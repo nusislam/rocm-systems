@@ -216,6 +216,7 @@ ncclResult_t ncclAlltoAllv_impl(const void *sendbuff, const size_t sendcounts[],
       0, datatype, 0, 0, ncclSum, mscclFuncAllToAllv, comm, stream);
   }
 
+  printf ("Here\n");
   int nRanks;
   NCCLCHECK(ncclCommCount(comm, &nRanks));
   if (!mscclIsCaller()) Recorder::instance().skip(true);
