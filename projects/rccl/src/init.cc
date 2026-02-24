@@ -67,7 +67,7 @@
 
 #ifdef ENABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>
-#define NUM_SYM_BUF 8
+#define NUM_SYM_BUF 2
 #endif
 
 
@@ -2272,9 +2272,15 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     comm->destRshmem = (void**) malloc(NUM_SYM_BUF * sizeof(void *));
 
     for (int i = 0; i < NUM_SYM_BUF; i++) {
-    	comm->sourceRshmem[i] = (void *)rocshmem::rocshmem_malloc((size_t)(1*1024*1024));
-    	comm->destRshmem[i] = (void *)rocshmem::rocshmem_malloc((size_t)(1*1024*1024));
+    	comm->sourceRshmem[i] = (void *)rocshmem::rocshmem_malloc((size_t)(128*1024*1024));
+    	comm->destRshmem[i] = (void *)rocshmem::rocshmem_malloc((size_t)(128*1024*1024));
     }
+    hipMallocManaged((void**)&comm->sizes, job->nranks * 4 * sizeof(size_t));
+    
+    comm->sendSizes = (size_t*)rocshmem::rocshmem_malloc(job->nranks  * sizeof(size_t));
+    comm->sendDispls = (size_t*)rocshmem::rocshmem_malloc(job->nranks * sizeof(size_t));
+    comm->recvSizes = (size_t*)rocshmem::rocshmem_malloc(job->nranks * sizeof(size_t));
+    comm->recvDispls = (size_t*)rocshmem::rocshmem_malloc(job->nranks * sizeof(size_t));
 
     comm->enableRocshmem = rcclParamRocshmemEnabled();
     comm->rocshmemThreshold = rcclParamRocshmemThreshold();
