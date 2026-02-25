@@ -393,6 +393,9 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
     devWork.recvbuffOffset = task->recvbuffOffset;
     devWork.sendbuffRmtAddrs = task->sendbuffRmtAddrs;
     devWork.recvbuffRmtAddrs = task->recvbuffRmtAddrs;
+    /*for (int i = 0; i < comm->nRanks; i++) {
+	printf("remote ptrs = %p\n", task->recvbuffRmtAddrs[i]);
+    }*/
     devWork.root = task->root;
     devWork.nWarps = task->nWarps;
     devWork.redOpArg = task->opDev.scalarArg;
@@ -2216,6 +2219,7 @@ static ncclResult_t topoGetAlgoInfo(
   }
 
   rcclRestrictMaxChannels(comm, nc);
+  printf("NChannels = %d\n", nc);
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #else

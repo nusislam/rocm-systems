@@ -286,7 +286,14 @@ static ncclResult_t setTreeDown(struct ncclTree* tree, int* indexes, int d) {
 
 static ncclResult_t connectTrees(struct ncclComm* comm, int* treeToParent, int* treeToChild0, int* treeToChild1, int* treePatterns) {
 
-  const int channelLimit = (IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx942") || IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx950")) ? 2*CHANNEL_LIMIT : CHANNEL_LIMIT;
+  //const 
+  int channelLimit = (IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx942") || IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx950")) ? 2*CHANNEL_LIMIT : CHANNEL_LIMIT;
+
+  /*if (IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx942") && comm->nNodes > 1) {
+	  channelLimit = 24;
+	  printf("Limit = 24\n");
+  }*/
+
   const int nChannels = (comm->nChannels > channelLimit) ? comm->nChannels / 2 : comm->nChannels;
   const int nNodes = comm->nNodes, node = comm->node;
 
@@ -817,6 +824,12 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   maxChannels = (IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx942") ||
                  IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx950"))
                  ? std::min(comm->topo->nodes[GPU].nodes[0].gpu.cu, MAXCHANNELS) : 2*CHANNEL_LIMIT;
+  
+  /*if (IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx942") && comm->nNodes > 1) {
+	  //printf("In topopostset\n");
+	  maxChannels = 48;
+  }*/
+
 #ifdef ENABLE_WARP_SPEED
   if (!wsEnabled && (graphs[NCCL_ALGO_RING]->nIntraChannels > 0 || comm->nNodes > 1)) {
     maxChannels = std::min(64, maxChannels);

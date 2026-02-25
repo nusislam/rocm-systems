@@ -55,7 +55,7 @@ RCCL_PARAM(WarpSpeedForceEnable, "WARP_SPEED_FORCE_ENABLE", 0);
 
 void rcclRestrictMaxChannels(struct ncclComm* comm, int& nc ) {
 
-  if (comm->nNodes > 1 && IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx950")) {
+  if (comm->nNodes > 1 && IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx942")) {
     const char* maxNChannelsStr = getenv("NCCL_MAX_NCHANNELS");
 
     if (maxNChannelsStr) {
