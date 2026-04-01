@@ -75,6 +75,7 @@
 #include "msccl/msccl_status.h"
 #include "latency_profiler/CollTrace.h"
 #include "latency_profiler/CollTraceFunc.h"
+#include "dda_all_reduce_ipc.h"
 #include  <cpuid.h>
 
 #ifndef STR2
@@ -575,6 +576,8 @@ skip_profiling:
   free(comm->collNetHeads);
   free(comm->clique.ranks);
 
+  NCCLCHECK(ncclDdaIpcCommFini(comm));
+
   if (comm->bootstrap)
     NCCLCHECK(bootstrapClose(comm->bootstrap));
 
@@ -713,6 +716,13 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
   ncclMemoryStackConstruct(&comm->memPermanent);
   ncclMemoryStackConstruct(&comm->memScoped);
   comm->destructorHead = nullptr;
+  
+  comm->ddaIpcMemHandler = nullptr;
+  comm->ddaIpcScratch = nullptr;
+  comm->ddaIpcScratchBytes = 0;
+  comm->ddaIpcPeerPtrsDev = nullptr;
+  comm->ddaIpcBarrierState = nullptr;
+  
   comm->rank = rank;
   comm->nRanks = ndev;
 
@@ -2396,6 +2406,7 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   }
 
   NCCLCHECKGOTO(latency_profiler::collTraceInit(comm), res, fail);
+  NCCLCHECKGOTO(ncclDdaIpcCommInit(comm), res, fail);
   // update communicator state
   comm->initState = ncclSuccess;
   timers[TIMER_INIT_TOTAL] = clockNano() - timers[TIMER_INIT_TOTAL];

@@ -12,6 +12,7 @@
 #include "api_trace.h"
 #include "nvtx_payload_schemas.h"
 #include "msccl/msccl_lifecycle.h"
+#include "dda_all_reduce_ipc.h"
 
 #ifdef ENABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>
@@ -334,6 +335,18 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
                       count, datatype, 0, 0, op, mscclFuncAllReduce, comm, stream);
       }
     }
+  }
+
+  if ((count * ncclTypeSize(datatype) <= 67108864) && ncclAllReduceDdaIpcEligible(comm, count, datatype, op)) {
+    NCCLCHECK(ncclAllReduceDdaIpc(
+        sendbuff,
+        recvbuff,
+        count,
+        datatype,
+        op,
+        comm,
+        stream));
+    return ncclSuccess;
   }
 
   return ncclEnqueueCheck(&info);
