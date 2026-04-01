@@ -21,8 +21,13 @@ set(SRC_FILES
   commDump.cc
   debug.cc
   dev_runtime.cc
+  dda_all_reduce_ipc.cu
+  device_buffer.cc
   enqueue.cc
   group.cc
+  ipc_gpu_barrier.cu
+  ipc_init.cu
+  ipc_mem_handler.cc
   init.cc
   init_nvtx.cc
   mnnvl.cc
@@ -94,6 +99,14 @@ set(SRC_FILES
   include/debug.h
   include/dev_runtime.h
   include/device.h
+  include/algorithms/CollCommon.h
+  include/algorithms/all_reduce/all_reduce_dda.h
+  include/dda_all_reduce_ipc.h
+  include/device_buffer.h
+  include/ipc_gpu_barrier.h
+  include/ipc_init.h
+  include/ipc_init_detail.h
+  include/ipc_mem_handler.h
   include/enqueue.h
   include/gdrwrap.h
   include/git_version.h

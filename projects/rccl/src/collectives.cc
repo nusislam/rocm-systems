@@ -12,6 +12,8 @@
 #include "api_trace.h"
 #include "nvtx_payload_schemas.h"
 #include "device/hierarchical_ag_shuffle.h"
+#include "dda_all_reduce_ipc.h"
+
 #ifdef ENABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>
 #endif
@@ -378,6 +380,18 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
     chunkSteps, sliceSteps, nullptr };
 
   NCCLCHECK(Recorder::instance().record(rrAllReduce, info));
+
+  if ((count * ncclTypeSize(datatype) <= 67108864) && ncclAllReduceDdaIpcEligible(comm, count, datatype, op)) {
+    NCCLCHECK(ncclAllReduceDdaIpc(
+        sendbuff,
+        recvbuff,
+        count,
+        datatype,
+        op,
+        comm,
+        stream));
+    return ncclSuccess;
+  }
 
   return ncclEnqueueCheck(&info);
 }
