@@ -14,6 +14,7 @@ set(RCCL_SOURCE_DIR "${PROJECT_SOURCE_DIR}")
 # E.g: find src -type f \( -name "*.cc" -o -name "*.h" -o -name "*.hpp" \) | sort
 set(SRC_FILES
 <<<<<<< HEAD
+<<<<<<< HEAD
   allocator.cc
   bootstrap.cc
   ce_coll.cc
