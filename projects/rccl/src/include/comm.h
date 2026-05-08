@@ -27,6 +27,8 @@
 #include "latency_profiler/CollTrace.h"
 #include "rccl_common.h"
 #include "recorder.h"
+#include "sdma/anvil.hpp"
+
 
 #ifdef ENABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>
@@ -791,6 +793,8 @@ struct ncclComm {
   size_t bufThreshold;
 #endif
 
+  // anvil SDMA backend
+  anvil::SdmaQueueDeviceHandle** deviceHandles_d{nullptr};
   // Direct Reduce Scatter [RCCL]
   bool enableDirectReduceScatter;
   // Temporary Buffer [RCCL]

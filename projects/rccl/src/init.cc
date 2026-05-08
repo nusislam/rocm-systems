@@ -69,6 +69,8 @@
 #define NUM_SYM_BUF 2
 #endif
 
+#include "sdma/anvil.hpp"
+#define NUM_SDMA_CHANNELS 2
 
 #include "latency_profiler/CollTrace.h"
 #include "latency_profiler/CollTraceFunc.h"
@@ -2321,6 +2323,46 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
 
   // RCCL: determine and set unroll factor for comm
   NCCLCHECK(commSetUnrollFactor(comm));
+
+  // Initialize the Anvil library
+  anvil::anvil.init();
+
+  // Get current device
+  int deviceId;
+  CHECK_HIP(hipGetDevice(&deviceId));
+
+  int numChannels = NUM_CHANNELS;
+  // Create SDMA connections to all local PEs including self
+  for (int i = 0; i < comm->nRanks; i++) {
+    if (i != deviceId) {
+      anvil::EnablePeerAccess(deviceId, i);
+    }
+    anvil::anvil.connect(deviceId, i, numChannels);
+  }
+
+  // Total number of handles: shm_size * numChannels
+  // Indexed as: deviceHandles_d[local_pe * numChannels + channel_idx]
+  int total_handles = comm->nRanks * numChannels;
+
+  // Allocate device-side array to hold SDMA queue device handles
+  CHECK_HIP(hipMalloc(&(comm->deviceHandles_d),
+                      total_handles * sizeof(anvil::SdmaQueueDeviceHandle*)));
+
+  // Copy device handles to device memory
+  anvil::SdmaQueueDeviceHandle** handles_h =
+      new anvil::SdmaQueueDeviceHandle*[total_handles];
+  for (int i = 0; i < comm->nRanks; i++) {
+    for (int ch = 0; ch < numChannels; ch++) {
+      int idx = i * numChannels + ch;
+      anvil::SdmaQueue* queue = anvil::anvil.getSdmaQueue(deviceId, i, ch);
+      handles_h[idx] = queue ? queue->deviceHandle() : nullptr;
+    }
+  }
+  CHECK_HIP(hipMemcpy(comm->deviceHandles_d, handles_h,
+                      total_handles * sizeof(anvil::SdmaQueueDeviceHandle*),
+                      hipMemcpyHostToDevice));
+  delete[] handles_h;
+
 
 #ifdef ENABLE_ROCSHMEM
   if (!job->parent && rcclParamRocshmemEnabled()) {
