@@ -23,10 +23,22 @@
  *****************************************************************************/
 
 #include "anvil.hpp"
-#include "log.hpp"
+//#include "log.hpp"
+#include "debug.h"
+
+#include <cstdlib>
 
 #include <fstream>
 #include <cstring>
+
+#define LOG_ERROR_EXIT(...) \
+  do {                    \
+    ERROR(__VA_ARGS__);    \
+    std::abort();         \
+  } while (0)
+#define LOG_TRACE(...) TRACE(NCCL_INIT, __VA_ARGS__)
+#define LOG_WARN(...) WARN(__VA_ARGS__)
+
 
 #include "sdma_pkt_struct.h"
 #include "sdma_pkt_struct_mi4.h"

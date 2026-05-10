@@ -2224,6 +2224,11 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   int cuCount;
   hipDeviceProp_t devProp;
 
+  int deviceId = 0;
+  const int numChannels = 2;
+  int total_handles = 0;
+  anvil::SdmaQueueDeviceHandle** handles_h = nullptr;
+
   #ifdef USE_INDIRECT_FUNCTION_CALL
   int64_t stackSize;
   #endif
@@ -2328,10 +2333,10 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   anvil::anvil.init();
 
   // Get current device
-  int deviceId;
-  hipGetDevice(&deviceId);
+  //int deviceId;
+  CUDACHECKGOTO(hipGetDevice(&deviceId), res, fail);
 
-  int numChannels=2;
+  //int numChannels=2;
   // Create SDMA connections to all local PEs including self
   for (int i = 0; i < comm->nRanks; i++) {
     if (i != deviceId) {
@@ -2342,15 +2347,14 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
 
   // Total number of handles: shm_size * numChannels
   // Indexed as: deviceHandles_d[local_pe * numChannels + channel_idx]
-  int total_handles = comm->nRanks * numChannels;
+  total_handles = comm->nRanks * numChannels;
 
   // Allocate device-side array to hold SDMA queue device handles
-  hipMalloc(&(comm->deviceHandles_d),
-                      total_handles * sizeof(anvil::SdmaQueueDeviceHandle*));
+  CUDACHECKGOTO(hipMalloc(&(comm->deviceHandles_d),
+                      total_handles * sizeof(anvil::SdmaQueueDeviceHandle*)), res, fail);
 
   // Copy device handles to device memory
-  anvil::SdmaQueueDeviceHandle** handles_h =
-      new anvil::SdmaQueueDeviceHandle*[total_handles];
+  handles_h = new anvil::SdmaQueueDeviceHandle*[total_handles];
   for (int i = 0; i < comm->nRanks; i++) {
     for (int ch = 0; ch < numChannels; ch++) {
       int idx = i * numChannels + ch;
@@ -2358,10 +2362,11 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
       handles_h[idx] = queue ? queue->deviceHandle() : nullptr;
     }
   }
-  hipMemcpy(comm->deviceHandles_d, handles_h,
+  CUDACHECKGOTO(hipMemcpy(comm->deviceHandles_d, handles_h,
                       total_handles * sizeof(anvil::SdmaQueueDeviceHandle*),
-                      hipMemcpyHostToDevice);
+                      hipMemcpyHostToDevice), res, fail);
   delete[] handles_h;
+  handles_h = nullptr;
 
 
 #ifdef ENABLE_ROCSHMEM
