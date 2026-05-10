@@ -497,6 +497,7 @@ list(APPEND HIP_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/git_version.cpp)
 #==================================================================================================
 ## Set RCCL source files
 add_library(rccl ${HIP_SOURCES})
+add_subdirectory(sdma)
 
 ## Set RCCL dependencies
 ## Ensure git version is updated before building rccl
@@ -506,6 +507,7 @@ add_dependencies(rccl update_git_version copy_nccl_device_headers)
 target_include_directories(rccl PRIVATE ${PROJECT_BINARY_DIR}/include)        # for generated rccl.h header
 target_include_directories(rccl PRIVATE ${HIPIFY_DIR}/src)                    # for hipified headers
 target_include_directories(rccl PRIVATE ${HIPIFY_DIR}/src/device)
+target_include_directories(rccl PRIVATE ${RCCL_SOURCE_DIR}/src)
 target_include_directories(rccl PRIVATE ${HIPIFY_DIR}/src/device/network/unpack)
 target_include_directories(rccl PRIVATE ${HIPIFY_DIR}/src/include)
 target_include_directories(rccl PRIVATE ${HIPIFY_DIR}/src/include/mlx5)

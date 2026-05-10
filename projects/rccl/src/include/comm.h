@@ -794,7 +794,7 @@ struct ncclComm {
 #endif
 
   // anvil SDMA backend
-  anvil::SdmaQueueDeviceHandle** deviceHandles_d{nullptr};
+  rocshmem::anvil::SdmaQueueDeviceHandle** deviceHandles_d{nullptr};
   // Direct Reduce Scatter [RCCL]
   bool enableDirectReduceScatter;
   // Temporary Buffer [RCCL]

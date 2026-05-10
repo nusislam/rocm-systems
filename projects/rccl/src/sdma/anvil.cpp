@@ -376,8 +376,8 @@ int AnvilLib::getSdmaEngineId(int srcDeviceId, int dstDeviceId) {
   return mi300xOamMap[srcOamId][dstOamId] * 2;
 }
 
-AnvilLib& anvil = anvil.getInstance();
-
+//AnvilLib& anvil = anvil.getInstance();
+AnvilLib& anvil = AnvilLib::getInstance();
 // Thin wrappers matching the rocm-xio sdma-ep API style.
 // initEndpoint() is idempotent; shutdownEndpoint() only resets the flag,
 // it does not destroy queues or shut down HSA/KFD (AnvilLib destructor does
@@ -397,4 +397,4 @@ void shutdownEndpoint() {
 }
 
 }  // namespace anvil
-}  // namespace rocshmem
+}  // namespace rccl

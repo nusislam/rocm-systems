@@ -30,3 +30,11 @@ target_sources(
   PRIVATE
     anvil.cpp
 )
+# Anvil uses HSA runtime iteration and KFD (libhsakmt) for SDMA queue setup.
+target_link_libraries(${PROJECT_NAME} PRIVATE hsa-runtime64::hsa-runtime64)
+find_library(RCCL_HSAKMT_LIB NAMES hsakmt HINTS "${ROCM_PATH}/lib" "${ROCM_PATH}/lib64")
+if(NOT RCCL_HSAKMT_LIB)
+  message(FATAL_ERROR "Anvil SDMA requires libhsakmt under ROCM_PATH (${ROCM_PATH}).")
+endif()
+target_link_libraries(${PROJECT_NAME} PRIVATE ${RCCL_HSAKMT_LIB})
+

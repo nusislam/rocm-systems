@@ -147,6 +147,8 @@ inline void EnablePeerAccess(int const deviceId, int const peerDeviceId) {
 }
 
 }  // namespace anvil
-}  // namespace rocshmem
+}  // namespace rccl
 
+// Shorthand used by init.cc, comm.h, and device code.
+namespace anvil = rocshmem::anvil;
 #endif  // LIBRARY_SRC_SDMA_ANVIL_HPP_
