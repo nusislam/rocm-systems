@@ -795,6 +795,15 @@ struct ncclComm {
 
   // anvil SDMA backend
   rocshmem::anvil::SdmaQueueDeviceHandle** deviceHandles_d{nullptr};
+  // Fine-grained device temp buffer + all peers' IPC mem handles (bootstrapAllGather) [RCCL / SDMA]
+  void* sdmaFineGrainedTempBuf{nullptr};
+  size_t sdmaFineGrainedTempBytes{0};
+  cudaIpcMemHandle_t* sdmaFineGrainedIpcHandles{nullptr};
+
+  // Fine-grained device sync words (local); distinct from sdmaTempBuffer and tempBuff [RCCL / SDMA]
+  uint64_t* sdmaSyncBuffer{nullptr};
+  size_t sdmaSyncBufferBytes{0};
+
   // Direct Reduce Scatter [RCCL]
   bool enableDirectReduceScatter;
   // Temporary Buffer [RCCL]

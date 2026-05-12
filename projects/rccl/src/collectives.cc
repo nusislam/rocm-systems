@@ -15,6 +15,9 @@
 #ifdef ENABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>
 #endif
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+#include "sdma/two_shot_allreduce_launch.hpp"
+#endif
 
 using namespace rccl;
 
@@ -379,6 +382,14 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
 
   NCCLCHECK(Recorder::instance().record(rrAllReduce, info));
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  if (rcclParamAnvilTwoShotAllreduce() != 0) {
+    ncclResult_t ar =
+        rcclAnvilTwoShotAllReduceTry(sendbuff, recvbuff, count, datatype, op, comm, stream);
+    if (ar == ncclSuccess) return ncclSuccess;
+    if (ar != ncclInvalidUsage) return ar;
+  }
+#endif
   return ncclEnqueueCheck(&info);
 }
 

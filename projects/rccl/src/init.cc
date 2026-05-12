@@ -485,6 +485,25 @@ static ncclResult_t commFree(ncclComm_t comm) {
     comm->tempBuff = nullptr;
   }
 
+  if (comm->deviceHandles_d) {
+    CUDACHECK(hipFree(comm->deviceHandles_d));
+    comm->deviceHandles_d = nullptr;
+  }
+  free(comm->sdmaFineGrainedIpcHandles);
+  comm->sdmaFineGrainedIpcHandles = nullptr;
+
+  if (comm->sdmaFineGrainedTempBuf) {
+    CUDACHECK(hipFree(comm->sdmaFineGrainedTempBuf));
+    comm->sdmaFineGrainedTempBuf = nullptr;
+    comm->sdmaFineGrainedTempBytes = 0;
+  }
+
+  if (comm->sdmaSyncBuffer) {
+    CUDACHECK(hipFree((void*)comm->sdmaSyncBuffer));
+    comm->sdmaSyncBuffer = nullptr;
+    comm->sdmaSyncBufferBytes = 0;
+  }
+
   // Free hierarchical AG resources
   if (comm->hierarchicalAGTempBuffer) {
     NCCLCHECK(ncclCudaFree(comm->hierarchicalAGTempBuffer));
@@ -2207,6 +2226,78 @@ static ncclResult_t getParentRanks(int parentRanks, int parentRank, int* exclude
   return ncclSuccess;
 }
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+// HIP stacks often require a minimum allocation for IPC export (see tools/p2p-latency-test).
+static constexpr size_t kSdmaFineGrainedIpcTempMinBytes = 2u * 1024u * 1024u;
+// Local fine-grained sync area: cache-line worth of uint64_t words (no IPC on this slab).
+static constexpr size_t kSdmaSyncBufferNumUint64 = 8;
+
+static unsigned sdmaFineGrainedMallocFlags(const char* archName) {
+  if (IsArchMatch(archName, "gfx942") || IsArchMatch(archName, "gfx950"))
+    return hipDeviceMallocUncached;
+  return hipDeviceMallocFinegrained;
+}
+
+// Allocate a fine-grained (or uncached-on-MI300-class) device buffer and AllGather IPC handles.
+static ncclResult_t sdmaExchangeFineGrainedIpcTempBuf(ncclComm_t comm) {
+  ncclResult_t res = ncclSuccess;
+  const size_t allocBytes = kSdmaFineGrainedIpcTempMinBytes;
+  const size_t syncBytes = kSdmaSyncBufferNumUint64 * sizeof(uint64_t);
+  cudaIpcMemHandle_t localIpc;
+  void* syncRaw = nullptr;
+
+
+  comm->sdmaFineGrainedTempBuf = nullptr;
+  comm->sdmaFineGrainedTempBytes = 0;
+  comm->sdmaFineGrainedIpcHandles = nullptr;
+
+  comm->sdmaSyncBuffer = nullptr;
+  comm->sdmaSyncBufferBytes = 0;
+  
+  CUDACHECKGOTO(hipExtMallocWithFlags(&comm->sdmaFineGrainedTempBuf, allocBytes,
+                                    sdmaFineGrainedMallocFlags(comm->archName)), res, fail);
+  comm->sdmaFineGrainedTempBytes = allocBytes;
+
+
+  memset(&localIpc, 0, sizeof(localIpc));
+  CUDACHECKGOTO(cudaIpcGetMemHandle(&localIpc, comm->sdmaFineGrainedTempBuf), res, fail);
+
+  NCCLCHECKGOTO(ncclCalloc(&comm->sdmaFineGrainedIpcHandles, comm->nRanks), res, fail);
+  memcpy(comm->sdmaFineGrainedIpcHandles + comm->rank, &localIpc, sizeof(localIpc));
+
+  NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, comm->sdmaFineGrainedIpcHandles,
+                                    (int)sizeof(cudaIpcMemHandle_t)),
+                res, fail);
+
+  CUDACHECKGOTO(hipExtMallocWithFlags(&syncRaw, syncBytes, sdmaFineGrainedMallocFlags(comm->archName)),
+                res, fail);
+  comm->sdmaSyncBuffer = reinterpret_cast<uint64_t*>(syncRaw);
+  comm->sdmaSyncBufferBytes = syncBytes;
+  CUDACHECKGOTO(hipMemset(comm->sdmaSyncBuffer, 0, syncBytes), res, fail);
+
+  INFO(NCCL_INIT,
+       "SDMA tempBuffer IPC: %zu B + syncBuffer: %zu B uint64_t[%zu] (rank %d of %d); temp IPC via "
+       "bootstrapAllGather",
+       tempBytes, syncBytes, kSdmaSyncBufferNumUint64, comm->rank, comm->nRanks);
+  return ncclSuccess;
+fail:
+  free(comm->sdmaFineGrainedIpcHandles);
+  comm->sdmaFineGrainedIpcHandles = nullptr;
+  if (comm->sdmaFineGrainedTempBuf) {
+    CUDACHECKIGNORE(hipFree(comm->sdmaFineGrainedTempBuf));
+    comm->sdmaFineGrainedTempBuf = nullptr;
+    comm->sdmaFineGrainedTempBytes = 0;
+  }
+  if (comm->sdmaSyncBuffer) {
+    CUDACHECKIGNORE(hipFree((void*)comm->sdmaSyncBuffer));
+    comm->sdmaSyncBuffer = nullptr;
+    comm->sdmaSyncBufferBytes = 0;
+  }
+  return res;
+}
+#endif
+
+
 static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   struct ncclCommInitRankAsyncJob* job = (struct ncclCommInitRankAsyncJob*)job_;
   ncclComm_t comm = job->comm;
@@ -2225,7 +2316,7 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   hipDeviceProp_t devProp;
 
   int deviceId = 0;
-  const int numChannels = 2;
+  int numChannels = NUM_SDMA_CHANNELS;;
   int total_handles = 0;
   anvil::SdmaQueueDeviceHandle** handles_h = nullptr;
 
@@ -2368,6 +2459,9 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   delete[] handles_h;
   handles_h = nullptr;
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  NCCLCHECKGOTO(sdmaExchangeFineGrainedIpcTempBuf(comm), res, fail);
+#endif
 
 #ifdef ENABLE_ROCSHMEM
   if (!job->parent && rcclParamRocshmemEnabled()) {
