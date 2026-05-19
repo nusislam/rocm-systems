@@ -13,11 +13,11 @@
 #include <type_traits>
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__)
-#include <hip/hip_bfloat16.h>
+//#include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <hip/amd_detail/amd_hip_bf16.h>
-using bf16 = hip_bfloat16;
+using bf16 = __hip_bfloat16;
 #else
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -25,6 +25,13 @@ using bf16 = hip_bfloat16;
 using bf16 = __nv_bfloat16;
 using bf162 = __nv_bfloat162;
 #endif
+
+/*#if !defined(_HIP_INCLUDE_HIP_AMD_DETAIL_HIP_BFLOAT16_H_) && !defined(_HIP_BFLOAT16_H_)
+#define _HIP_INCLUDE_HIP_AMD_DETAIL_HIP_BFLOAT16_H_
+#define _HIP_BFLOAT16_H_
+#include <hip/hip_bf16.h>
+typedef __hip_bfloat16 hip_bfloat16;
+#endif*/
 
 namespace meta::comms {
 

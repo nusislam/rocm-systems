@@ -13,6 +13,7 @@
 #include "nvtx_payload_schemas.h"
 #include "device/hierarchical_ag_shuffle.h"
 #include "dda_all_reduce_ipc.h"
+#include "dda_reduce_scatter_ipc.h"
 
 #ifdef ENABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>
@@ -188,6 +189,8 @@ ncclResult_t ncclAllGather_impl(const void* sendbuff, void* recvbuff, size_t sen
     NVTX3_PAYLOAD(comm ? comm->commHash : 0, sendcount * ncclTypeSize(datatype), datatype));
     // RCCL update slice steps for AllGather if single node
     const bool isGfx950 = IsArchMatch(comm->archName, "gfx950");
+    const bool isGfx942 = IsArchMatch(comm->archName, "gfx942");
+
     int chunkSteps = (isGfx950 && comm->rcclUseOneSlice)? 1 : ALLGATHER_CHUNKSTEPS;
     int sliceSteps = comm->rcclUseOneSlice
       ? (isGfx950 ? 1 : ALLGATHER_SLICESTEPS_SINGLE_NODE)
@@ -204,6 +207,25 @@ ncclResult_t ncclAllGather_impl(const void* sendbuff, void* recvbuff, size_t sen
   size_t msgSize = sendcount * ncclTypeSize(datatype) * nRanks;
 
   NCCLCHECK(Recorder::instance().record(rrAllGather, info));
+
+  size_t ddaThreshold =  rcclParamDdaThreshold();
+  if (isGfx942) {
+     ddaThreshold = (size_t)(8388608);
+  } else if (!isGfx950) {
+     ddaThreshold = 0;
+  }
+
+  if (rcclParamDdaEnable() && (nRanks * sendcount * ncclTypeSize(datatype) <= ddaThreshold) && (ddaThreshold > 0) && ncclAllGatherDdaIpcEligible(comm, sendbuff, recvbuff, sendcount, datatype, op) && ncclGroupDepth == 0) {
+    NCCLCHECK(ncclAllGatherDdaIpc(
+        sendbuff,
+        recvbuff,
+        sendcount,
+        datatype,
+        op,
+        comm,
+        stream));
+    return ncclSuccess;
+  }
 
   if (rcclUseHierarchicalAllGather(comm, msgSize)) {
     return ncclHierarchicalAllGather_Impl(sendbuff, recvbuff, sendcount, datatype, comm, stream);
@@ -497,6 +519,8 @@ ncclResult_t ncclReduceScatter_impl(const void* sendbuff, void* recvbuff, size_t
     NVTX3_PAYLOAD(comm ? comm->commHash : 0, recvcount * ncclTypeSize(datatype), op, datatype));
     // RCCL update slice steps for ReduceScatter if single node
     const bool isGfx950 = IsArchMatch(comm->archName, "gfx950");
+    const bool isGfx942 = IsArchMatch(comm->archName, "gfx942");
+
     int chunkSteps = (isGfx950 && comm->rcclUseOneSlice)? 1 : REDUCESCATTER_CHUNKSTEPS;
     int sliceSteps = comm->rcclUseOneSlice
       ? (isGfx950 ? 1 : REDUCESCATTER_SLICESTEPS_SINGLE_NODE)
@@ -514,6 +538,26 @@ ncclResult_t ncclReduceScatter_impl(const void* sendbuff, void* recvbuff, size_t
 
   // Reset value forcing direct reduce scatter algorithm 
   comm->enableDirectReduceScatter = 0;
+
+  size_t ddaThreshold =  rcclParamDdaThreshold();
+  if (isGfx942) {
+     ddaThreshold = (size_t)(8388608);
+  } else if (!isGfx950) {
+     ddaThreshold = 0;
+  }
+
+  if (rcclParamDdaEnable() && (nRanks * recvcount * ncclTypeSize(datatype) <= ddaThreshold) && (ddaThreshold > 0) && ncclReduceScatterDdaIpcEligible(comm, sendbuff, recvbuff, recvcount, datatype, op) && ncclGroupDepth == 0) {
+    NCCLCHECK(ncclReduceScatterDdaIpc(
+        sendbuff,
+        recvbuff,
+        recvcount,
+        datatype,
+        op,
+        comm,
+        stream));
+    return ncclSuccess;
+  }
+
 
   if (rcclUseReduceScatterDirect(comm, msgSize)) {
     INFO(NCCL_INIT, "RCCL DIRECT REDUCE-SCATTER recvcount=%zu msgSize=%zu rank=%d nRanks=%d nNodes=%d comm=%p stream=%p sendbuff=%p recvbuff=%p",
