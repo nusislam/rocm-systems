@@ -14,6 +14,7 @@
 #include "device/hierarchical_ag_shuffle.h"
 #include "dda_all_reduce_ipc.h"
 #include "dda_reduce_scatter_ipc.h"
+#include "dda_all_gather_ipc.h"
 
 #ifdef ENABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>
@@ -215,13 +216,12 @@ ncclResult_t ncclAllGather_impl(const void* sendbuff, void* recvbuff, size_t sen
      ddaThreshold = 0;
   }
 
-  if (rcclParamDdaEnable() && (nRanks * sendcount * ncclTypeSize(datatype) <= ddaThreshold) && (ddaThreshold > 0) && ncclAllGatherDdaIpcEligible(comm, sendbuff, recvbuff, sendcount, datatype, op) && ncclGroupDepth == 0) {
+  if (rcclParamDdaEnable() && (nRanks * sendcount * ncclTypeSize(datatype) <= ddaThreshold) && (ddaThreshold > 0) && ncclAllGatherDdaIpcEligible(comm, sendbuff, recvbuff, sendcount, datatype) && ncclGroupDepth == 0) {
     NCCLCHECK(ncclAllGatherDdaIpc(
         sendbuff,
         recvbuff,
         sendcount,
         datatype,
-        op,
         comm,
         stream));
     return ncclSuccess;
