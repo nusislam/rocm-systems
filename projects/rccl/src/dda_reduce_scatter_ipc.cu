@@ -154,7 +154,7 @@ static ncclResult_t ncclReduceScatterDdaIpcTyped(
   } else {*/
     // Use flat algorithm for smaller messages
   //if (totalCount * sizeof(T) > kernelCopyThresholdBytes) {
-    CUDACHECK(cudaMemcpyAsync(
+  CUDACHECK(cudaMemcpyAsync(
         comm->ddaIpcScratch,
         sendbuff,
         totalCount * sizeof(T),

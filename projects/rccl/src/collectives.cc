@@ -15,6 +15,7 @@
 #include "dda_all_reduce_ipc.h"
 #include "dda_reduce_scatter_ipc.h"
 #include "dda_all_gather_ipc.h"
+#include "dda_alltoall_ipc.h"
 
 #ifdef ENABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>
@@ -286,6 +287,27 @@ ncclResult_t ncclAlltoAll_impl(const void* sendbuff, void* recvbuff, size_t coun
         return ncclEnqueueCheck(&info);
       }
       #endif // ENABLE_ROCSHMEM
+	     //
+     size_t ddaThreshold =  rcclParamDdaThreshold();
+     const bool isGfx950 = IsArchMatch(comm->archName, "gfx950");
+     const bool isGfx942 = IsArchMatch(comm->archName, "gfx942");
+     if (isGfx942) {
+     	ddaThreshold = (size_t)(4194304);
+     } else if (!isGfx950) {
+        ddaThreshold = 0;
+     }
+
+  if (rcclParamDdaEnable() && (comm->nRanks * count * ncclTypeSize(datatype) <= ddaThreshold) && (ddaThreshold > 0) && ncclAllToAllDdaIpcEligible(comm, sendbuff, recvbuff, count, datatype) && ncclGroupDepth == 0) {
+    NCCLCHECK(ncclAllToAllDdaIpc(
+        sendbuff,
+        recvbuff,
+        count,
+        datatype,
+        comm,
+        stream));
+    return ncclSuccess;
+  }
+
     info = { ncclFuncAlltoAll, "AlltoAll",
       sendbuff, recvbuff, count, datatype, ncclSum, 0, comm, stream, /* Args */
       ALLTOALL_CHUNKSTEPS, ALLTOALL_SLICESTEPS };
