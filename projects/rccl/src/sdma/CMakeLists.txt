@@ -29,6 +29,7 @@ target_sources(
   ${PROJECT_NAME}
   PRIVATE
     anvil.cpp
+    two_shot_allreduce.cpp
 )
 # Anvil uses HSA runtime iteration and KFD (libhsakmt) for SDMA queue setup.
 target_link_libraries(${PROJECT_NAME} PRIVATE hsa-runtime64::hsa-runtime64)

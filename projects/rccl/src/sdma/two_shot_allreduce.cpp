@@ -108,7 +108,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   for (int s = 0; s < nRanks; ++s) {
     if (s == myRank)
       continue;
-    const float* src =  + (size_t)s * (size_t)chunk;
+    const float* src =  tmpbuff + (size_t)s * (size_t)chunk;
     float* dst = recvbuff + (size_t)s * (size_t)chunk;
     for (int i = 0; i < chunk; ++i)
       dst[i] = src[i];
@@ -116,7 +116,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
 
 }
 
-__global__ void anvilTwoShotPhase2Kernel(const float* __restrict__ sendbuff, float* __restrict__ recvbuff,
+/*__global__ void anvilTwoShotPhase2Kernel(const float* __restrict__ sendbuff, float* __restrict__ recvbuff,
                                          int count, int nRanks, int myRank, void** __restrict__ peerTempPtrs,
                                          rocshmem::anvil::SdmaQueueDeviceHandle** __restrict__ devHandles,
                                          size_t dataByteOffset) {
@@ -163,7 +163,7 @@ __global__ void anvilTwoShotPhase2Kernel(const float* __restrict__ sendbuff, flo
     for (int i = 0; i < chunk; ++i)
       dst[i] = src[i];
   }
-}
+}*/
 
 ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, size_t count,
                                           ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
@@ -178,7 +178,7 @@ ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, 
     return ncclInvalidUsage;
 
   const int nr = comm->nRanks;
-  if (nr <= 0 || comm->sdmaTempBuffer == nullptr || comm->remoteBufs == nullptr || comm->deviceHandles_d == nullptr)
+  if (nr <= 0 || comm->sdmaFineGrainedTempBuf == nullptr || comm->remoteBufs == nullptr || comm->deviceHandles_d == nullptr)
     return ncclInvalidUsage;
 
   if (count > (size_t)INT_MAX || (int)count % nr != 0)
