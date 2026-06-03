@@ -799,11 +799,22 @@ struct ncclComm {
   void* sdmaFineGrainedTempBuf{nullptr};
   size_t sdmaFineGrainedTempBytes{0};
   cudaIpcMemHandle_t* sdmaFineGrainedIpcHandles{nullptr};
+  // IPC-opened peer temp bases (host); length nRanks; slot[rank] is local sdmaFineGrainedTempBuf
+  void** sdmaFineGrainedTempPeerOpenedHost{nullptr};
+  // Device array: peer r's fine-grained temp buffer as mapped on this GPU (two-shot AllReduce)
+  void** sdmaFineGrainedTempPeerPtrs_d{nullptr};
+  // Cross-rank signal header + float staging layout (see sdma/two_shot_allreduce.cpp)
+  size_t sdmaCrossSignalBytes{0};
+  size_t sdmaDataByteOffset{0};
+
 
   // Fine-grained device sync words (local); distinct from sdmaTempBuffer and tempBuff [RCCL / SDMA]
   uint64_t* sdmaSyncBuffer{nullptr};
   size_t sdmaSyncBufferBytes{0};
-  cudaIpcMemHandle_t* sdmaSyncIpcHandles{nullptr};
+  cudaIpcMemHandle_t* sdmaSyncBufferIpcHandles{nullptr};
+
+  void** sdmaSyncBufferPeerOpenedHost{nullptr};
+  uint64_t** sdmaSyncBufferPeerPtrs_d{nullptr};
 
   //Fine-grained device buffer for barrier
   uint64_t* sdmaBarrierBuffer{nullptr};
