@@ -18,5 +18,5 @@ int64_t rcclParamAnvilTwoShotAllreduce(void);
 // ncclInvalidArgument for invalid pointers, ncclInternalError on unexpected HIP failures.
 ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, size_t count,
                                           ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
-                                          cudaStream_t stream);
+                                          hipStream_t stream);
 

@@ -23,26 +23,30 @@ static __host__ inline size_t crossHeaderBytes(int nRanks) {
 
 RCCL_PARAM(AnvilTwoShotAllreduce, "ANVIL_TWO_SHOT_ALLREDUCE", 0);
 
-__global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, float* __restrict__ recvbuff,
-                                         int count, int nRanks, int myRank, void** __restrict__ peerTempPtrs,
+__global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, float* __restrict__ recvbuff, 
+					float* __restrict__ tmpbuff, int count, int nRanks, int myRank, 
+					void** __restrict__ peerTempPtrs,
                                          rocshmem::anvil::SdmaQueueDeviceHandle** __restrict__ devHandles,
-                                         size_t dataByteOffset) {
+                                         uint64_t** remoteSignals, uint64_t** remoteBarriers, 
+					 uint64_t* localSignals, uint64_t* localBarriers ) {
   if (threadIdx.x != 0 || blockIdx.x != 0)
     return;
 
   const int chunk = count / nRanks;
   const size_t chunkBytes = (size_t)chunk * sizeof(float);
   char* myTemp = reinterpret_cast<char*>(peerTempPtrs[myRank]);
-  float* stage1 = reinterpret_cast<float*>(myTemp + dataByteOffset);
+  //float* stage1 = reinterpret_cast<float*>(myTemp + dataByteOffset);
 
   for (int peer = 0; peer < nRanks; ++peer) {
     if (peer == myRank)
       continue;
     void* peerBase = peerTempPtrs[peer];
     char* peerC = reinterpret_cast<char*>(peerBase);
-    float* dst = reinterpret_cast<float*>(peerC + dataByteOffset) + (size_t)myRank * (size_t)chunk;
-    const float* src = sendbuff + (size_t)myRank * (size_t)chunk;
-    uint64_t* sig = reinterpret_cast<uint64_t*>(peerBase) + myRank;
+    float* dst = reinterpret_cast<float*>(peerC) + (size_t)myRank * (size_t)chunk;
+    const float* src = sendbuff + (size_t)peer * (size_t)chunk;
+
+    uint64_t* sigPeer = remoteSignals[peer];
+    uint64_t* sig = sigPeer[myRank];
     rocshmem::anvil::SdmaQueueDeviceHandle* hqPtr = devHandles[peer * kNumSdmaChannels + 0];
     if (hqPtr == nullptr)
       return;
@@ -53,20 +57,63 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   for (int s = 0; s < nRanks; ++s) {
     if (s == myRank)
       continue;
-    uint64_t* waitAt = reinterpret_cast<uint64_t*>(myTemp) + s;
+    uint64_t* waitAt = reinterpret_cast<uint64_t*>(localSignals) + s;
     rocshmem::anvil::waitSignal(waitAt, 1ull);
   }
 
   for (int i = 0; i < chunk; ++i) {
     const size_t idx = (size_t)myRank * (size_t)chunk + (size_t)i;
     float acc = sendbuff[idx];
+
     for (int s = 0; s < nRanks; ++s) {
       if (s == myRank)
         continue;
-      acc += stage1[(size_t)s * (size_t)chunk + (size_t)i];
+      size_t idx1 = (size_t)s * (size_t)chunk + (size_t)i;
+      float acc1 = tmpbuff[idx1];
+
+      acc += acc1;
     }
     recvbuff[idx] = acc;
   }
+
+  __syncthreads();
+
+  //need a barrier
+  // allgather
+  //
+  for (int peer = 0; peer < nRanks; ++peer) {
+    if (peer == myRank)
+      continue;
+    void* peerBase = peerTempPtrs[peer];
+    char* peerC = reinterpret_cast<char*>(peerBase);
+    float* dst = reinterpret_cast<float*>(peerC) + (size_t)myRank * (size_t)chunk;
+    const float* src = recvbuff + (size_t)myRank * (size_t)chunk;
+
+    uint64_t* sigPeer = remoteSignals[peer];
+    uint64_t* sig = sigPeer[myRank];
+    rocshmem::anvil::SdmaQueueDeviceHandle* hqPtr = devHandles[peer * kNumSdmaChannels + 0];
+    if (hqPtr == nullptr)
+      return;
+    rocshmem::anvil::SdmaQueueDeviceHandle& hq = *hqPtr;
+    rocshmem::anvil::putSignal(hq, dst, const_cast<float*>(src), chunkBytes, sig);
+  }
+
+  for (int s = 0; s < nRanks; ++s) {
+    if (s == myRank)
+      continue;
+    uint64_t* waitAt = reinterpret_cast<uint64_t*>(localSignals) + s;
+    rocshmem::anvil::waitSignal(waitAt, 1ull);
+  }
+
+  for (int s = 0; s < nRanks; ++s) {
+    if (s == myRank)
+      continue;
+    const float* src =  + (size_t)s * (size_t)chunk;
+    float* dst = recvbuff + (size_t)s * (size_t)chunk;
+    for (int i = 0; i < chunk; ++i)
+      dst[i] = src[i];
+  }
+
 }
 
 __global__ void anvilTwoShotPhase2Kernel(const float* __restrict__ sendbuff, float* __restrict__ recvbuff,
@@ -120,7 +167,7 @@ __global__ void anvilTwoShotPhase2Kernel(const float* __restrict__ sendbuff, flo
 
 ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, size_t count,
                                           ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
-                                          cudaStream_t stream) {
+                                          hipStream_t stream) {
   if (rcclParamAnvilTwoShotAllreduce() == 0)
     return ncclInvalidUsage;
   if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr)
@@ -131,8 +178,7 @@ ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, 
     return ncclInvalidUsage;
 
   const int nr = comm->nRanks;
-  if (nr <= 0 || comm->sdmaTempBuffer == nullptr || comm->sdmaTempBufferPeerPtrs_d == nullptr ||
-      comm->deviceHandles_d == nullptr)
+  if (nr <= 0 || comm->sdmaTempBuffer == nullptr || comm->remoteBufs == nullptr || comm->deviceHandles_d == nullptr)
     return ncclInvalidUsage;
 
   if (count > (size_t)INT_MAX || (int)count % nr != 0)
@@ -142,31 +188,25 @@ ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, 
   const int chunk = icount / nr;
   const size_t chunkBytes = (size_t)chunk * sizeof(float);
   const size_t stageBytes = (size_t)nr * chunkBytes;
-  const size_t hdrExpected = crossHeaderBytes(nr);
-  if (comm->sdmaTempBufferCrossSignalBytes != hdrExpected ||
-      comm->sdmaTempBufferDataByteOffset != hdrExpected)
-    return ncclInvalidUsage;
 
-  const size_t need = comm->sdmaTempBufferDataByteOffset + 2ull * stageBytes;
-  if (need > comm->sdmaTempBufferBytes)
-    return ncclInvalidUsage;
+  void *sdmaTempBufferPeerPtrs_d = comm->remoteBufs;
+  void *localTempBuf = comm->sdmaFineGrainedTempBuf;
+
+  uint64_t **remoteSignals = comm->remoteSignals;
+  uint64_t **remoteBarriers = comm->remoteBarriers;
+  uint64_t *localBarriers = comm->localBarriers;
+  uint64_t *localSignals = comm->localSignals;
+
 
   const float* sb = reinterpret_cast<const float*>(sendbuff);
   float* rb = reinterpret_cast<float*>(recvbuff);
 
-  CUDACHECK(hipMemsetAsync(comm->sdmaTempBuffer, 0, comm->sdmaTempBufferCrossSignalBytes, stream));
+  CUDACHECK(hipMemsetAsync(comm->sdmaFineGrainedTempBuf, 0, comm->sdmaFineGrainedTempBytes, stream));
 
-  hipLaunchKernelGGL(anvilTwoShotPhase1Kernel, dim3(1), dim3(1), 0, stream, sb, rb, icount, nr,
-                     comm->rank, comm->sdmaTempBufferPeerPtrs_d, comm->deviceHandles_d,
-                     comm->sdmaTempBufferDataByteOffset);
+  hipLaunchKernelGGL(anvilTwoShotPhase1Kernel, dim3(1), dim3(1), 0, stream, sb, rb, comm->sdmaFineGrainedTempBuf, icount, nr,
+                     comm->rank, sdmaTempBufferPeerPtrs_d, comm->deviceHandles_d, remoteSignals, remoteBarriers, localSignals, 			   localBarriers);
   CUDACHECK(hipGetLastError());
 
-  CUDACHECK(hipMemsetAsync(comm->sdmaTempBuffer, 0, comm->sdmaTempBufferCrossSignalBytes, stream));
-
-  hipLaunchKernelGGL(anvilTwoShotPhase2Kernel, dim3(1), dim3(1), 0, stream, sb, rb, icount, nr, comm->rank,
-                     comm->sdmaTempBufferPeerPtrs_d, comm->deviceHandles_d,
-                     comm->sdmaTempBufferDataByteOffset);
-  CUDACHECK(hipGetLastError());
 
   return ncclSuccess;
 }

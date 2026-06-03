@@ -2243,12 +2243,15 @@ static ncclResult_t sdmaExchangeFineGrainedIpcTempBuf(ncclComm_t comm) {
   ncclResult_t res = ncclSuccess;
   const size_t allocBytes = kSdmaFineGrainedIpcTempMinBytes;
   const size_t syncBytes = kSdmaSyncBufferNumUint64 * sizeof(uint64_t);
-  cudaIpcMemHandle_t localIpc;
+  const size_t barrierBytes = 32 * kSdmaSyncBufferNumUint64 * sizeof(uint64_t); //max CUs = 32
+
+  cudaIpcMemHandle_t localIpc, localIpcFlag, localIpcBarrier;
   void* syncRaw = nullptr;
+  void* barrierRaw = nullptr;
 
 
   comm->sdmaFineGrainedTempBuf = nullptr;
-  comm->sdmaFineGrainedTempBytes = 0;
+  comm->sdmaFineGrainedTempBytes = allocBytes;
   comm->sdmaFineGrainedIpcHandles = nullptr;
 
   comm->sdmaSyncBuffer = nullptr;
@@ -2269,16 +2272,69 @@ static ncclResult_t sdmaExchangeFineGrainedIpcTempBuf(ncclComm_t comm) {
                                     (int)sizeof(cudaIpcMemHandle_t)),
                 res, fail);
 
+  //anvil signal buffer
   CUDACHECKGOTO(hipExtMallocWithFlags(&syncRaw, syncBytes, sdmaFineGrainedMallocFlags(comm->archName)),
                 res, fail);
   comm->sdmaSyncBuffer = reinterpret_cast<uint64_t*>(syncRaw);
   comm->sdmaSyncBufferBytes = syncBytes;
   CUDACHECKGOTO(hipMemset(comm->sdmaSyncBuffer, 0, syncBytes), res, fail);
 
+  memset(&localIpcFlag, 0, sizeof(localIpcFlag));
+  CUDACHECKGOTO(cudaIpcGetMemHandle(&localIpcFlag, comm->sdmaSyncBuffer), res, fail);
+
+  NCCLCHECKGOTO(ncclCalloc(&comm->sdmaSyncIpcHandles, comm->nRanks), res, fail);
+  memcpy(comm->sdmaSyncIpcHandles + comm->rank, &localIpcFlag, sizeof(localIpcFlag));
+
+  NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, comm->sdmaSyncIpcHandles,
+                                    (int)sizeof(cudaIpcMemHandle_t)),
+                res, fail);
+
+ //sdma kernel barrier buffer
+  CUDACHECKGOTO(hipExtMallocWithFlags(&barrierRaw, barrierBytes, sdmaFineGrainedMallocFlags(comm->archName)),
+                res, fail);
+  comm->sdmaBarrierBuffer = reinterpret_cast<uint64_t*>(barrierRaw);
+  comm->sdmaBarrierBufferBytes = barrierBytes;
+  CUDACHECKGOTO(hipMemset(comm->sdmaBarrierBuffer, 0, barrierBytes), res, fail);
+
+  memset(&localIpcBarrier, 0, sizeof(localIpcBarrier));
+  CUDACHECKGOTO(cudaIpcGetMemHandle(&localIpcBarrier, comm->sdmaBarrierBuffer), res, fail);
+
+  NCCLCHECKGOTO(ncclCalloc(&comm->sdmaBarrierIpcHandles, comm->nRanks), res, fail);
+  memcpy(comm->sdmaBarrierIpcHandles + comm->rank, &localIpcBarrier, sizeof(localIpcBarrier));
+
+  NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, comm->sdmaBarrierIpcHandles,
+                                    (int)sizeof(cudaIpcMemHandle_t)),
+                res, fail);
   INFO(NCCL_INIT,
        "SDMA tempBuffer IPC: %zu B + syncBuffer: %zu B uint64_t[%zu] (rank %d of %d); temp IPC via "
        "bootstrapAllGather",
-       tempBytes, syncBytes, kSdmaSyncBufferNumUint64, comm->rank, comm->nRanks);
+       allocBytes, syncBytes, kSdmaSyncBufferNumUint64, comm->rank, comm->nRanks);
+
+  for (int i = 0; i < comm->nRanks; i++) {
+    if (i == comm->rank) {
+	comm->remoteBufs[i] = nullptr;
+	comm->remoteSignals[i] = nullptr;
+	comm->remoteBarriers[i] = nullptr;
+	continue;
+    }
+    void *remoteOut = nullptr;
+    void *remoteSig = nullptr;
+    void *remoteBarrier = nullptr;
+
+    CUDACHECKGOTO(hipIpcOpenMemHandle(&remoteOut, comm->sdmaFineGrainedIpcHandles[i],
+                                  hipIpcMemLazyEnablePeerAccess), res, fail);
+    CUDACHECKGOTO(hipIpcOpenMemHandle(&remoteSig, comm->sdmaSyncIpcHandles[i],
+                                  hipIpcMemLazyEnablePeerAccess), res, fail);
+    CUDACHECKGOTO(hipIpcOpenMemHandle(&remoteBarrier, comm->sdmaBarrierIpcHandles[i],
+                                  hipIpcMemLazyEnablePeerAccess), res, fail);
+    comm->remoteBufs[i] = remoteOut;
+    comm->remoteSignals[i] = static_cast<uint64_t*>(remoteSig);
+    comm->remoteBarriers[i] = static_cast<uint64_t*>(remoteBarrier);
+    
+  }
+  comm->localSignals = comm->sdmaSyncBuffer;
+  comm->localBarriers = comm->sdmaBarrierBuffer;
+
   return ncclSuccess;
 fail:
   free(comm->sdmaFineGrainedIpcHandles);
@@ -2288,11 +2344,21 @@ fail:
     comm->sdmaFineGrainedTempBuf = nullptr;
     comm->sdmaFineGrainedTempBytes = 0;
   }
+  free(comm->sdmaSyncIpcHandles);
+  comm->sdmaSyncIpcHandles = nullptr;
   if (comm->sdmaSyncBuffer) {
     CUDACHECKIGNORE(hipFree((void*)comm->sdmaSyncBuffer));
     comm->sdmaSyncBuffer = nullptr;
     comm->sdmaSyncBufferBytes = 0;
   }
+  free(comm->sdmaBarrierIpcHandles);
+  comm->sdmaBarrierIpcHandles = nullptr;
+  if (comm->sdmaBarrierBuffer) {
+    CUDACHECKIGNORE(hipFree((void*)comm->sdmaBarrierBuffer));
+    comm->sdmaBarrierBuffer = nullptr;
+    comm->sdmaBarrierBufferBytes = 0;
+  }
+
   return res;
 }
 #endif

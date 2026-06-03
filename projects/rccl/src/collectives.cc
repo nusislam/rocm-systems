@@ -384,6 +384,7 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
   if (rcclParamAnvilTwoShotAllreduce() != 0) {
+    printf("Anvil SDMA allred\n");	  
     ncclResult_t ar =
         rcclAnvilTwoShotAllReduceTry(sendbuff, recvbuff, count, datatype, op, comm, stream);
     if (ar == ncclSuccess) return ncclSuccess;

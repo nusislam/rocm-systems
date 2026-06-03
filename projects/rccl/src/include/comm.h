@@ -803,6 +803,18 @@ struct ncclComm {
   // Fine-grained device sync words (local); distinct from sdmaTempBuffer and tempBuff [RCCL / SDMA]
   uint64_t* sdmaSyncBuffer{nullptr};
   size_t sdmaSyncBufferBytes{0};
+  cudaIpcMemHandle_t* sdmaSyncIpcHandles{nullptr};
+
+  //Fine-grained device buffer for barrier
+  uint64_t* sdmaBarrierBuffer{nullptr};
+  size_t sdmaBarrierBufferBytes{0};
+  cudaIpcMemHandle_t* sdmaBarrierIpcHandles{nullptr};
+
+  void* remoteBufs[8];
+  uint64_t* remoteSignals[8];
+  uint64_t* localSignals;
+  uint64_t* remoteBarriers[8];
+  uint64_t* localBarriers;
 
   // Direct Reduce Scatter [RCCL]
   bool enableDirectReduceScatter;
