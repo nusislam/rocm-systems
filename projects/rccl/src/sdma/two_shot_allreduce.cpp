@@ -46,7 +46,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
     const float* src = sendbuff + (size_t)peer * (size_t)chunk;
 
     uint64_t* sigPeer = remoteSignals[peer];
-    uint64_t* sig = sigPeer[myRank];
+    uint64_t* sig = sigPeer + myRank;
     rocshmem::anvil::SdmaQueueDeviceHandle* hqPtr = devHandles[peer * kNumSdmaChannels + 0];
     if (hqPtr == nullptr)
       return;
@@ -90,7 +90,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
     const float* src = recvbuff + (size_t)myRank * (size_t)chunk;
 
     uint64_t* sigPeer = remoteSignals[peer];
-    uint64_t* sig = sigPeer[myRank];
+    uint64_t* sig = sigPeer + myRank;
     rocshmem::anvil::SdmaQueueDeviceHandle* hqPtr = devHandles[peer * kNumSdmaChannels + 0];
     if (hqPtr == nullptr)
       return;
@@ -178,7 +178,8 @@ ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, 
     return ncclInvalidUsage;
 
   const int nr = comm->nRanks;
-  if (nr <= 0 || comm->sdmaFineGrainedTempBuf == nullptr || comm->remoteBufs == nullptr || comm->deviceHandles_d == nullptr)
+  if (nr <= 0 || comm->sdmaFineGrainedTempBuf == nullptr || comm->sdmaFineGrainedIpcHandles == nullptr || 
+		  comm->localSignals == nullptr || comm->deviceHandles_d == nullptr)
     return ncclInvalidUsage;
 
   if (count > (size_t)INT_MAX || (int)count % nr != 0)
@@ -189,7 +190,9 @@ ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, 
   const size_t chunkBytes = (size_t)chunk * sizeof(float);
   const size_t stageBytes = (size_t)nr * chunkBytes;
 
-  void *sdmaTempBufferPeerPtrs_d = comm->remoteBufs;
+  //void *sdmaTempBufferPeerPtrs_d = comm->remoteBufs;
+  void** sdmaTempBufferPeerPtrs_d = comm->remoteBufs;
+
   void *localTempBuf = comm->sdmaFineGrainedTempBuf;
 
   uint64_t **remoteSignals = comm->remoteSignals;
@@ -203,7 +206,9 @@ ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, 
 
   CUDACHECK(hipMemsetAsync(comm->sdmaFineGrainedTempBuf, 0, comm->sdmaFineGrainedTempBytes, stream));
 
-  hipLaunchKernelGGL(anvilTwoShotPhase1Kernel, dim3(1), dim3(1), 0, stream, sb, rb, comm->sdmaFineGrainedTempBuf, icount, nr,
+  printf("Invoking the kernel %d\n", comm->rank);
+  float* tmpBuf = reinterpret_cast<float*>(comm->sdmaFineGrainedTempBuf);
+  hipLaunchKernelGGL(anvilTwoShotPhase1Kernel, dim3(1), dim3(1), 0, stream, sb, rb, tmpBuf, icount, nr,
                      comm->rank, sdmaTempBufferPeerPtrs_d, comm->deviceHandles_d, remoteSignals, remoteBarriers, localSignals, 			   localBarriers);
   CUDACHECK(hipGetLastError());
 
