@@ -56,14 +56,14 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
 					void** __restrict__ peerTempPtrs,
                                          rocshmem::anvil::SdmaQueueDeviceHandle** __restrict__ devHandles,
                                          uint64_t** __restrict__ remoteSignals, uint64_t** remoteBarriers, 
-					 uint64_t* localSignals, uint64_t* localBarriers, uint64_t val ) {
+					 uint64_t* localSignals, uint64_t* localBarriers, uint64_t *val ) {
   /*if (threadIdx.x != 0 || blockIdx.x != 0)
     return;*/
   if (blockIdx.x >= kMaxSdmaBarrierBlocks)
     return;
 
 
-  anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, val);
+  anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, *val);
 
   const int chunk = count / nRanks;
   const size_t chunkBytes = (size_t)chunk * sizeof(float);
@@ -118,7 +118,8 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   }
 
   __syncthreads();
-  anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, val + 1);
+  *val = *val + 1;
+  anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, *val);
 
   //need a barrier
   // allgather
@@ -153,7 +154,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
     if (s == myRank)
       continue;
     uint64_t* waitAt = reinterpret_cast<uint64_t*>(localSignals) + s;
-    rocshmem::anvil::waitSignal(waitAt, 1ull);
+    rocshmem::anvil::waitSignal(waitAt, 2ull);
   }
 
   for (int s = 0; s < nRanks; ++s) {
@@ -165,7 +166,8 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
       dst[i] = src[i];
   }
 
-  anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, val + 2);
+  *val = *val + 1;
+  anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, *val);
 
 }
 
@@ -201,7 +203,7 @@ ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, 
   uint64_t *localBarriers = comm->localBarriers;
   //uint64_t *localSignals = comm->localSignals;
 
-
+  comm->sdmaAnvilBarrierFlag = comm->sdmaAnvilBarrierFlag + 1;
   const float* sb = reinterpret_cast<const float*>(sendbuff);
   float* rb = reinterpret_cast<float*>(recvbuff);
 
@@ -214,7 +216,7 @@ ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, 
   float* tmpBuf = reinterpret_cast<float*>(comm->sdmaFineGrainedTempBuf);
   hipLaunchKernelGGL(anvilTwoShotPhase1Kernel, dim3(1), dim3(1), 0, stream, sb, rb, tmpBuf, icount, nr,
                      comm->rank, comm->sdmaFineGrainedTempPeerPtrs_d, comm->deviceHandles_d, comm->sdmaSyncBufferPeerPtrs_d, 
-		     comm->sdmaBarrierBufferPeerPtrs_d, comm->sdmaSyncBuffer, comm->sdmaBarrierBuffer, 1);
+		     comm->sdmaBarrierBufferPeerPtrs_d, comm->sdmaSyncBuffer, comm->sdmaBarrierBuffer, &(comm->sdmaAnvilBarrierFlag));
   CUDACHECK(hipGetLastError());
 
 
