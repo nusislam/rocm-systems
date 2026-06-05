@@ -821,6 +821,9 @@ struct ncclComm {
   size_t sdmaBarrierBufferBytes{0};
   cudaIpcMemHandle_t* sdmaBarrierIpcHandles{nullptr};
 
+  void** sdmaBarrierBufferPeerOpenedHost{nullptr};
+  uint64_t** sdmaBarrierBufferPeerPtrs_d{nullptr};
+
   void* remoteBufs[8];
   uint64_t* remoteSignals[8];
   uint64_t* localSignals;

@@ -64,7 +64,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   }
 
   for (int s = 0; s < nRanks; ++s) {
-    if (s == myRank)+
+    if (s == myRank)
       continue;
     uint64_t* waitAt = reinterpret_cast<uint64_t*>(localSignals) + s;
     rocshmem::anvil::waitSignal(waitAt, 1ull);
@@ -123,55 +123,6 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   }*/
 
 }
-
-/*__global__ void anvilTwoShotPhase2Kernel(const float* __restrict__ sendbuff, float* __restrict__ recvbuff,
-                                         int count, int nRanks, int myRank, void** __restrict__ peerTempPtrs,
-                                         rocshmem::anvil::SdmaQueueDeviceHandle** __restrict__ devHandles,
-                                         size_t dataByteOffset) {
-  (void)sendbuff;
-  if (threadIdx.x != 0 || blockIdx.x != 0)
-    return;
-
-  const int chunk = count / nRanks;
-  const size_t chunkBytes = (size_t)chunk * sizeof(float);
-  const size_t stageBytes = (size_t)nRanks * chunkBytes;
-  char* myTemp = reinterpret_cast<char*>(peerTempPtrs[myRank]);
-  const size_t stage2Off = dataByteOffset + stageBytes;
-
-  for (int peer = 0; peer < nRanks; ++peer) {
-    if (peer == myRank)
-      continue;
-    void* peerBase = peerTempPtrs[peer];
-    char* peerC = reinterpret_cast<char*>(peerBase);
-    float* dst = reinterpret_cast<float*>(peerC + stage2Off) + (size_t)myRank * (size_t)chunk;
-    const float* src = recvbuff + (size_t)myRank * (size_t)chunk;
-    uint64_t* sig = reinterpret_cast<uint64_t*>(peerBase) + nRanks + myRank;
-    rocshmem::anvil::SdmaQueueDeviceHandle* hqPtr = devHandles[peer * kNumSdmaChannels + 1];
-    if (hqPtr == nullptr)
-      hqPtr = devHandles[peer * kNumSdmaChannels + 0];
-    if (hqPtr == nullptr)
-      return;
-    rocshmem::anvil::SdmaQueueDeviceHandle& hq = *hqPtr;
-    rocshmem::anvil::putSignal(hq, dst, const_cast<float*>(src), chunkBytes, sig);
-  }
-
-  for (int s = 0; s < nRanks; ++s) {
-    if (s == myRank)
-      continue;
-    uint64_t* waitAt = reinterpret_cast<uint64_t*>(myTemp) + nRanks + s;
-    rocshmem::anvil::waitSignal(waitAt, 1ull);
-  }
-
-  float* myStage2 = reinterpret_cast<float*>(myTemp + stage2Off);
-  for (int s = 0; s < nRanks; ++s) {
-    if (s == myRank)
-      continue;
-    const float* src = myStage2 + (size_t)s * (size_t)chunk;
-    float* dst = recvbuff + (size_t)s * (size_t)chunk;
-    for (int i = 0; i < chunk; ++i)
-      dst[i] = src[i];
-  }
-}*/
 
 ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, size_t count,
                                           ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
