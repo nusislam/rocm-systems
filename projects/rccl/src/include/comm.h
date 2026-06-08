@@ -825,6 +825,7 @@ struct ncclComm {
   uint64_t** sdmaBarrierBufferPeerPtrs_d{nullptr};
 
   uint64_t sdmaAnvilBarrierFlag{0};
+  uint64_t sdmaAnvilSignalFlag{0};
 
   void* remoteBufs[8];
   uint64_t* remoteSignals[8];

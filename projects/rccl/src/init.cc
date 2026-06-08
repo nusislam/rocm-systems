@@ -70,7 +70,7 @@
 #endif
 
 #include "sdma/anvil.hpp"
-#define NUM_SDMA_CHANNELS 2
+#define NUM_SDMA_CHANNELS 1
 
 #include "latency_profiler/CollTrace.h"
 #include "latency_profiler/CollTraceFunc.h"
@@ -2382,6 +2382,8 @@ static ncclResult_t sdmaExchangeFineGrainedIpcTempBuf(ncclComm_t comm) {
        "bootstrapAllGather",
        allocBytes, syncBytes, kSdmaSyncBufferNumUint64, comm->rank, comm->nRanks);
 
+  comm->sdmaAnvilBarrierFlag = 1ull;
+  comm->sdmaAnvilSignalFlag = 1ull;
 
   comm->sdmaFineGrainedTempPeerOpenedHost = (void**)calloc((size_t)comm->nRanks, sizeof(void*));
   if (comm->sdmaFineGrainedTempPeerOpenedHost == nullptr) {
