@@ -480,6 +480,14 @@ __device__ __forceinline__ void put(SdmaQueueDeviceHandle& handle, void* dst, vo
   put_signal_counter_impl<true, false, false>(handle, dst, src, size, nullptr, nullptr);
 }
 
+// Same-device copy via the local SDMA queue (peer == myRank). Multi-threaded kernels
+// must call putSelf or putSignal on every active lane so divergent skips do not hang
+// inside submitPacket's wave_barrier.
+__device__ __forceinline__ void putSelf(SdmaQueueDeviceHandle& handle, void* dst, void* src,
+                                        size_t size) {
+  put(handle, dst, src, size);
+}
+
 __device__ __forceinline__ void putSignal(SdmaQueueDeviceHandle& handle, void* dst, void* src,
                                           size_t size, uint64_t* signal) {
   put_signal_counter_impl<true, true, false>(handle, dst, src, size, signal, nullptr);
