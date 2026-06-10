@@ -386,15 +386,19 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
   if (rcclParamAnvilTwoShotAllreduce() != 0) {
     //printf("Anvil SDMA allred\n");	  
     int flag1 = comm->sdmaAnvilBarrierFlag;
-    int flag2 = flag1 + 1;
+    int flagMid = flag1 + 1;
+    int flag2 = flagMid + 1;
+
     int flag3 = comm->sdmaAnvilSignalFlag;
+    int flag4 = flag3 + 1;
+
     ncclResult_t ar =
-        rcclAnvilTwoShotAllReduceTry(sendbuff, recvbuff, count, datatype, op, comm, stream, flag1, flag2, flag3);
+        rcclAnvilTwoShotAllReduceTry(sendbuff, recvbuff, count, datatype, op, comm, stream, flag1, flag2, flag3, flag4, flagMid);
     if (ar == ncclSuccess) return ncclSuccess;
     if (ar != ncclInvalidUsage) return ar;
 
     comm->sdmaAnvilBarrierFlag = flag2 + 1;
-    comm->sdmaAnvilSignalFlag = flag3 + 1;
+    comm->sdmaAnvilSignalFlag = flag4 + 1;
   }
 #endif
   return ncclEnqueueCheck(&info);
