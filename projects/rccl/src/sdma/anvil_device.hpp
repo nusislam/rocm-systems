@@ -287,6 +287,7 @@ struct SdmaQueueDeviceHandle {
         // maxWritePtr visible to quiet callers on other CUs.
         __hip_atomic_store(&maxWritePtr, pendingWptr, __ATOMIC_RELAXED,
                            __HIP_MEMORY_SCOPE_AGENT);
+	//maxWritePtr = pendingWptr;
         break;
       }
       __builtin_amdgcn_s_sleep(1);

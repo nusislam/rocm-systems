@@ -58,14 +58,10 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   if (blockIdx.x >= 1)
     return;
 
-  // Barrier values 1/2/3: sdmaBarrierBuffer is reset to zero before each kernel launch.
-  constexpr uint64_t kBarrierVal0 = 1ull;
-  constexpr uint64_t kSignalRs = 1ull;
-  constexpr uint64_t kSignalAg = 2ull;
 
   anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, bar1);
-  if (threadIdx.x == 0) 
-	  printf("Back from barrier1\n");
+  /*if (threadIdx.x == 0) 
+	  printf("Back from barrier1\n");*/
 
   const int chunk = count / nRanks;
   const size_t chunkBytes = (size_t)chunk * sizeof(float);
@@ -99,8 +95,6 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
 
   __syncthreads();
 
-  if (threadIdx.x == 0) 
-  	printf("WaitSignal RS thresh = %zu\n", kSignalRs);
   if (threadIdx.x < nRanks) {
     s = threadIdx.x;
     uint64_t* waitAt = reinterpret_cast<uint64_t*>(localSignals) + s;
@@ -108,25 +102,15 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   }
   __syncthreads();
 
-  if (threadIdx.x == 0) {
-  for (int i = 0; i < chunk; ++i) {
+  //local reduction
+  const int tid = threadIdx.x;
+  const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int totalThreads = blockDim.x * gridDim.x;
+
+  for (int i = gid; i < chunk; i += totalThreads) {
     const size_t idx = (size_t)myRank * (size_t)chunk + (size_t)i;
     float acc = sendbuff[idx];
-
-    for (int s = 0; s < nRanks; ++s) {
-      if (s == myRank)
-        continue;
-      size_t idx1 = (size_t)s * (size_t)chunk + (size_t)i;
-      float acc1 = tmpbuff[idx1];
-      acc += acc1;
-    }
-    recvbuff[idx] = acc;
-  }
-  }
-  /*for (int i = threadIdx.x; i < chunk; i += blockDim.x) {
-    const size_t idx = (size_t)myRank * (size_t)chunk + (size_t)i;
-    float acc = sendbuff[idx];
-
+#pragma unroll
     for (int s = 0; s < nRanks; ++s) {
       if (s == myRank)
         continue;
@@ -134,7 +118,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
       acc += tmpbuff[idx1];
     }
     recvbuff[idx] = acc;
-  }*/
+  }
 
   __syncthreads();
   anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, barMid);
@@ -158,8 +142,8 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   }
   __syncthreads();
 
-  if (threadIdx.x == 0)
-  	printf("Put done\n");
+  /*if (threadIdx.x == 0)
+  	printf("Put done\n");*/
 
   if (threadIdx.x < nRanks) {
     peer = threadIdx.x;
@@ -169,38 +153,26 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   }
   __syncthreads();
 
-  if (threadIdx.x == 0) 
-	  printf("Waiting\n");
   if (threadIdx.x < nRanks) {
-    s = threadIdx.x;
-    if (s != myRank) {
+    	s = threadIdx.x;
     	uint64_t* waitAt = reinterpret_cast<uint64_t*>(localSignals) + s;
     	rocshmem::anvil::waitSignal(waitAt, (uint64_t) signal2);
-    }
   }
   __syncthreads();
   
-  if (threadIdx.x == 0) 
-  	printf("Waiting done\n");
 
   if (threadIdx.x < nRanks) {
     s = threadIdx.x;
-    if (s != myRank) {
-    	const float* src =  tmpbuff + (size_t)s * (size_t)chunk;
-    	float* dst = recvbuff + (size_t)s * (size_t)chunk;
-    	for (int i = 0; i < chunk; ++i)
-      		dst[i] = src[i];
-    }
+    const float* src =  tmpbuff + (size_t)s * (size_t)chunk;
+    float* dst = recvbuff + (size_t)s * (size_t)chunk;
+    for (int i = 0; i < chunk; ++i)
+      	dst[i] = src[i];
   }
   __syncthreads();
 
-  if (threadIdx.x == 0)
-  	printf("Going to barrier\n");
 
   anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, bar2);
 
-  if (threadIdx.x == 0)
-  	printf("barrier done\n");
 }
 
 ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, size_t count,
@@ -230,20 +202,12 @@ ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, 
   const size_t chunkBytes = (size_t)chunk * sizeof(float);
   const size_t stageBytes = (size_t)nr * chunkBytes;
 
-  //uint64_t **remoteSignals = comm->remoteSignals;
   uint64_t **remoteBarriers = comm->remoteBarriers;
   uint64_t *localBarriers = comm->localBarriers;
-  //uint64_t *localSignals = comm->localSignals;
 
   const float* sb = reinterpret_cast<const float*>(sendbuff);
   float* rb = reinterpret_cast<float*>(recvbuff);
 
-  /*CUDACHECK(hipMemsetAsync(comm->sdmaFineGrainedTempBuf, 0, comm->sdmaFineGrainedTempBytes, stream));
-  CUDACHECK(hipMemsetAsync(comm->sdmaSyncBuffer, 0, comm->sdmaSyncBufferBytes, stream));
-  CUDACHECK(hipMemsetAsync(comm->sdmaBarrierBuffer, 0, comm->sdmaBarrierBufferBytes, stream));*/
-
-
-  //printf("Invoking the kernel signal thresh = %zu\n", comm->sdmaAnvilSignalFlag);
   float* tmpBuf = reinterpret_cast<float*>(comm->sdmaFineGrainedTempBuf);
   hipLaunchKernelGGL(anvilTwoShotPhase1Kernel, dim3(1), dim3(8), 0, stream, sb, rb, tmpBuf, icount, nr,
                      comm->rank, comm->sdmaFineGrainedTempPeerPtrs_d, comm->deviceHandles_d, comm->sdmaSyncBufferPeerPtrs_d, 
