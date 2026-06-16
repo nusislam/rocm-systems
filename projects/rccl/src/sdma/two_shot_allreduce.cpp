@@ -209,7 +209,7 @@ ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, 
   float* rb = reinterpret_cast<float*>(recvbuff);
 
   float* tmpBuf = reinterpret_cast<float*>(comm->sdmaFineGrainedTempBuf);
-  hipLaunchKernelGGL(anvilTwoShotPhase1Kernel, dim3(1), dim3(8), 0, stream, sb, rb, tmpBuf, icount, nr,
+  hipLaunchKernelGGL(anvilTwoShotPhase1Kernel, dim3(1), dim3(512), 0, stream, sb, rb, tmpBuf, icount, nr,
                      comm->rank, comm->sdmaFineGrainedTempPeerPtrs_d, comm->deviceHandles_d, comm->sdmaSyncBufferPeerPtrs_d, 
 		     comm->sdmaBarrierBufferPeerPtrs_d, comm->sdmaSyncBuffer, comm->sdmaBarrierBuffer, bar1, bar2, signal1, signal2, barMid);
 
