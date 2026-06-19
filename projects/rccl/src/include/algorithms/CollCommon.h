@@ -104,6 +104,62 @@ static inline __device__ void copyFromSrcToDest(
   }
 }
 
+// Each rank writes its per-destination sendbuff slices to remote ipcbuffs.
+// ipcbuffs[r][selfRank*count + idx] receives sendbuff[r*count + idx] from rank selfRank.
+// ipcbuffs[r] must be NRANKS * count elements.
+template <typename T, int NRANKS>
+static inline __device__ void reduceScatterWrite(
+    T* const* __restrict__ ipcbuffs,
+    const T* __restrict__ sendbuff,
+    int selfRank,
+    const size_t idxStart,
+    const size_t idxEnd,
+    const size_t idxStride) {
+  static_assert(is_supported_type_v<T>, "dda: unsupported element type");
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    const size_t destIdx = static_cast<size_t>(selfRank) * idxEnd + idx;
+#pragma unroll NRANKS
+    for (int r = 0; r < NRANKS; ++r) {
+      const size_t srcIdx = static_cast<size_t>(r) * idxEnd + idx;
+      *reinterpret_cast<uint4*>(&ipcbuffs[r][destIdx]) =
+          reinterpret_cast<const uint4*>(&sendbuff[srcIdx])[0];
+    }
+  }
+}
+
+// Reduce NRANKS slots from a single local ipcbuff into destbuff.
+// ipcbuff[r*count + idx] holds rank r's contribution to this rank's output chunk.
+template <typename T, int NRANKS, bool hasAcc>
+static inline __device__ void localReduce(
+    const T* __restrict__ ipcbuff,
+    T* __restrict__ destbuff,
+    const T* __restrict__ acc,
+    const size_t idxStart,
+    const size_t idxEnd,
+    const size_t idxStride) {
+  static_assert(is_supported_type_v<T>, "dda: unsupported element type");
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    uint4 sum{0, 0, 0, 0};
+    if constexpr (hasAcc) {
+      sum = reinterpret_cast<const uint4*>(&acc[idx])[0];
+    }
+    uint4 vals[2];
+    *reinterpret_cast<uint4*>(&vals[0]) =
+        reinterpret_cast<const uint4*>(&ipcbuff[idx])[0];
+#pragma unroll NRANKS - 1
+    for (int r = 0; r < NRANKS - 1; ++r) {
+      *reinterpret_cast<uint4*>(&vals[(r + 1) & 1]) =
+          reinterpret_cast<const uint4*>(
+              &ipcbuff[static_cast<size_t>(r + 1) * idxEnd + idx])[0];
+      sum = vecElementAdd<T>(sum, vals[r & 1]);
+    }
+    sum = vecElementAdd<T>(sum, vals[(NRANKS - 1) & 1]);
+    *reinterpret_cast<uint4*>(&destbuff[idx]) =
+        *reinterpret_cast<const uint4*>(&sum);
+  }
+}
+
+
 template <typename T, int NRANKS, bool hasAcc>
 static inline __device__ void reduceScatter(
     T* const* __restrict__ ipcbuffs,
@@ -168,6 +224,26 @@ static inline __device__ void allGather(
           reinterpret_cast<const uint4*>(&ipcbuffs[srcRank][srcIdx])[0];
     }
   }
+}
+
+template <typename T, int NRANKS>
+static inline __device__ void allGatherWrite(
+    T* const* __restrict__ ipcbuffs,
+    const T* __restrict__ sendbuff,
+    int selfRank,
+    const size_t idxStart,
+    const size_t idxEnd,
+    const size_t idxStride) {
+  static_assert(is_supported_type_v<T>, "dda: unsupported element type");
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    const uint4 val = reinterpret_cast<const uint4*>(&sendbuff[idx])[0];
+    const size_t destIdx = static_cast<size_t>(selfRank) * idxEnd + idx;
+#pragma unroll NRANKS
+    for (int r = 0; r < NRANKS; ++r) {
+      *reinterpret_cast<uint4*>(&ipcbuffs[r][destIdx]) = val;
+    }
+  }
+
 }
 
 inline uint32_t divRoundUp(size_t a, size_t b) {

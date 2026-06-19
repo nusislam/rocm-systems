@@ -85,7 +85,7 @@ static ncclResult_t ncclAllReduceDdaIpcTyped(
         count * sizeof(T),
         cudaMemcpyDeviceToDevice,
         stream));
-    meta::comms::ddaAllReduceTreeIpc<T, kDdaNranks, false>
+    meta::comms::ddaAllReduceTreeIpcWrite<T, kDdaNranks, false>
         <<<grid, block, 0, stream>>>(
             d_ipcbuffs,
             static_cast<T*>(recvbuff),
@@ -95,7 +95,7 @@ static ncclResult_t ncclAllReduceDdaIpcTyped(
             barrierHost,
             nullptr);
   } else {
-    meta::comms::ddaAllReduceFlatIpc<T, kDdaNranks, false>
+    meta::comms::ddaAllReduceFlatIpcWrite<T, kDdaNranks, false>
         <<<grid, block, 0, stream>>>(
             d_ipcbuffs,
             static_cast<T*>(recvbuff),

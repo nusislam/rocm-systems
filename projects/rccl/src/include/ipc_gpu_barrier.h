@@ -109,7 +109,7 @@ class IpcGpuBarrier {
           int selfRank,
           void* bootstrap);
 
-  template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess>
+  template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess, bool isWrite>
   __device__ __forceinline__ void syncOnSameBlockIdx() {
     enum class MemFenceType {
       RELEASE_ACQUIRE,
@@ -127,6 +127,8 @@ class IpcGpuBarrier {
 
     if constexpr (hasPreviousMemAccess) {
       __syncthreads();
+      if (isWrite)
+      	__threadfence();
     }
     if (threadIdx.x < NRANKS) {
       auto peerRank = threadIdx.x;

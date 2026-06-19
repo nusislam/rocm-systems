@@ -42,7 +42,8 @@ __global__ void ddaAllGatherIpc(
 
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
-      true /* hasSubsequentMemAccess */>();
+      true /* hasSubsequentMemAccess */,
+      false /* prevRemoteWrite */>();
 
   allGather<T, NRANKS>(
       ipcbuffs, recvbuff, selfRank, idxStart, idxEnd, idxStride, false);
@@ -50,7 +51,51 @@ __global__ void ddaAllGatherIpc(
   // barrier to ensure remote ranks won't free their buffers until I'm done
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
-      false /* hasSubsequentMemAccess */>();
+      false /* hasSubsequentMemAccess */,
+      false /* prevRemoteWrite */>();
+}
+
+// Remote-write variant: each rank pushes its chunk into every rank's ipcbuff,
+// then each rank does a local copy from its ipcbuff to recvbuff.
+// ipcbuffs[r] must be allocated as NRANKS * count elements (not count).
+template <typename T, int NRANKS, bool hasAcc>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+__global__ void ddaAllGatherIpcWrite(
+    T* const* __restrict__ ipcbuffs,
+    T* __restrict__ recvbuff,
+    size_t count,
+    const T* __restrict__ sendbuff,
+    int selfRank,
+    IpcGpuBarrier barrier) {
+
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
+
+  const auto idxStart = gtIdx * countPerThread;
+  const auto idxEnd = count;
+  const auto idxStride = gridDim.x * blockDim.x * countPerThread;
+
+  // Phase 1: push sendbuff into ipcbuffs[r][selfRank*count .. (selfRank+1)*count)
+  // for every rank r (remote write).
+  allGatherWrite<T, NRANKS>(
+      ipcbuffs, sendbuff, selfRank, idxStart, idxEnd, idxStride);
+
+  barrier.syncOnSameBlockIdx<
+      true  /* hasPreviousMemAccess */,
+      true  /* hasSubsequentMemAccess */,
+      true  /* prevRemoteWrite */>();
+
+  // Phase 2: local copy — ipcbuffs[selfRank] is now fully populated by all ranks.
+  copyFromSrcToDest<T>(
+      ipcbuffs[selfRank], recvbuff, idxStart, count * NRANKS, idxStride);
+
+  // Barrier so no rank frees its ipcbuff before peers finish their local copies.
+  barrier.syncOnSameBlockIdx<
+      true  /* hasPreviousMemAccess */,
+      false /* hasSubsequentMemAccess */,
+      false /* prevRemoteWrite */>();
 }
 
 } // namespace meta::comms

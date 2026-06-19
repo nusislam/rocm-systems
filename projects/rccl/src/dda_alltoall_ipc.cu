@@ -62,16 +62,31 @@ static ncclResult_t ncclAllToAllDdaIpcTyped(
   void* peerPtrsDev = comm->ddaIpcPeerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
-  meta::comms::ddaAllToAllIpc<T, kDdaNranks, false>
-      <<<grid, block, 0, stream>>>(
+  const char* pushEnvVar = getenv("RCCL_DDA_WRITE");
+  const bool usePushModel = (pushEnvVar != nullptr && (strcmp(pushEnvVar, "PUSH") == 0 || strcmp(pushEnvVar, "push") == 0));
+
+
+  //if (!rcclParamDdaWriteEnable()) {
+    meta::comms::ddaAllToAllIpc<T, kDdaNranks, false>
+        <<<grid, block, 0, stream>>>(
           d_ipcbuffs,
           static_cast<T*>(recvbuff),
           count,
           static_cast<const T*>(sendbuff),
           comm->rank,
           barrierHost);
+  /*} else {
+    meta::comms::ddaAllToAllPushIpc<T, kDdaNranks, false>
+        <<<grid, block, 0, stream>>>(
+          d_ipcbuffs,
+          static_cast<T*>(recvbuff),
+          count,
+          static_cast<const T*>(sendbuff),
+          comm->rank,
+          barrierHost,
+          nullptr);
+  }*/
   CUDACHECK(cudaGetLastError());
-
   return ncclSuccess;
 }
 

@@ -76,6 +76,14 @@ static ncclResult_t ncclReduceScatterDdaIpcTyped(
           static_cast<const T*>(sendbuff),
           comm->rank,
           barrierHost);
+  /*meta::comms::ddaReduceScatterIpcWrite<T, kDdaNranks, false>
+      <<<grid, block, 0, stream>>>(
+          d_ipcbuffs,
+          static_cast<T*>(recvbuff),
+          recvcount,
+          static_cast<const T*>(sendbuff),
+          comm->rank,
+          barrierHost);*/
   CUDACHECK(cudaGetLastError());
 
   return ncclSuccess;
