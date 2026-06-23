@@ -2237,7 +2237,7 @@ static ncclResult_t getParentRanks(int parentRanks, int parentRank, int* exclude
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 // HIP stacks often require a minimum allocation for IPC export (see tools/p2p-latency-test).
-static constexpr size_t kSdmaFineGrainedIpcTempMinBytes = 2u * 1024u * 1024u;
+static constexpr size_t kSdmaFineGrainedIpcTempMinBytes = 64u * 1024u * 1024u;
 // Local fine-grained sync area: cache-line worth of uint64_t words (no IPC on this slab).
 static constexpr size_t kSdmaSyncBufferNumUint64 = 8;
 
@@ -2299,7 +2299,7 @@ static ncclResult_t sdmaExchangeFineGrainedIpcTempBuf(ncclComm_t comm) {
   cudaIpcMemHandle_t localTempIpc;
   cudaIpcMemHandle_t localSyncIpc;
 
-  const size_t syncBytes = (size_t)comm->nRanks * sizeof(uint64_t); 
+  const size_t syncBytes = 32 * (size_t)comm->nRanks * sizeof(uint64_t); 
   const size_t barrierBytes = 32 * (size_t)comm->nRanks * sizeof(uint64_t); //max CUs = 32
 
   cudaIpcMemHandle_t localIpc, localIpcFlag, localIpcBarrier;

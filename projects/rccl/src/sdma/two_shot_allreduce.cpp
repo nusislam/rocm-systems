@@ -54,7 +54,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
 					void** __restrict__ peerTempPtrs,
                                          rocshmem::anvil::SdmaQueueDeviceHandle** __restrict__ devHandles,
                                          uint64_t** __restrict__ remoteSignals, uint64_t** remoteBarriers, 
-					 uint64_t* localSignals, uint64_t* localBarriers, uint64_t bar1, uint64_t bar2, uint64_t signal1, uint64_t signal2, uint64_t barMid) {
+					 uint64_t* localSignals, uint64_t* localBarriers, uint64_t bar1, uint64_t bar2, uint64_t signal1, uint64_t signal2, uint64_t barMid, int warpSize) {
   if (blockIdx.x >= 1)
     return;
 
@@ -67,9 +67,13 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   const size_t chunkBytes = (size_t)chunk * sizeof(float);
   char* myTemp = reinterpret_cast<char*>(peerTempPtrs[myRank]);
   int peer, s;
-  
-  if (threadIdx.x < nRanks) {
-    peer = threadIdx.x;	 
+
+ if (blockIdx.x == 0) { 
+  const int warpId = static_cast<int>(threadIdx.x) / warpSize;
+  const int laneId = static_cast<int>(threadIdx.x) % warpSize; 
+
+  if (laneId == 0 && warpId < nRanks) {
+    peer = warpId;	 
     rocshmem::anvil::SdmaQueueDeviceHandle* hqPtr = devHandles[peer * kNumSdmaChannels + 0];
     if (hqPtr != nullptr) {
     	rocshmem::anvil::SdmaQueueDeviceHandle& hq = *hqPtr;
@@ -86,8 +90,8 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
 
   __syncthreads();
 
-  if (threadIdx.x < nRanks) {
-    peer = threadIdx.x;
+  if (laneId == 0 && warpId < nRanks) {
+    peer = warpId;
     rocshmem::anvil::SdmaQueueDeviceHandle* hqPtr = devHandles[peer * kNumSdmaChannels + 0];
     if (hqPtr != nullptr)
        rocshmem::anvil::quiet(*hqPtr);
@@ -95,12 +99,14 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
 
   __syncthreads();
 
-  if (threadIdx.x < nRanks) {
-    s = threadIdx.x;
+  if (laneId == 0 && warpId < nRanks) {
+    //s = threadIdx.x;
+    s = warpId;
     uint64_t* waitAt = reinterpret_cast<uint64_t*>(localSignals) + s;
     rocshmem::anvil::waitSignal(waitAt, signal1);
   }
   __syncthreads();
+ }
 
   //local reduction
   const int tid = threadIdx.x;
@@ -123,55 +129,81 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   __syncthreads();
   anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, barMid);
 
-  if (threadIdx.x < nRanks) {
-    peer = threadIdx.x;
+  if (blockIdx.x == 0) {
+  const int warpId = static_cast<int>(threadIdx.x) / warpSize;
+  const int laneId = static_cast<int>(threadIdx.x) % warpSize;
+
+  if (warpId < nRanks && laneId == 0) {
+    //peer = threadIdx.x;
+    peer = warpId;
+
     rocshmem::anvil::SdmaQueueDeviceHandle* hqPtr = devHandles[peer * kNumSdmaChannels + 0];
     if (hqPtr != nullptr) {
         rocshmem::anvil::SdmaQueueDeviceHandle& hq = *hqPtr;
 
     	void* peerBase = peerTempPtrs[peer];
-    	char* peerC = reinterpret_cast<char*>(peerBase);
-    	float* dst = reinterpret_cast<float*>(peerC) + (size_t)myRank * (size_t)chunk;
+    	char* peerC = reinterpret_cast<char*>(peerBase) + (size_t)32*1024*1024;
+    	float* dst = reinterpret_cast<float*>(peerC) +  + (size_t)myRank * (size_t)chunk;
+    	//float* dst = reinterpret_cast<float*>(peerC) + (size_t)myRank * (size_t)chunk;
+
     	const float* src = recvbuff + (size_t)myRank * (size_t)chunk;
     	//const float* src = sendbuff + (size_t)myRank * (size_t)chunk;
 
     	uint64_t* sigPeer = remoteSignals[peer];
+    	//uint64_t* sig = sigPeer + nRanks + myRank;
     	uint64_t* sig = sigPeer + myRank;
+
     	rocshmem::anvil::putSignal(hq, dst, const_cast<float*>(src), chunkBytes, sig);
     }
   }
   __syncthreads();
 
-  /*if (threadIdx.x == 0)
-  	printf("Put done\n");*/
+  if (warpId < nRanks && laneId == 0) {
 
-  if (threadIdx.x < nRanks) {
-    peer = threadIdx.x;
+  //if (threadIdx.x < nRanks) {
+    peer = warpId;
     rocshmem::anvil::SdmaQueueDeviceHandle* hqPtr = devHandles[peer * kNumSdmaChannels + 0];
     if (hqPtr != nullptr)
     	rocshmem::anvil::quiet(*hqPtr);
   }
   __syncthreads();
 
-  if (threadIdx.x < nRanks) {
-    	s = threadIdx.x;
+  //if (threadIdx.x < nRanks) {
+  if (warpId < nRanks && laneId == 0) {
+    	s = warpId;
+    	//uint64_t* waitAt = reinterpret_cast<uint64_t*>(localSignals) + nRanks + s;
     	uint64_t* waitAt = reinterpret_cast<uint64_t*>(localSignals) + s;
+
     	rocshmem::anvil::waitSignal(waitAt, (uint64_t) signal2);
+    	//rocshmem::anvil::waitSignal(waitAt, (uint64_t) signal1);
+
   }
   __syncthreads();
-  
-
-  if (threadIdx.x < nRanks) {
-    s = threadIdx.x;
-    const float* src =  tmpbuff + (size_t)s * (size_t)chunk;
-    float* dst = recvbuff + (size_t)s * (size_t)chunk;
-    for (int i = 0; i < chunk; ++i)
-      	dst[i] = src[i];
   }
+  for (int i = gid; i < chunk; i += totalThreads) {
+    //const size_t idx = (size_t)myRank * (size_t)chunk + (size_t)i;
+    //float acc = sendbuff[idx];
+#pragma unroll
+    for (int r = 0; r < nRanks; ++r) {
+      if (r == myRank)
+  	continue;	      
+      int srcRank = r;
+      int destIdx = i + srcRank * chunk;
+      int srcIdx;
+      srcIdx = static_cast<int>(i);
+      char* tmpbuff = reinterpret_cast<char*>(myTemp) + (size_t)32*1024*1024;
+      float* src = reinterpret_cast<float*>(tmpbuff) + (size_t)r * (size_t)chunk;
+      recvbuff[destIdx] = src[srcIdx];
+      /**reinterpret_cast<uint4*>(&recvbuff[destIdx]) =
+          reinterpret_cast<const uint4*>(&tmpbuff[srcRank][srcIdx])[0];*/
+    }
+  }
+
   __syncthreads();
 
 
   anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, bar2);
+  //anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, barMid);
 
 }
 
@@ -208,10 +240,11 @@ ncclResult_t rcclAnvilTwoShotAllReduceTry(const void* sendbuff, void* recvbuff, 
   const float* sb = reinterpret_cast<const float*>(sendbuff);
   float* rb = reinterpret_cast<float*>(recvbuff);
 
+  int warpSize = comm->WarpSize;
   float* tmpBuf = reinterpret_cast<float*>(comm->sdmaFineGrainedTempBuf);
   hipLaunchKernelGGL(anvilTwoShotPhase1Kernel, dim3(1), dim3(512), 0, stream, sb, rb, tmpBuf, icount, nr,
                      comm->rank, comm->sdmaFineGrainedTempPeerPtrs_d, comm->deviceHandles_d, comm->sdmaSyncBufferPeerPtrs_d, 
-		     comm->sdmaBarrierBufferPeerPtrs_d, comm->sdmaSyncBuffer, comm->sdmaBarrierBuffer, bar1, bar2, signal1, signal2, barMid);
+		     comm->sdmaBarrierBufferPeerPtrs_d, comm->sdmaSyncBuffer, comm->sdmaBarrierBuffer, bar1, bar2, signal1, signal2, barMid, warpSize);
 
   CUDACHECK(hipGetLastError());
 

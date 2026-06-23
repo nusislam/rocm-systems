@@ -385,14 +385,16 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
   size_t msgSize = count * ncclTypeSize(datatype);
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-  if (rcclParamAnvilTwoShotAllreduce() != 0 && msgSize <= 1048576) {
+  if (rcclParamAnvilTwoShotAllreduce() != 0 && msgSize <= 16777216) {
     //printf("Anvil SDMA allred\n");	  
     int flag1 = comm->sdmaAnvilBarrierFlag;
     int flagMid = flag1 + 1;
     int flag2 = flagMid + 1;
+    //int flag2 = flagMid;
 
     int flag3 = comm->sdmaAnvilSignalFlag;
     int flag4 = flag3 + 1;
+    //int flag4 = flag3;
 
     ncclResult_t ar =
         rcclAnvilTwoShotAllReduceTry(sendbuff, recvbuff, count, datatype, op, comm, stream, flag1, flag2, flag3, flag4, flagMid);
