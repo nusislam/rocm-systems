@@ -394,15 +394,18 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
 
     int flag3 = comm->sdmaAnvilSignalFlag;
     int flag4 = flag3 + 1;
-    //int flag4 = flag3;
+    int flag5 = comm->sdmaAnvilIntraBarrierFlag;
+
 
     ncclResult_t ar =
-        rcclAnvilTwoShotAllReduceTry(sendbuff, recvbuff, count, datatype, op, comm, stream, flag1, flag2, flag3, flag4, flagMid);
+        rcclAnvilTwoShotAllReduceTry(sendbuff, recvbuff, count, datatype, op, comm, stream, flag1, flag2, flag3, flag4, flagMid, flag5);
     if (ar == ncclSuccess) return ncclSuccess;
     if (ar != ncclInvalidUsage) return ar;
 
     comm->sdmaAnvilBarrierFlag = flag2 + 1;
     comm->sdmaAnvilSignalFlag = flag4 + 1;
+    comm->sdmaAnvilIntraBarrierFlag = comm->sdmaAnvilIntraBarrierFlag + 4;
+
   }
 #endif
   return ncclEnqueueCheck(&info);
