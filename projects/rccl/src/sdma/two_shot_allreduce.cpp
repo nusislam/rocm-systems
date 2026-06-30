@@ -164,7 +164,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
     }
   }
 
-  __syncthreads();
+  //__syncthreads();
 
   if (laneId == 0 && warpId < nRanks) {
     peer = warpId;
@@ -173,7 +173,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
        rocshmem::anvil::quiet(*hqPtr);
   }
 
-  __syncthreads();
+  //__syncthreads();
 
   if (laneId == 0 && warpId < nRanks) {
     s = warpId;
@@ -224,7 +224,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   }
   __syncthreads();
 
-  anvilIntraGpuBlockBarrier(nRanks, blockIdx.x, localBarriers, bar3+1);
+  //anvilIntraGpuBlockBarrier(nRanks, blockIdx.x, localBarriers, bar3+1);
   anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, barMid);
 
   if (threadIdx.x == 0) {
@@ -257,7 +257,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
     	rocshmem::anvil::putSignal(hq, dst, const_cast<float*>(src), chunkBytes, sig);
     }
   }
-  __syncthreads();
+  //__syncthreads();
 
   if (warpId < nRanks && laneId == 0) {
     peer = warpId;
@@ -265,7 +265,7 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
     if (hqPtr != nullptr)
     	rocshmem::anvil::quiet(*hqPtr);
   }
-  __syncthreads();
+  //__syncthreads();
 
   if (warpId < nRanks && laneId == 0) {
     	s = warpId;
@@ -276,14 +276,14 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
   __syncthreads();
   }
 
-  anvilIntraGpuBlockBarrier(nRanks, blockIdx.x, localBarriers, bar3+2);
+  anvilIntraGpuBlockBarrier(nRanks, blockIdx.x, localBarriers, bar3+1);
 
   if (threadIdx.x == 0) {
     asm volatile("buffer_wbl2" ::: "memory");
   }
   __syncthreads();
 
-  for (int i = gid; i < chunk; i += totalThreads) {
+  /*for (int i = gid; i < chunk; i += totalThreads) {
 #pragma unroll
     for (int r = 0; r < nRanks; ++r) {
       if (r == myRank)
@@ -298,12 +298,33 @@ __global__ void anvilTwoShotPhase1Kernel(const float* __restrict__ sendbuff, flo
       float* src = reinterpret_cast<float*>(tmpbuff) + (size_t)r * (size_t)chunk;
       recvbuff[destIdx] = src[srcIdx];
     }
+  }*/
+
+  const float* myTempFloat = reinterpret_cast<float*>(myTemp);
+  for (int vi = gid; vi < vecCount; vi += totalThreads) {
+    const int i = vi * 4;
+#pragma unroll
+    for (int r = 0; r < nRanks; ++r) {
+      if (r == myRank)
+        continue;
+      const float* srcRank = myTempFloat + (size_t)r * (size_t)chunk;
+      anvilStoreVec16(recvbuff + i + r * chunk, anvilLoadVec16(srcRank + i));
+    }
+  }
+
+  for (int i = vecCount * 4 + gid; i < chunk; i += totalThreads) {
+#pragma unroll
+    for (int r = 0; r < nRanks; ++r) {
+      if (r == myRank)
+        continue;
+      recvbuff[i + r * chunk] = myTempFloat[(size_t)r * (size_t)chunk + (size_t)i];
+    }
   }
 
   __syncthreads();
 
 
-  anvilIntraGpuBlockBarrier(nRanks, blockIdx.x, localBarriers, bar3+3);
+  //anvilIntraGpuBlockBarrier(nRanks, blockIdx.x, localBarriers, bar3+3);
   anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, bar2);
 
 }
