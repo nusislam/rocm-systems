@@ -26,6 +26,7 @@ const char* ncclFuncToString(ncclFunc_t fn) {
   case ncclFuncAllGather: return "AllGather";
   case ncclFuncAllReduce: return "AllReduce";
   case ncclFuncAlltoAll: return "AlltoAll";
+  case ncclFuncAlltoAllv: return "AlltoAllv";
   case ncclFuncBroadcast: return "Broadcast";
   case ncclFuncGather: return "Gather";
   case ncclFuncRecv: return "Recv";
@@ -301,14 +302,26 @@ ncclResult_t ncclAlltoAllv_impl(const void *sendbuff, const size_t sendcounts[],
   std::vector<size_t> recvcounts1(nRanks);
 
   std::vector<size_t> sizes(4*nRanks);	//4 for sdispl, rdispl, scount, rcount
-#ifdef ENABLE_ROCSHMEM
-    for (int i = 0; i < nRanks; i++) {
+  const size_t eltSize = ncclTypeSize(datatype);
+  
+  for (int i = 0; i < nRanks; i++) {
+    sdispls1[i] = sdispls[i] * eltSize;
+    rdispls1[i] = rdispls[i] * eltSize;
+    sendcounts1[i] = sendcounts[i] * eltSize;
+    recvcounts1[i] = recvcounts[i] * eltSize;
+    sizes[i] = sendcounts1[i];
+    sizes[nRanks + i] = sdispls1[i];
+    sizes[2*nRanks + i] = recvcounts1[i];
+    sizes[3*nRanks + i] = rdispls1[i];
+  }
+
+    /*for (int i = 0; i < nRanks; i++) {
        sdispls1[i] = sdispls[i] * ncclTypeSize(datatype);
        rdispls1[i] = rdispls[i] * ncclTypeSize(datatype);
        sendcounts1[i] = sendcounts[i] * ncclTypeSize(datatype);
        recvcounts1[i] = recvcounts[i] * ncclTypeSize(datatype);
-    }
-
+    }*/
+#ifdef ENABLE_ROCSHMEM
     size_t count = sdispls1[nRanks - 1] + sendcounts1[nRanks - 1];
 
     if (comm->enableRocshmem && comm->nNodes > 1 && (comm->nRanks/comm->nNodes == 8)) {
@@ -348,7 +361,7 @@ ncclResult_t ncclAlltoAllv_impl(const void *sendbuff, const size_t sendcounts[],
     }
 #endif
 
-  Recorder::instance().skip(true);
+ /* Recorder::instance().skip(true);
   NCCLCHECK(ncclGroupStart());
   for (int r=0; r<nRanks; r++) {
     NCCLCHECK(ncclSend(
@@ -366,7 +379,14 @@ ncclResult_t ncclAlltoAllv_impl(const void *sendbuff, const size_t sendcounts[],
         comm,
         stream));
   }
-  NCCLCHECK(ncclGroupEnd());
+  NCCLCHECK(ncclGroupEnd());*/
+
+  struct ncclInfo info = { ncclFuncAlltoAllv, "AlltoAllv",
+    sendbuff, recvbuff, 0, datatype, ncclSum, 0, comm, stream,
+    ALLTOALL_CHUNKSTEPS, ALLTOALL_SLICESTEPS, nullptr };
+  info.sizes = sizes.data();
+  return ncclEnqueueCheck(&info);
+
   Recorder::instance().skip(false);
   return ncclSuccess;
 }

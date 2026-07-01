@@ -1881,11 +1881,17 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
         plan->ceCollArgs->ddaUserRecvBuff = task->ddaUserRecvBuff;
         plan->ceCollArgs->ddaCopyBackBytes = task->ddaCopyBackBytes;
         plan->ceCollArgs->collApiEventHandle = task->collApiEventHandle;
+	plan->ceCollArgs->sizes = (task->func == ncclFuncAlltoAllv) ? task->sizes : nullptr;
 
         if (comm->rank == 0) {
           const char* nvlsSync = comm->nvlsSupport ? "; CE synchronization with NVLS" : "";
-          INFO(NCCL_TUNING, "%s [Copy Engine]: %ld Bytes -> cudaMemcpy%s",
-            ncclFuncToString(task->func), task->count * ncclTypeSize(task->datatype), nvlsSync);
+          size_t ceBytes = task->count * ncclTypeSize(task->datatype);
+          if (task->func == ncclFuncAlltoAllv && task->sizes != nullptr) {
+            ceBytes = 0;
+            for (int r = 0; r < comm->nRanks; r++) ceBytes += task->sizes[r];
+          }
+	  INFO(NCCL_TUNING, "%s [Copy Engine]: %ld Bytes -> cudaMemcpy%s",
+            ncclFuncToString(task->func), ceBytes, nvlsSync);
         }
 
         ncclIntruQueueEnqueue(&planner->planQueue, plan);
@@ -3278,6 +3284,14 @@ static ncclResult_t ceCollTaskAppend(
   t->sendWin = sendWin;
   t->recvWin = recvWin;
 
+  t->sizes = nullptr;
+  if (t->func == ncclFuncAlltoAllv && info->sizes != nullptr) {
+    size_t nSizes = 4 * comm->nRanks;
+    t->sizes = ncclMemoryStackAlloc<size_t>(&comm->memScoped, nSizes);
+    memcpy(t->sizes, info->sizes, nSizes * sizeof(size_t));
+    for (int r = 0; r < comm->nRanks; r++) t->trafficBytes += t->sizes[r];
+  }
+
   ncclIntruQueueEnqueue(&planner->collCeTaskQueue, t);
 
   ncclProfilerStopCollApiEvent();
@@ -3490,10 +3504,21 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
     NCCLCHECK(rmaTaskAppend(comm, info));
   } else {
     // Empty collectives can be discarded.
-    if (info->count == 0) return ncclSuccess;
+    if (info->count == 0 && info->coll != ncclFuncAlltoAllv) return ncclSuccess;
+
+    if (info->coll == ncclFuncAlltoAllv && info->sizes != nullptr) {
+      bool hasData = false;
+      for (int r = 0; r < comm->nRanks; r++) {
+        if (info->sizes[r] != 0 || info->sizes[2*comm->nRanks + r] != 0) {
+          hasData = true;
+          break;
+        }
+      }
+      if (!hasData) return ncclSuccess;
+    }
 
     if (info->datatype == ncclFloat8e4m3 || info->datatype == ncclFloat8e5m2) {
-      if (comm->minCompCap < 90 && info->coll != ncclFuncAllGather && info->coll != ncclFuncBroadcast && info->coll != ncclFuncAlltoAll && info->coll != ncclFuncScatter && info->coll != ncclFuncGather) {
+      if (comm->minCompCap < 90 && info->coll != ncclFuncAllGather && info->coll != ncclFuncBroadcast && info->coll != ncclFuncAlltoAll && info->coll != ncclFuncAlltoAllv && info->coll != ncclFuncScatter && info->coll != ncclFuncGather) {
         WARN("FP8 reduction support begins with sm90 capable devices.");
         return ncclInvalidArgument;
       }
@@ -3504,10 +3529,17 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
     struct ncclDevRedOpFull opDev;
     NCCLCHECK(hostToDevRedOp(&opDev, info->op, info->datatype, comm));
 
-    if (comm->nRanks == 1) {
+    if (comm->nRanks == 1 && info->coll != ncclFuncAlltoAllv) {
       NCCLCHECK(ncclLaunchOneRank(info->recvbuff, info->sendbuff, info->count, opDev, info->datatype, info->stream, info->acc));
       return ncclSuccess;
     } else {
+      size_t ceBytes = 0;
+
+      if (info->coll == ncclFuncAlltoAllv) {
+
+	size_t* recvSizes = info->sizes + 2*comm->nRanks;
+	for (int r = 0; r < comm->nRanks; r++) ceBytes += recvSizes[r];
+      }
       struct ncclDevrWindow* sendWin;
       struct ncclDevrWindow* recvWin;
       ncclDevrFindWindow(comm, info->sendbuff, &sendWin);
@@ -3518,12 +3550,14 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       bool ceAvailable = ncclCeAvailable(comm, info->coll, info->op, info->datatype, winRegType);
       bool CeScartchAvailable = ncclCeScartchAvailable(comm, info->coll, info->op, info->datatype, winRegType);
       size_t recvBytes = (size_t)comm->nRanks * info->count * ncclTypeSize(info->datatype);
-      if (CeScartchAvailable && winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendNonregRecvReg && rcclParamForceCe() && comm->ddaScratch != nullptr && recvBytes <= comm->ddaScratchBytes) {
+
+      if (CeScartchAvailable && winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendNonregRecvReg && rcclParamForceCe() && comm->ddaScratch != nullptr && (recvBytes <= comm->ddaScratchBytes || (info->coll == ncclFuncAlltoAllv && ceBytes <= comm->ddaScratchBytes))) {
         INFO(NCCL_TUNING, "Using DDA scratch for CE collective, count=%zu, recvBytes=%zu", info->count, recvBytes);
+	printf("Taking CE path\n");
           NCCLCHECK(ceCollTaskAppend(comm, info, /*sendWin=*/nullptr, /*recvWin=*/nullptr,
                                      comm->ddaScratch, comm->ddaPeerPtrsHost, opDev));
       }
-      else if ((comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) && ceAvailable) {
+      else if ((comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) && ceAvailable && info->coll != ncclFuncAlltoAllv) {
         INFO(NCCL_TUNING, "Using CE collective, count=%zu, recvBytes=%zu", info->count, recvBytes);
         NCCLCHECK(ceCollTaskAppend(comm, info, sendWin, recvWin, /*ddaRecvBase=*/nullptr, /*ddaPeerBases=*/nullptr, opDev));
       }
@@ -3548,6 +3582,23 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
           for (int r=0; r<comm->nRanks; r++) {
             NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncSend, collAPI, (void*)((char*)info->sendbuff+r*info->count*ncclTypeSize(info->datatype)), info->count, info->datatype, r, allowUB));
             NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncRecv, collAPI, (void*)((char*)info->recvbuff+r*info->count*ncclTypeSize(info->datatype)), info->count, info->datatype, r, allowUB));
+          }
+        } else if (info->coll == ncclFuncAlltoAllv) {
+          allowUB = captured;
+          size_t eltSize = ncclTypeSize(info->datatype);
+          size_t* sendSizes = info->sizes;
+          size_t* sendDispls = info->sizes + comm->nRanks;
+          size_t* recvSizes = info->sizes + 2*comm->nRanks;
+          size_t* recvDispls = info->sizes + 3*comm->nRanks;
+          for (int r=0; r<comm->nRanks; r++) {
+            if (sendSizes[r] > 0) {
+              NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncSend, collAPI,
+                (void*)((char*)info->sendbuff + sendDispls[r]), sendSizes[r]/eltSize, info->datatype, r, allowUB));
+            }
+            if (recvSizes[r] > 0) {
+              NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncRecv, collAPI,
+                (void*)((char*)info->recvbuff + recvDispls[r]), recvSizes[r]/eltSize, info->datatype, r, allowUB));
+            }
           }
         } else if (info->coll == ncclFuncAllGather && info->useDirect) {
           NCCLCHECK(ncclRegFind(comm, info->sendbuff, info->count * ncclTypeSize(info->datatype), &sendReg));

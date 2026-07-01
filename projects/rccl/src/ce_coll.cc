@@ -14,6 +14,7 @@
 #include "ce_coll.h"
 #include "alloc.h"
 #include "ce_fault_inject.h"
+#define TEMP_DISPLS 33554432
 
 #ifdef ENABLE_FAULT_INJECTION
 // Common fault check helper
@@ -219,6 +220,7 @@ bool ncclCeImplemented(ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, ncclDataType_
     switch (coll) {
     case ncclFuncAllGather:
     case ncclFuncAlltoAll:
+    case ncclFuncAlltoAllv:
     case ncclFuncScatter:
     case ncclFuncGather:
       return true;
@@ -672,6 +674,80 @@ fail:
   goto exit;
 }
 
+ncclResult_t ncclCeAlltoAllv(struct ncclComm* comm, struct ncclCeCollArgs* args, cudaStream_t stream) {
+  ncclResult_t ret = ncclSuccess;
+
+  if (args->sizes == nullptr) {
+    WARN("CE AlltoAllv: missing size metadata");
+    return ncclInvalidUsage;
+  }
+
+  size_t* sendSizes = args->sizes;
+  size_t* sendDispls = args->sizes + comm->nRanks;
+  size_t* recvDispls = args->sizes + 3*comm->nRanks;
+  uint8_t* mySendBuff = (uint8_t*)args->sendBuff;
+  uint8_t* myRecvBuff = (uint8_t*)args->recvBuff;
+  void* peerRecvBuff;
+  size_t offset;
+  size_t totalBytes = 0;
+  struct ncclCeBatchOpsParams batchOpsParams = {};
+  NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&batchOpsParams, comm->nRanks), ret, fail);
+
+  // Ensure all ranks are ready before starting transfers
+  NCCLCHECKGOTO(ncclMemOpSync(comm, args, stream), ret, fail);
+
+  // Copy data to other ranks: send variable-sized chunk for each destination rank
+  for (int r = 0; r < comm->nRanks; r++) {
+    int dstRank = (comm->rank + r) % comm->nRanks;
+    const size_t chunkBytes = sendSizes[dstRank];
+    if (chunkBytes == 0) continue;
+
+    uint8_t* srcPtr = mySendBuff + sendDispls[dstRank];
+    uint8_t* dstPtr = myRecvBuff + recvDispls[comm->rank];
+    totalBytes += chunkBytes;
+
+    if (dstRank == comm->rank) {
+      // Local copy for own data
+      if (srcPtr != dstPtr) {
+        batchOpsParams.srcs[batchOpsParams.numOps] = (void*)srcPtr;
+        batchOpsParams.dsts[batchOpsParams.numOps] = (void*)dstPtr;
+        batchOpsParams.sizes[batchOpsParams.numOps] = chunkBytes;
+        batchOpsParams.numOps++;
+      }
+    } else {
+      // Remote copy to other ranks: send to rank dstRank's receive buffer at position comm->rank
+      offset = dstPtr - (uint8_t*)args->recvBuff;
+      if (args->useDda) {
+        peerRecvBuff = (uint8_t*)args->ddaPeerBases[dstRank] + comm->rank * TEMP_DISPLS;
+      } else {
+      	offset = dstPtr - (uint8_t*)args->recvWin->userPtr;
+      	NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, args->recvWin, offset, dstRank, &peerRecvBuff), ret, fail);
+      }
+      batchOpsParams.srcs[batchOpsParams.numOps] = (void*)srcPtr;
+      batchOpsParams.dsts[batchOpsParams.numOps] = (void*)peerRecvBuff;
+      batchOpsParams.sizes[batchOpsParams.numOps] = chunkBytes;
+      batchOpsParams.numOps++;
+    }
+  }
+
+  // Check if we need to perform intra-batch synchronization
+  batchOpsParams.intraBatchSync = (batchOpsParams.numOps > comm->ceColl.intraBatchSyncFreq &&
+      totalBytes >= comm->ceColl.intraBatchSyncMsgThreshold);
+
+  // Launch the batch operations
+  NCCLCHECKGOTO(ncclCeLaunchBatchOps(comm, args, &batchOpsParams, stream), ret, fail);
+
+  // Ensure all transfers are complete across all ranks
+  NCCLCHECKGOTO(ncclMemOpSync(comm, args, stream), ret, fail);
+
+exit:
+  ncclCeFreeBatchOpsParams(&batchOpsParams);
+  return ret;
+fail:
+  goto exit;
+}
+
+
 ncclResult_t ncclCeScatter(struct ncclComm* comm, struct ncclCeCollArgs* args, cudaStream_t stream) {
   ncclResult_t ret = ncclSuccess;
 
@@ -810,6 +886,10 @@ ncclResult_t ncclLaunchCeColl(struct ncclComm* comm, struct ncclKernelPlan* plan
       NCCLCHECKGOTO(ncclCeAlltoAll(comm, args, stream),
                     ret, fail);
       break;
+    case ncclFuncAlltoAllv:
+      NCCLCHECKGOTO(ncclCeAlltoAllv(comm, args, stream),
+                    ret, fail);
+      break;
     case ncclFuncScatter:
       NCCLCHECKGOTO(ncclCeScatter(comm, args, stream),
                     ret, fail);
@@ -829,6 +909,9 @@ ncclResult_t ncclLaunchCeColl(struct ncclComm* comm, struct ncclKernelPlan* plan
   if (args->useDda && args->ddaUserRecvBuff != NULL) {
     const size_t chunkBytes = args->nElts * args->eltSize;
     const size_t fullBytes  = (size_t)comm->nRanks * chunkBytes;
+    struct ncclCeBatchOpsParams batchOpsParams = {};
+    NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&batchOpsParams, 1), ret, fail);
+    
     switch (args->func) {
       case ncclFuncGather:
         if (comm->rank == args->rootRank) {
@@ -840,6 +923,22 @@ ncclResult_t ncclLaunchCeColl(struct ncclComm* comm, struct ncclKernelPlan* plan
         CUDACHECKGOTO(cudaMemcpyAsync(args->ddaUserRecvBuff, args->recvBuff /*scratch*/,
                       chunkBytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
         break;
+      case ncclFuncAlltoAllv:
+	size_t* sendSizes = args->sizes;
+  	size_t* sendDispls = args->sizes + comm->nRanks;
+  	size_t* recvDispls = args->sizes + 3*comm->nRanks;
+	size_t* recvSizes = args->sizes + 2*comm->nRanks;
+      	for (int i = 0; i < comm->nRanks; i++) {
+    	    //if (i != comm->rank) {
+      		/*srcsCp[i] = (void *)((char *)d_tempbuff + i * sizeof(int) * MAX_COUNT);
+      		dstsCp[i] = (void *)((char *)d_recvbuff + recvDispls[i] * sizeof(int));*/
+		batchOpsParams.srcs[batchOpsParams.numOps] = (void*)((char*)args->recvBuff + i * TEMP_DISPLS);
+        	batchOpsParams.dsts[batchOpsParams.numOps] = (void*)((char*)args->ddaUserRecvBuff + recvDispls[i]);
+        	batchOpsParams.sizes[batchOpsParams.numOps] = recvSizes[i];
+        	batchOpsParams.numOps++;
+        }
+	NCCLCHECKGOTO(ncclCeLaunchBatchOps(comm, args, &batchOpsParams, stream), ret, fail);
+	break;	
       default: // AllGather, AlltoAll
         CUDACHECKGOTO(cudaMemcpyAsync(args->ddaUserRecvBuff, args->recvBuff /*scratch*/,
                      fullBytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
