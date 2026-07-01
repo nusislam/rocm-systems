@@ -37,6 +37,10 @@
 #include "sdma_pkt_struct.h"
 #include "sdma_pkt_struct_mi4.h"
 
+#ifndef ANVIL_USE_FUSED_MI4
+#define ANVIL_USE_FUSED_MI4 0
+#endif
+
 namespace rocshmem {
 namespace anvil {
 
@@ -410,7 +414,7 @@ __device__ __forceinline__ void put_signal_counter_impl(SdmaQueueDeviceHandle& h
                                                         void* src, size_t size, uint64_t* signal,
                                                         uint64_t* counter,
                                                         uint64_t* put_index = nullptr) {
-#if SDMA_IS_OSS7
+#if SDMA_IS_OSS7 && ANVIL_USE_FUSED_MI4
   // OSS7 fast path: when a copy + signal and/or counter are requested, fuse the
   // copy and one atomic into a single COPY_LINEAR_WAIT_SIGNAL_MI4 packet.
   // The HW packet has one signal slot: when both signal and counter are active,
