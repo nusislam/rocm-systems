@@ -119,7 +119,7 @@ static ncclResult_t registrationCheck(struct ncclInfo* info) {
     }
   }
 
-  if (info->coll == ncclFuncAllGather || info->coll == ncclFuncAllReduce || info->coll == ncclFuncAlltoAll || info->coll == ncclFuncAlltoAll || info->coll == ncclFuncScatter) {
+  if (info->coll == ncclFuncAllGather || info->coll == ncclFuncAllReduce || info->coll == ncclFuncAlltoAll || info->coll == ncclFuncAlltoAllv || info->coll == ncclFuncScatter) {
     if (cmpBufInfo[1].isSymRegistered) {
       if (recvWinMismatch) {
         if (comm->rank == 0) WARN("Coll %s size %ld symmetric registration check failed on rank %d: recv buffer window (0x%lx) mismatch with rank 0 (0x%lx)", info->opName, size, recvWinMismatchRank, bufInfo[recvWinMismatchRank * 2 + 1].bigOffset, cmpBufInfo[1].bigOffset);

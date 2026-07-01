@@ -3534,12 +3534,13 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       return ncclSuccess;
     } else {
       size_t ceBytes = 0;
-
       if (info->coll == ncclFuncAlltoAllv) {
 
 	size_t* recvSizes = info->sizes + 2*comm->nRanks;
 	for (int r = 0; r < comm->nRanks; r++) ceBytes += recvSizes[r];
       }
+      //printf("Here %zu\n", ceBytes);
+	
       struct ncclDevrWindow* sendWin;
       struct ncclDevrWindow* recvWin;
       ncclDevrFindWindow(comm, info->sendbuff, &sendWin);
@@ -3548,12 +3549,13 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       ncclSymRegType_t winRegType;
       NCCLCHECK(ncclGetSymRegType(sendWin, recvWin, &winRegType));
       bool ceAvailable = ncclCeAvailable(comm, info->coll, info->op, info->datatype, winRegType);
+      
       bool CeScartchAvailable = ncclCeScartchAvailable(comm, info->coll, info->op, info->datatype, winRegType);
       size_t recvBytes = (size_t)comm->nRanks * info->count * ncclTypeSize(info->datatype);
 
       if (CeScartchAvailable && winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendNonregRecvReg && rcclParamForceCe() && comm->ddaScratch != nullptr && (recvBytes <= comm->ddaScratchBytes || (info->coll == ncclFuncAlltoAllv && ceBytes <= comm->ddaScratchBytes))) {
         INFO(NCCL_TUNING, "Using DDA scratch for CE collective, count=%zu, recvBytes=%zu", info->count, recvBytes);
-	printf("Taking CE path\n");
+	//printf("Taking CE path\n");
           NCCLCHECK(ceCollTaskAppend(comm, info, /*sendWin=*/nullptr, /*recvWin=*/nullptr,
                                      comm->ddaScratch, comm->ddaPeerPtrsHost, opDev));
       }

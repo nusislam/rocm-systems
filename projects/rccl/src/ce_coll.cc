@@ -709,6 +709,7 @@ ncclResult_t ncclCeAlltoAllv(struct ncclComm* comm, struct ncclCeCollArgs* args,
     if (dstRank == comm->rank) {
       // Local copy for own data
       if (srcPtr != dstPtr) {
+	dstPtr = (uint8_t*)args->ddaPeerBases[comm->rank] + comm->rank * TEMP_DISPLS;
         batchOpsParams.srcs[batchOpsParams.numOps] = (void*)srcPtr;
         batchOpsParams.dsts[batchOpsParams.numOps] = (void*)dstPtr;
         batchOpsParams.sizes[batchOpsParams.numOps] = chunkBytes;
@@ -909,8 +910,6 @@ ncclResult_t ncclLaunchCeColl(struct ncclComm* comm, struct ncclKernelPlan* plan
   if (args->useDda && args->ddaUserRecvBuff != NULL) {
     const size_t chunkBytes = args->nElts * args->eltSize;
     const size_t fullBytes  = (size_t)comm->nRanks * chunkBytes;
-    struct ncclCeBatchOpsParams batchOpsParams = {};
-    NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&batchOpsParams, 1), ret, fail);
     
     switch (args->func) {
       case ncclFuncGather:
@@ -923,22 +922,24 @@ ncclResult_t ncclLaunchCeColl(struct ncclComm* comm, struct ncclKernelPlan* plan
         CUDACHECKGOTO(cudaMemcpyAsync(args->ddaUserRecvBuff, args->recvBuff /*scratch*/,
                       chunkBytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
         break;
-      case ncclFuncAlltoAllv:
-	size_t* sendSizes = args->sizes;
-  	size_t* sendDispls = args->sizes + comm->nRanks;
+      case ncclFuncAlltoAllv: {
   	size_t* recvDispls = args->sizes + 3*comm->nRanks;
 	size_t* recvSizes = args->sizes + 2*comm->nRanks;
+	//ncclCeFreeBatchOpsParams(&batchOpsParams);
+	
+	struct ncclCeBatchOpsParams batchOpsParams = {};
+        ncclCeInitBatchOpsParams(&batchOpsParams, comm->nRanks);
+
       	for (int i = 0; i < comm->nRanks; i++) {
-    	    //if (i != comm->rank) {
-      		/*srcsCp[i] = (void *)((char *)d_tempbuff + i * sizeof(int) * MAX_COUNT);
-      		dstsCp[i] = (void *)((char *)d_recvbuff + recvDispls[i] * sizeof(int));*/
 		batchOpsParams.srcs[batchOpsParams.numOps] = (void*)((char*)args->recvBuff + i * TEMP_DISPLS);
         	batchOpsParams.dsts[batchOpsParams.numOps] = (void*)((char*)args->ddaUserRecvBuff + recvDispls[i]);
         	batchOpsParams.sizes[batchOpsParams.numOps] = recvSizes[i];
         	batchOpsParams.numOps++;
         }
-	NCCLCHECKGOTO(ncclCeLaunchBatchOps(comm, args, &batchOpsParams, stream), ret, fail);
+	ncclCeLaunchBatchOps(comm, args, &batchOpsParams, stream);
+	ncclCeFreeBatchOpsParams(&batchOpsParams);
 	break;	
+	}
       default: // AllGather, AlltoAll
         CUDACHECKGOTO(cudaMemcpyAsync(args->ddaUserRecvBuff, args->recvBuff /*scratch*/,
                      fullBytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
@@ -948,6 +949,7 @@ ncclResult_t ncclLaunchCeColl(struct ncclComm* comm, struct ncclKernelPlan* plan
 
 exit:
   // Stop CE collective profiling - always attempt if started, even on error
+  //ncclCeFreeBatchOpsParams(&batchOpsParams);
   ncclProfilerStopCeCollEvent(comm, args, stream);
   return ret;
 fail:
