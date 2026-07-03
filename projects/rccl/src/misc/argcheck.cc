@@ -104,7 +104,7 @@ static ncclResult_t registrationCheck(struct ncclInfo* info) {
     if (cmpBufInfo[1].userOffset != bufInfo[infoIdx + 1].userOffset) { recvUserMismatch = true; recvUserMismatchRank = r; }
   }
 
-  if (info->coll == ncclFuncAllReduce || info->coll == ncclFuncReduceScatter || info->coll == ncclFuncAlltoAll || info->coll == ncclFuncAlltoAllv || info->coll == ncclFuncGather) {
+  if (info->coll == ncclFuncAllReduce || info->coll == ncclFuncReduceScatter || info->coll == ncclFuncAlltoAll || info->coll == ncclFuncGather) {
     if (cmpBufInfo[0].isSymRegistered) {
       if (sendWinMismatch) {
         if (comm->rank == 0) WARN("Coll %s size %ld symmetric registration check failed on rank %d: send buffer window (0x%lx) mismatch with rank 0 (0x%lx)", info->opName, size, sendWinMismatchRank, bufInfo[sendWinMismatchRank * 2].bigOffset, cmpBufInfo[0].bigOffset);
@@ -119,7 +119,7 @@ static ncclResult_t registrationCheck(struct ncclInfo* info) {
     }
   }
 
-  if (info->coll == ncclFuncAllGather || info->coll == ncclFuncAllReduce || info->coll == ncclFuncAlltoAll || info->coll == ncclFuncAlltoAllv || info->coll == ncclFuncScatter) {
+  if (info->coll == ncclFuncAllGather || info->coll == ncclFuncAllReduce || info->coll == ncclFuncAlltoAll || info->coll == ncclFuncScatter) {
     if (cmpBufInfo[1].isSymRegistered) {
       if (recvWinMismatch) {
         if (comm->rank == 0) WARN("Coll %s size %ld symmetric registration check failed on rank %d: recv buffer window (0x%lx) mismatch with rank 0 (0x%lx)", info->opName, size, recvWinMismatchRank, bufInfo[recvWinMismatchRank * 2 + 1].bigOffset, cmpBufInfo[1].bigOffset);

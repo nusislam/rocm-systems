@@ -925,19 +925,36 @@ ncclResult_t ncclLaunchCeColl(struct ncclComm* comm, struct ncclKernelPlan* plan
       case ncclFuncAlltoAllv: {
   	size_t* recvDispls = args->sizes + 3*comm->nRanks;
 	size_t* recvSizes = args->sizes + 2*comm->nRanks;
-	//ncclCeFreeBatchOpsParams(&batchOpsParams);
 	
-	struct ncclCeBatchOpsParams batchOpsParams = {};
-        ncclCeInitBatchOpsParams(&batchOpsParams, comm->nRanks);
+	/*struct ncclCeBatchOpsParams batchOpsParams = {};
+        ncclCeInitBatchOpsParams(&batchOpsParams, comm->nRanks);*/
+	void *dstsCp[comm->nRanks];
+  	void *srcsCp[comm->nRanks];
+  	size_t sizeArrayCp[comm->nRanks];
+  	size_t numAttrs = 1;
+  	size_t failIdx = 0;
+
+	hipMemcpyAttributes attrs[1];
+  	size_t attrsIdxs[1];
+  	attrs[0] = {};
+  	attrs[0].srcAccessOrder = hipMemcpySrcAccessOrderStream;
+  	attrs[0].flags = 0x100;
+  	// size_t attrsIdxs[] = {0,8};//The attributes sp
+  	attrsIdxs[0] = 0;
 
       	for (int i = 0; i < comm->nRanks; i++) {
-		batchOpsParams.srcs[batchOpsParams.numOps] = (void*)((char*)args->recvBuff + i * TEMP_DISPLS);
+		/*batchOpsParams.srcs[batchOpsParams.numOps] = (void*)((char*)args->recvBuff + i * TEMP_DISPLS);
         	batchOpsParams.dsts[batchOpsParams.numOps] = (void*)((char*)args->ddaUserRecvBuff + recvDispls[i]);
         	batchOpsParams.sizes[batchOpsParams.numOps] = recvSizes[i];
-        	batchOpsParams.numOps++;
+        	batchOpsParams.numOps++;*/
+		srcsCp[i] =  (void*)((char*)args->recvBuff + i * TEMP_DISPLS);
+      		dstsCp[i] = (void*)((char*)args->ddaUserRecvBuff + recvDispls[i]);
+		sizeArrayCp[i] = recvSizes[i];
         }
-	ncclCeLaunchBatchOps(comm, args, &batchOpsParams, stream);
-	ncclCeFreeBatchOpsParams(&batchOpsParams);
+	/*ncclCeLaunchBatchOps(comm, args, &batchOpsParams, stream);
+	ncclCeFreeBatchOpsParams(&batchOpsParams);*/
+		hipMemcpyBatchAsync(dstsCp, srcsCp, sizeArrayCp, comm->nRanks, attrs,
+                                 attrsIdxs, numAttrs, &failIdx, stream);
 	break;	
 	}
       default: // AllGather, AlltoAll

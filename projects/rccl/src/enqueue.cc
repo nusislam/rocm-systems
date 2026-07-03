@@ -3585,7 +3585,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
             NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncSend, collAPI, (void*)((char*)info->sendbuff+r*info->count*ncclTypeSize(info->datatype)), info->count, info->datatype, r, allowUB));
             NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncRecv, collAPI, (void*)((char*)info->recvbuff+r*info->count*ncclTypeSize(info->datatype)), info->count, info->datatype, r, allowUB));
           }
-        } else if (info->coll == ncclFuncAlltoAllv) {
+        } /*else if (info->coll == ncclFuncAlltoAllv) {
           allowUB = captured;
           size_t eltSize = ncclTypeSize(info->datatype);
           size_t* sendSizes = info->sizes;
@@ -3602,7 +3602,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
                 (void*)((char*)info->recvbuff + recvDispls[r]), recvSizes[r]/eltSize, info->datatype, r, allowUB));
             }
           }
-        } else if (info->coll == ncclFuncAllGather && info->useDirect) {
+        }*/ else if (info->coll == ncclFuncAllGather && info->useDirect) {
           NCCLCHECK(ncclRegFind(comm, info->sendbuff, info->count * ncclTypeSize(info->datatype), &sendReg));
           NCCLCHECK(ncclRegFind(comm, info->recvbuff, comm->nRanks * info->count * ncclTypeSize(info->datatype), &recvReg));
           allowUB = captured || (sendReg != NULL && recvReg != NULL);

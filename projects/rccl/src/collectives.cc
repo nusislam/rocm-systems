@@ -360,8 +360,15 @@ ncclResult_t ncclAlltoAllv_impl(const void *sendbuff, const size_t sendcounts[],
         return ret;
     }
 #endif
+   /*if (comm->nNodes == 1) {
+  struct ncclInfo info = { ncclFuncAlltoAllv, "AlltoAllv",
+    sendbuff, recvbuff, 0, datatype, ncclSum, 0, comm, stream,
+    ALLTOALL_CHUNKSTEPS, ALLTOALL_SLICESTEPS, nullptr };
+  info.sizes = sizes.data();
+  return ncclEnqueueCheck(&info);
+   } else {*/
 
- /* Recorder::instance().skip(true);
+ Recorder::instance().skip(true);
   NCCLCHECK(ncclGroupStart());
   for (int r=0; r<nRanks; r++) {
     NCCLCHECK(ncclSend(
@@ -379,16 +386,12 @@ ncclResult_t ncclAlltoAllv_impl(const void *sendbuff, const size_t sendcounts[],
         comm,
         stream));
   }
-  NCCLCHECK(ncclGroupEnd());*/
+  NCCLCHECK(ncclGroupEnd());
 
-  struct ncclInfo info = { ncclFuncAlltoAllv, "AlltoAllv",
-    sendbuff, recvbuff, 0, datatype, ncclSum, 0, comm, stream,
-    ALLTOALL_CHUNKSTEPS, ALLTOALL_SLICESTEPS, nullptr };
-  info.sizes = sizes.data();
-  return ncclEnqueueCheck(&info);
 
-  /*Recorder::instance().skip(false);
-  return ncclSuccess;*/
+  Recorder::instance().skip(false);
+  return ncclSuccess;
+   //}
 }
 
 NCCL_API(ncclResult_t, ncclAllReduce, const void* sendbuff, void* recvbuff, size_t count,
