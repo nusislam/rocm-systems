@@ -920,6 +920,10 @@ struct ncclComm {
   int symId;
   size_t bufThreshold;
 #endif
+  
+  //Added for AlltoAllv
+  void *localSizes;
+  void* gatheredSizes;
 
   // Direct Reduce Scatter [RCCL]
   bool enableDirectReduceScatter;

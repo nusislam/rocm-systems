@@ -3256,8 +3256,12 @@ static ncclResult_t ceCollTaskAppend(
 
   t->func = info->coll;
   t->sendbuff = info->sendbuff;
-  t->recvbuff = ddaRecvBase != nullptr ? ddaRecvBase : info->recvbuff;
-  t->useDda = ddaRecvBase != nullptr;
+  t->recvbuff = info->recvbuff;
+  
+  //t->recvbuff = ddaRecvBase != nullptr ? ddaRecvBase : info->recvbuff;
+  //t->useDda = ddaRecvBase != nullptr;
+  t->useDda = 0;
+
   t->ddaPeerBases = ddaPeerBasesHost;
   // DDA path stages results in scratch (t->recvbuff); remember the real user
   // recvbuff. The copy-back size is collective-specific and computed at the copy
@@ -3286,10 +3290,10 @@ static ncclResult_t ceCollTaskAppend(
 
   t->sizes = nullptr;
   if (t->func == ncclFuncAlltoAllv && info->sizes != nullptr) {
-    size_t nSizes = 4 * comm->nRanks;
+    size_t nSizes = 4 * comm->nRanks * comm->nRanks;
     t->sizes = ncclMemoryStackAlloc<size_t>(&comm->memScoped, nSizes);
     memcpy(t->sizes, info->sizes, nSizes * sizeof(size_t));
-    for (int r = 0; r < comm->nRanks; r++) t->trafficBytes += t->sizes[r];
+    for (int r = 0; r < comm->nRanks; r++) t->trafficBytes += t->sizes[comm->rank*4*comm->nRanks + r];
   }
 
   ncclIntruQueueEnqueue(&planner->collCeTaskQueue, t);
@@ -3506,7 +3510,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
     // Empty collectives can be discarded.
     if (info->count == 0 && info->coll != ncclFuncAlltoAllv) return ncclSuccess;
 
-    if (info->coll == ncclFuncAlltoAllv && info->sizes != nullptr) {
+    /*if (info->coll == ncclFuncAlltoAllv && info->sizes != nullptr) {
       bool hasData = false;
       for (int r = 0; r < comm->nRanks; r++) {
         if (info->sizes[r] != 0 || info->sizes[2*comm->nRanks + r] != 0) {
@@ -3515,7 +3519,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
         }
       }
       if (!hasData) return ncclSuccess;
-    }
+    }*/
 
     if (info->datatype == ncclFloat8e4m3 || info->datatype == ncclFloat8e5m2) {
       if (comm->minCompCap < 90 && info->coll != ncclFuncAllGather && info->coll != ncclFuncBroadcast && info->coll != ncclFuncAlltoAll && info->coll != ncclFuncAlltoAllv && info->coll != ncclFuncScatter && info->coll != ncclFuncGather) {
@@ -3536,10 +3540,10 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       size_t ceBytes = 0;
       if (info->coll == ncclFuncAlltoAllv) {
 
-	size_t* recvSizes = info->sizes + 2*comm->nRanks;
+	size_t* recvSizes = info->sizes + 4*comm->nRanks*comm->rank + 2 * comm->nRanks;
 	for (int r = 0; r < comm->nRanks; r++) ceBytes += recvSizes[r];
       }
-      //printf("Here %zu\n", ceBytes);
+      printf("Here %zu\n", ceBytes);
 	
       struct ncclDevrWindow* sendWin;
       struct ncclDevrWindow* recvWin;
@@ -3555,11 +3559,12 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
 
       if (CeScartchAvailable && winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendNonregRecvReg && rcclParamForceCe() && comm->ddaScratch != nullptr && (recvBytes <= comm->ddaScratchBytes || (info->coll == ncclFuncAlltoAllv && ceBytes <= comm->ddaScratchBytes))) {
         INFO(NCCL_TUNING, "Using DDA scratch for CE collective, count=%zu, recvBytes=%zu", info->count, recvBytes);
-	//printf("Taking CE path\n");
           NCCLCHECK(ceCollTaskAppend(comm, info, /*sendWin=*/nullptr, /*recvWin=*/nullptr,
                                      comm->ddaScratch, comm->ddaPeerPtrsHost, opDev));
       }
-      else if ((comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) && ceAvailable && info->coll != ncclFuncAlltoAllv) {
+      else if ((comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) && ceAvailable) {
+	printf("Taking CE path\n");
+
         INFO(NCCL_TUNING, "Using CE collective, count=%zu, recvBytes=%zu", info->count, recvBytes);
         NCCLCHECK(ceCollTaskAppend(comm, info, sendWin, recvWin, /*ddaRecvBase=*/nullptr, /*ddaPeerBases=*/nullptr, opDev));
       }

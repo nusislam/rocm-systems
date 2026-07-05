@@ -682,9 +682,12 @@ ncclResult_t ncclCeAlltoAllv(struct ncclComm* comm, struct ncclCeCollArgs* args,
     return ncclInvalidUsage;
   }
 
-  size_t* sendSizes = args->sizes;
-  size_t* sendDispls = args->sizes + comm->nRanks;
-  size_t* recvDispls = args->sizes + 3*comm->nRanks;
+  size_t* sendSizes = args->sizes + 4 * comm->nRanks * comm->rank;
+  size_t* sendDispls = args->sizes + 4 * comm->nRanks * comm->rank + 1 * comm->nRanks;
+  size_t* recvDispls = args->sizes + 4 * comm->nRanks * comm->rank + 3 * comm->nRanks;
+  size_t peerDispls = 0;
+  size_t peerRcvSize = 0;
+
   uint8_t* mySendBuff = (uint8_t*)args->sendBuff;
   uint8_t* myRecvBuff = (uint8_t*)args->recvBuff;
   void* peerRecvBuff;
@@ -696,6 +699,7 @@ ncclResult_t ncclCeAlltoAllv(struct ncclComm* comm, struct ncclCeCollArgs* args,
   // Ensure all ranks are ready before starting transfers
   NCCLCHECKGOTO(ncclMemOpSync(comm, args, stream), ret, fail);
 
+  //printf("In ce alltoallv\n");
   // Copy data to other ranks: send variable-sized chunk for each destination rank
   for (int r = 0; r < comm->nRanks; r++) {
     int dstRank = (comm->rank + r) % comm->nRanks;
@@ -709,7 +713,7 @@ ncclResult_t ncclCeAlltoAllv(struct ncclComm* comm, struct ncclCeCollArgs* args,
     if (dstRank == comm->rank) {
       // Local copy for own data
       if (srcPtr != dstPtr) {
-	dstPtr = (uint8_t*)args->ddaPeerBases[comm->rank] + comm->rank * TEMP_DISPLS;
+	//dstPtr = (uint8_t*)args->ddaPeerBases[comm->rank] + comm->rank * TEMP_DISPLS;
         batchOpsParams.srcs[batchOpsParams.numOps] = (void*)srcPtr;
         batchOpsParams.dsts[batchOpsParams.numOps] = (void*)dstPtr;
         batchOpsParams.sizes[batchOpsParams.numOps] = chunkBytes;
@@ -720,14 +724,23 @@ ncclResult_t ncclCeAlltoAllv(struct ncclComm* comm, struct ncclCeCollArgs* args,
       offset = dstPtr - (uint8_t*)args->recvBuff;
       if (args->useDda) {
         peerRecvBuff = (uint8_t*)args->ddaPeerBases[dstRank] + comm->rank * TEMP_DISPLS;
+	peerDispls = 0;
       } else {
       	offset = dstPtr - (uint8_t*)args->recvWin->userPtr;
       	NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, args->recvWin, offset, dstRank, &peerRecvBuff), ret, fail);
+
+	size_t* peerRecvSizes = args->sizes + 4 * comm->nRanks * dstRank + 2 * comm->nRanks;
+	size_t* peerRecvDispls = args->sizes + 4 * comm->nRanks * dstRank + 3 * comm->nRanks;
+	peerDispls = peerRecvDispls[comm->rank];
+	peerRcvSize = peerRecvSizes[comm->rank];
+	//printf("In symmetric rcv displs = %zu\n", peerDispls);
       }
-      batchOpsParams.srcs[batchOpsParams.numOps] = (void*)srcPtr;
-      batchOpsParams.dsts[batchOpsParams.numOps] = (void*)peerRecvBuff;
-      batchOpsParams.sizes[batchOpsParams.numOps] = chunkBytes;
-      batchOpsParams.numOps++;
+      if (peerRcvSize != chunkBytes)
+	      printf("Problem\n");
+      	batchOpsParams.srcs[batchOpsParams.numOps] = (void*)srcPtr;
+      	batchOpsParams.dsts[batchOpsParams.numOps] = (void*)((uint8_t*)peerRecvBuff + peerDispls);
+      	batchOpsParams.sizes[batchOpsParams.numOps] = chunkBytes;
+      	batchOpsParams.numOps++;
     }
   }
 

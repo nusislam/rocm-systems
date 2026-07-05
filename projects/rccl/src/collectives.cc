@@ -14,6 +14,7 @@
 #include "nvtx_payload_schemas.h"
 #include "device/hierarchical_ag_shuffle.h"
 #include "dda_all_reduce.h"
+#include "alloc.h"
 
 #ifdef ENABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>
@@ -302,6 +303,8 @@ ncclResult_t ncclAlltoAllv_impl(const void *sendbuff, const size_t sendcounts[],
   std::vector<size_t> recvcounts1(nRanks);
 
   std::vector<size_t> sizes(4*nRanks);	//4 for sdispl, rdispl, scount, rcount
+  std::vector<size_t> gatheredSizes(4*nRanks*nRanks);	//4 for sdispl, rdispl, scount, rcount
+					//
   const size_t eltSize = ncclTypeSize(datatype);
   
   for (int i = 0; i < nRanks; i++) {
@@ -360,13 +363,29 @@ ncclResult_t ncclAlltoAllv_impl(const void *sendbuff, const size_t sendcounts[],
         return ret;
     }
 #endif
-   /*if (comm->nNodes == 1) {
-  struct ncclInfo info = { ncclFuncAlltoAllv, "AlltoAllv",
-    sendbuff, recvbuff, 0, datatype, ncclSum, 0, comm, stream,
-    ALLTOALL_CHUNKSTEPS, ALLTOALL_SLICESTEPS, nullptr };
-  info.sizes = sizes.data();
-  return ncclEnqueueCheck(&info);
-   } else {*/
+  if (comm->nNodes == 1) {
+	const size_t nLocal = 4 * (size_t)nRanks;	  
+	const size_t nGather = nLocal * (size_t)nRanks;
+
+	CUDACHECK(cudaMemcpyAsync(comm->localSizes, sizes.data(), nLocal * sizeof(size_t),
+  				cudaMemcpyHostToDevice, stream));
+	NCCLCHECK(ncclGroupStart());
+    	for (int r = 0; r < nRanks; r++) {
+      	    void* recvPtr = (void*)((char*)comm->gatheredSizes + (size_t)r * nLocal * sizeof(size_t));
+      	    NCCLCHECK(ncclSend(comm->localSizes, nLocal, ncclUint64, r, comm, stream));
+      	    NCCLCHECK(ncclRecv(recvPtr, nLocal, ncclUint64, r, comm, stream));
+    	}
+    	NCCLCHECK(ncclGroupEnd());
+	CUDACHECK(cudaMemcpyAsync(gatheredSizes.data(), comm->gatheredSizes, nGather * sizeof(size_t),
+                                cudaMemcpyDeviceToHost, stream));
+
+
+  	struct ncclInfo info = { ncclFuncAlltoAllv, "AlltoAllv",
+    		sendbuff, recvbuff, 0, datatype, ncclSum, 0, comm, stream,
+    		ALLTOALL_CHUNKSTEPS, ALLTOALL_SLICESTEPS, nullptr };
+  	info.sizes = gatheredSizes.data();
+  	return ncclEnqueueCheck(&info);
+  } else {
 
  Recorder::instance().skip(true);
   NCCLCHECK(ncclGroupStart());
@@ -391,7 +410,7 @@ ncclResult_t ncclAlltoAllv_impl(const void *sendbuff, const size_t sendcounts[],
 
   Recorder::instance().skip(false);
   return ncclSuccess;
-   //}
+   }
 }
 
 NCCL_API(ncclResult_t, ncclAllReduce, const void* sendbuff, void* recvbuff, size_t count,

@@ -642,6 +642,12 @@ skip_profiling:
     NCCLCHECK(ncclDdaIpcCommFini(comm));
   }
 
+  //Alltoallv CE support
+  if (comm->nNodes == 1) {
+    NCCLCHECK(ncclCudaFree((void *)comm->localSizes, comm->memManager));
+    NCCLCHECK(ncclCudaFree((void *)comm->gatheredSizes, comm->memManager));
+  }
+ 
   if (comm->bootstrap)
     NCCLCHECK(bootstrapClose(comm->bootstrap));
 
@@ -2597,6 +2603,14 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   }
   // update communicator state
   comm->initState = ncclSuccess;
+
+  if (comm->nNodes == 1) {
+    const size_t nLocal = 4 * (size_t)comm->nRanks;	  
+    const size_t nGather = nLocal * (size_t)comm->nRanks;
+
+    NCCLCHECK(ncclCudaMalloc(&comm->localSizes, nLocal, comm->memManager));
+    NCCLCHECK(ncclCudaMalloc(&comm->gatheredSizes, nGather, comm->memManager));
+  }
 
   // Initialize hierarchical sub-communicators and temp buffer
   if (!job->parent && !comm->isGrow && comm->nNodes >= 8 && rcclParamHierarchicalAllGather() == 1) {
