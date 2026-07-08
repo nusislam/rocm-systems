@@ -73,9 +73,10 @@ __global__ void ddaAllReduceFlatFabricWrite(
     size_t count,
     const T* __restrict__ sendbuff,
     int selfRank,
-    int nRanks,
+    int nRanksRuntime,
     FabricGpuBarrier barrier,
     const T* __restrict__ acc) {
+  const int nRanks = (NRANKS_CT > 0) ? NRANKS_CT : nRanksRuntime;	
   constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
   const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
 
@@ -85,7 +86,7 @@ __global__ void ddaAllReduceFlatFabricWrite(
 
   // Remote write: push sendbuff into selfRank's slot of every rank's IPC buffer.
   // Caller must allocate ipcbuffs[r] with capacity NRANKS * count.
-  for (int r = 0; r < NRANKS_CT; r++) {
+  for (int r = 0; r < nRanks; r++) {
     copyFromSrcToDest<T>(
         sendbuff,
         ipcbuffs[r] + selfRank * count,
@@ -101,7 +102,7 @@ __global__ void ddaAllReduceFlatFabricWrite(
 
   // Local reduce: ipcbuffs[selfRank] now holds NRANKS contributions in slots 0..NRANKS-1.
   localReduce<T, NRANKS_CT, hasAcc>(
-      ipcbuffs[selfRank], recvbuff, acc, idxStart, idxEnd, idxStride);
+      ipcbuffs[selfRank], recvbuff, acc, nRanks, idxStart, idxEnd, idxStride);
 
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
@@ -193,7 +194,7 @@ __global__ void ddaAllReduceTreeFabricWrite(
   // sendbuff destined for r into selfRank's slot of r's IPC buffer.
   // ipcbuffs[r][s * countPerRank .. (s+1)*countPerRank) = contribution from rank s.
   reduceScatterWrite<T, NRANKS_CT>(
-      ipcbuffs, sendbuff, selfRank, idxStart, idxEnd, idxStride);
+      ipcbuffs, sendbuff, selfRank, nRanks, idxStart, idxEnd, idxStride);
 
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
@@ -206,6 +207,7 @@ __global__ void ddaAllReduceTreeFabricWrite(
       ipcbuffs[selfRank],
       ipcbuffs[selfRank] + selfRank * countPerRank,
       acc,
+      nRanks,
       idxStart,
       idxEnd,
       idxStride);
@@ -219,7 +221,7 @@ __global__ void ddaAllReduceTreeFabricWrite(
   // of every rank's IPC buffer (reusing the same slot offsets now that the
   // reduce step has consumed the scatter data).
   allGatherWrite<T, NRANKS_CT>(
-      ipcbuffs, ipcbuffs[selfRank] + selfRank * countPerRank, selfRank, idxStart, idxEnd, idxStride);
+      ipcbuffs, ipcbuffs[selfRank] + selfRank * countPerRank, selfRank, nRanks, idxStart, idxEnd, idxStride);
 
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,

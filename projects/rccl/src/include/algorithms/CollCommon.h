@@ -160,15 +160,18 @@ static inline __device__ void reduceScatterWrite(
     T* const* __restrict__ ipcbuffs,
     const T* __restrict__ sendbuff,
     int selfRank,
+    int nRanksRuntime,
     const size_t idxStart,
     const size_t idxEnd,
     const size_t idxStride) {
   static_assert(is_supported_type_v<T>, "dda: unsupported element type");
-  
+  const int nRanks = (NRANKS_CT > 0) ? NRANKS_CT : nRanksRuntime;
+  constexpr int kUnroll = (NRANKS_CT > 0) ? NRANKS_CT : 8;
+
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
     const size_t destIdx = static_cast<size_t>(selfRank) * idxEnd + idx;
-#pragma unroll NRANKS_CT
-    for (int r = 0; r < NRANKS_CT; ++r) {
+#pragma unroll kUnroll
+    for (int r = 0; r < nRanks; ++r) {
       const size_t srcIdx = static_cast<size_t>(r) * idxEnd + idx;
       *reinterpret_cast<uint4*>(&ipcbuffs[r][destIdx]) =
           reinterpret_cast<const uint4*>(&sendbuff[srcIdx])[0];
@@ -183,11 +186,14 @@ static inline __device__ void localReduce(
     const T* __restrict__ ipcbuff,
     T* __restrict__ destbuff,
     const T* __restrict__ acc,
+    int nRanksRuntime,
     const size_t idxStart,
     const size_t idxEnd,
     const size_t idxStride) {
   static_assert(is_supported_type_v<T>, "dda: unsupported element type");
+  const int nRanks = (NRANKS_CT > 0) ? NRANKS_CT : nRanksRuntime;
   constexpr int kUnroll = (NRANKS_CT > 0) ? (NRANKS_CT-1) : 8;
+
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
     uint4 sum{0, 0, 0, 0};
     if constexpr (hasAcc) {
@@ -197,13 +203,13 @@ static inline __device__ void localReduce(
     *reinterpret_cast<uint4*>(&vals[0]) =
         reinterpret_cast<const uint4*>(&ipcbuff[idx])[0];
 #pragma unroll kUnroll
-    for (int r = 0; r < (NRANKS_CT - 1); ++r) {
+    for (int r = 0; r < (nRanks - 1); ++r) {
       *reinterpret_cast<uint4*>(&vals[(r + 1) & 1]) =
           reinterpret_cast<const uint4*>(
               &ipcbuff[static_cast<size_t>(r + 1) * idxEnd + idx])[0];
       sum = vecElementAdd<T>(sum, vals[r & 1]);
     }
-    sum = vecElementAdd<T>(sum, vals[(NRANKS_CT - 1) & 1]);
+    sum = vecElementAdd<T>(sum, vals[(nRanks - 1) & 1]);
     *reinterpret_cast<uint4*>(&destbuff[idx]) =
         *reinterpret_cast<const uint4*>(&sum);
   }
@@ -214,15 +220,19 @@ static inline __device__ void allGatherWrite(
     T* const* __restrict__ ipcbuffs,
     const T* __restrict__ sendbuff,
     int selfRank,
+    int nRanksRuntime,
     const size_t idxStart,
     const size_t idxEnd,
     const size_t idxStride) {
   static_assert(is_supported_type_v<T>, "dda: unsupported element type");
+  const int nRanks = (NRANKS_CT > 0) ? NRANKS_CT : nRanksRuntime;
+  constexpr int kUnroll = (NRANKS_CT > 0) ? NRANKS_CT : 8;
+
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
     const uint4 val = reinterpret_cast<const uint4*>(&sendbuff[idx])[0];
     const size_t destIdx = static_cast<size_t>(selfRank) * idxEnd + idx;
-#pragma unroll NRANKS_CT
-    for (int r = 0; r < NRANKS_CT; ++r) {
+#pragma unroll kUnroll
+    for (int r = 0; r < nRanks; ++r) {
       *reinterpret_cast<uint4*>(&ipcbuffs[r][destIdx]) = val;
     }
   }

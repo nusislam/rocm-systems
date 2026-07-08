@@ -63,4 +63,51 @@ __global__ void ddaAllGatherFabric(
       false >();
 }
 
+// Remote-write variant: each rank pushes its chunk into every rank's ipcbuff,
+// then each rank does a local copy from its ipcbuff to recvbuff.
+// ipcbuffs[r] must be allocated as NRANKS * count elements (not count).
+template <typename T, int NRANKS_CT>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+__global__ void ddaAllGatherFabricWrite(
+    T* const* __restrict__ ipcbuffs,
+    T* __restrict__ recvbuff,
+    size_t count,
+    const T* __restrict__ sendbuff,
+    int selfRank,
+    int nRanksRuntime,
+    FabricGpuBarrier barrier) {
+
+  const int nRanks = (NRANKS_CT > 0) ? NRANKS_CT : nRanksRuntime; 	
+  const size_t countPerRank = count;
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
+
+  const auto idxStart = gtIdx * countPerThread;
+  const auto idxEnd = countPerRank;
+  const auto idxStride = gridDim.x * blockDim.x * countPerThread;
+
+  // Phase 1: push sendbuff into ipcbuffs[r][selfRank*count .. (selfRank+1)*count)
+  // for every rank r (remote write).
+  allGatherWrite<T, NRANKS_CT>(
+      ipcbuffs, sendbuff, selfRank, nRanks, idxStart, idxEnd, idxStride);
+
+  barrier.syncOnSameBlockIdx<
+      true /* hasPreviousMemAccess */,
+      true /* hasSubsequentMemAccess */,
+      true >();
+
+  // Phase 2: local copy — ipcbuffs[selfRank] is now fully populated by all ranks.
+  copyFromSrcToDest<T>(
+      ipcbuffs[selfRank], recvbuff, idxStart, count * nRanks, idxStride);
+
+  // barrier to ensure remote ranks won't free their buffers until I'm done
+  barrier.syncOnSameBlockIdx<
+      true /* hasPreviousMemAccess */,
+      false /* hasSubsequentMemAccess */,
+      false >();
+}
+
+
 } // namespace meta::comms
