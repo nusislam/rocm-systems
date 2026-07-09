@@ -131,14 +131,16 @@ RCCL_PARAM(DdaThreshold, "DDA_THRESHOLD", (size_t)(67108864));
 // with the given total byte count.  gfx942Default is the per-collective
 // threshold for gfx942; gfx950 uses the user-configurable rcclParamDdaThreshold();
 // all other architectures return false (threshold 0).
-static bool rcclDdaEnabled(const ncclComm* comm, size_t totalBytes, size_t gfx942Default) {
-  if (!rcclParamDdaEnable() || ncclParamLaunchOrderImplicit() || ncclGroupDepth != 0) return false;
+static bool rcclDdaEnabled(ncclComm* comm, size_t totalBytes, size_t gfx942Default) {
+  if ((rcclParamDdaEnable() == 1) || (rcclParamDdaEnable() == 2) || ncclParamLaunchOrderImplicit() || ncclGroupDepth != 0) return false;
   size_t threshold;
   if (IsArchMatch(comm->archName, "gfx1250")) {
     threshold = (size_t)rcclParamDdaThreshold();
+    comm->ddaEnable = rcclParamDdaEnable();
   } else if (IsArchMatch(comm->archName, "gfx942") || IsArchMatch(comm->archName, "gfx950")) {
     if (comm->nRanks < 8 || comm->symmetricSupport) return false;
     threshold = IsArchMatch(comm->archName, "gfx942") ? gfx942Default : (size_t)rcclParamDdaThreshold();
+    comm->ddaEnable = rcclParamDdaEnable();  
   } else {
     return false;
   }

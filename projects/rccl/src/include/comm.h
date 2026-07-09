@@ -631,6 +631,7 @@ struct ncclComm {
   nccl_dda_detail::DdaIpcBarrierState* ddaIpcBarrierState; /* IPC path only */
   nccl_dda_detail::DdaFabricBarrierState* ddaFabricBarrierState; /* fabric path only */
   int ddaFabricMaxBlocks;
+  int ddaEnable;
   // True when ddaScratch is VMM (cuMem) backed (fabric path); selects the
   // matching deallocator at teardown.
   bool ddaScratchIsVmm;
