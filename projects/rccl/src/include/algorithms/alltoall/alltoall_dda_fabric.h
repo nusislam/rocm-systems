@@ -75,4 +75,73 @@ __global__ void ddaAllToAllFabric(
       false >();
 }
 
-} // namespace meta::comms
+template <typename T, int NRANKS_CT>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+__global__ void ddaAllToAllFabricWrite(
+    T* const* __restrict__ ipcbuffs,
+    T* __restrict__ recvbuff,
+    size_t count,
+    const T* __restrict__ sendbuff,
+    int selfRank,
+    int nRanks,
+    FabricGpuBarrier barrier) {
+  // use uint4 to do 16-byte loads to maximize memory efficiency. We assume
+  // that count % countPerThread == 0, enforced before kernel launch.
+  const int nRanksEff = (NRANKS_CT > 0) ? NRANKS_CT : nRanks;
+  // Fully unroll when the clique size is a compile-time constant; otherwise
+  // partially unroll 8-wide for the runtime fallback (Option A).
+  constexpr int kUnroll = (NRANKS_CT > 0) ? NRANKS_CT : 8;
+  const size_t countPerRank = count;
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
+
+  const auto idxStart = gtIdx * countPerThread;
+  const auto idxEnd = countPerRank;
+  const auto idxStride = gridDim.x * blockDim.x * countPerThread;
+
+  // Step 1: Push data directly to remote IPC buffers
+  // Each rank writes its data for destRank into destRank's IPC buffer
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+#pragma unroll kUnroll
+    for (int destRank = 0; destRank < nRanksEff; ++destRank) {
+      size_t srcOffset = destRank * count + idx;  // Data for destRank in send buffer
+      size_t destOffset = selfRank * count + idx; // Where selfRank's data goes in destRank's buffer
+
+      if ((srcOffset < count * nRanksEff) && (destOffset < count * nRanksEff)) {
+        // Write directly to destRank's IPC buffer at the position for selfRank's data
+        *reinterpret_cast<uint4*>(&ipcbuffs[destRank][destOffset]) =
+            reinterpret_cast<const uint4*>(&sendbuff[srcOffset])[0];
+      }
+    }
+  }
+
+  barrier.syncOnSameBlockIdx<
+      true /* hasPreviousMemAccess */,
+      true /* hasSubsequentMemAccess */,
+      true >();
+
+  // Step 2: Local copy from own IPC buffer to recv buffer
+  // After all ranks have written to this rank's IPC buffer, copy locally
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+#pragma unroll kUnroll
+    for (int srcRank = 0; srcRank < nRanksEff; ++srcRank) {
+      size_t ipcOffset = srcRank * count + idx;  // Data from srcRank in local IPC buffer
+      size_t destOffset = srcRank * count + idx; // Where to place data from srcRank
+
+      if (ipcOffset < count * nRanksEff && destOffset < count * nRanksEff) {
+        *reinterpret_cast<uint4*>(&recvbuff[destOffset]) =
+            reinterpret_cast<const uint4*>(&ipcbuffs[selfRank][ipcOffset])[0];
+      }
+    }
+  }
+
+  barrier.syncOnSameBlockIdx<
+      true  /* hasPreviousMemAccess */,
+      false /* hasSubsequentMemAccess */,
+      false /* prevRemoteWrite */>();
+
+}
+
+} // namespace meta::comms/

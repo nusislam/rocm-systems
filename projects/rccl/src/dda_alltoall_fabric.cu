@@ -67,19 +67,37 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(
 
   switch (nRanks) {
   case 4:
-    meta::comms::ddaAllToAllFabric<T, 4><<<grid, block, 0, stream>>>(
+    if (comm->ddaEnable == 2) {	  
+      meta::comms::ddaAllToAllFabricWrite<T, 4><<<grid, block, 0, stream>>>(
         d_ipcbuffs, static_cast<T*>(recvbuff), count,
         static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+    } else if (comm->ddaEnable == 1) {
+      meta::comms::ddaAllToAllFabric<T, 4><<<grid, block, 0, stream>>>(
+        d_ipcbuffs, static_cast<T*>(recvbuff), count,
+        static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+    }
     break;
   case 8:
-    meta::comms::ddaAllToAllFabric<T, 8><<<grid, block, 0, stream>>>(
+    if (comm->ddaEnable == 2) {
+      meta::comms::ddaAllToAllFabricWrite<T, 8><<<grid, block, 0, stream>>>(
         d_ipcbuffs, static_cast<T*>(recvbuff), count,
         static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+    } else if (comm->ddaEnable == 1) {
+      meta::comms::ddaAllToAllFabric<T, 8><<<grid, block, 0, stream>>>(
+        d_ipcbuffs, static_cast<T*>(recvbuff), count,
+        static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+    }
     break;
   default:
-    meta::comms::ddaAllToAllFabric<T, 0><<<grid, block, 0, stream>>>(
+    if (comm->ddaEnable == 2) {
+      meta::comms::ddaAllToAllFabricWrite<T, 0><<<grid, block, 0, stream>>>(
         d_ipcbuffs, static_cast<T*>(recvbuff), count,
         static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+    } else if (comm->ddaEnable == 1) {
+      meta::comms::ddaAllToAllFabric<T, 0><<<grid, block, 0, stream>>>(
+        d_ipcbuffs, static_cast<T*>(recvbuff), count,
+        static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+    }
     break;
   }
 
