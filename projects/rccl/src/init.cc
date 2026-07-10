@@ -673,6 +673,7 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
   comm->ddaFabricBarrierState = nullptr;
   comm->ddaFabricMemHandler = nullptr;
   comm->ddaFabricMaxBlocks = 0;
+  comm->ddaEnable = (int)rcclParamDdaEnable();
 
   comm->rank = rank;
   comm->nRanks = ndev;
