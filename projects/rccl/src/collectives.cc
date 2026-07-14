@@ -17,6 +17,7 @@
 #endif
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #include "sdma/two_shot_allreduce_launch.hpp"
+#include "sdma/anvil_alltoall_launch.hpp"
 #endif
 
 using namespace rccl;
@@ -263,7 +264,29 @@ ncclResult_t ncclAlltoAll_impl(const void* sendbuff, void* recvbuff, size_t coun
         return ncclEnqueueCheck(&info);
       }
       #endif // ENABLE_ROCSHMEM
-    info = { ncclFuncAlltoAll, "AlltoAll",
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  size_t msgSize = count * ncclTypeSize(datatype) * comm->nRanks;
+
+  if (rcclParamAnvilAlltoAll() != 0 && msgSize <= 33554432) {
+    //printf("Anvil SDMA alltoall\n");
+    int flag1 = comm->sdmaAnvilBarrierFlag;
+    int flag2 = flag1 + 1;
+    int flag3 = comm->sdmaAnvilSignalFlag;
+    int flag4 = comm->sdmaAnvilIntraBarrierFlag;
+
+
+    ncclResult_t ar =
+        rcclAnvilAlltoAllTry(sendbuff, recvbuff, count, datatype, comm, stream, flag1, flag2, flag3, flag4);
+    if (ar == ncclSuccess) return ncclSuccess;
+    if (ar != ncclInvalidUsage) return ar;
+
+    comm->sdmaAnvilBarrierFlag = flag2 + 1;
+    comm->sdmaAnvilSignalFlag = comm->sdmaAnvilSignalFlag + 1;
+    comm->sdmaAnvilIntraBarrierFlag = comm->sdmaAnvilIntraBarrierFlag + 1;
+  }
+#endif
+  info = { ncclFuncAlltoAll, "AlltoAll",
       sendbuff, recvbuff, count, datatype, ncclSum, 0, comm, stream, /* Args */
       ALLTOALL_CHUNKSTEPS, ALLTOALL_SLICESTEPS };
   }
