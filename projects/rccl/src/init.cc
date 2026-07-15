@@ -2237,7 +2237,7 @@ static ncclResult_t getParentRanks(int parentRanks, int parentRank, int* exclude
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 // HIP stacks often require a minimum allocation for IPC export (see tools/p2p-latency-test).
-static constexpr size_t kSdmaFineGrainedIpcTempMinBytes = (size_t)67108864;
+static constexpr size_t kSdmaFineGrainedIpcTempMinBytes = (size_t)536870912;
 // Local fine-grained sync area: cache-line worth of uint64_t words (no IPC on this slab).
 static constexpr size_t kSdmaSyncBufferNumUint64 = 8;
 

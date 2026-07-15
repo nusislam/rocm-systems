@@ -99,13 +99,15 @@ __device__ __forceinline__ void anvilCrossRankBlockBarrier(int nRanks, int myRan
 __device__ __forceinline__ void anvilIntraGpuBlockBarrier(int nRanks, int blockId, uint64_t* localBarriers,
                                                             uint64_t val) {
   const int numBlocks = gridDim.x;
-  if (numBlocks <= 1)
+  if (numBlocks <= 1) {
+    __syncthreads();
     return;
+  }
 
   const int intraBase = kMaxSdmaBarrierBlocks * nRanks;
 
-  __syncthreads();
-  if (threadIdx.x == 0) {
+  //__syncthreads();
+  /*if (threadIdx.x == 0) {
     uint64_t* arrival = localBarriers + intraBase + blockId;
     __atomic_store_n(arrival, val, __ATOMIC_RELEASE);
 
@@ -114,6 +116,21 @@ __device__ __forceinline__ void anvilIntraGpuBlockBarrier(int nRanks, int blockI
         continue;
       uint64_t* waitAt = localBarriers + intraBase + b;
       while (__atomic_load_n(waitAt, __ATOMIC_ACQUIRE) != val) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+  }*/
+
+  uint64_t* arrival = localBarriers + intraBase + 0;
+  uint64_t* doneGen = localBarriers + intraBase + 1;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    uint32_t prev = __hip_atomic_fetch_add(arrival, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if (prev + 1 == (uint32_t)numBlocks) {
+      __hip_atomic_store(arrival, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(doneGen, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    } else {
+      while (__hip_atomic_load(doneGen, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) != val) {
         __builtin_amdgcn_s_sleep(1);
       }
     }
@@ -128,7 +145,7 @@ __global__ void anvilAlltoAllKernel(const float* __restrict__ sendbuff, float* _
                                          rocshmem::anvil::SdmaQueueDeviceHandle** __restrict__ devHandles,
                                          uint64_t** __restrict__ remoteSignals, uint64_t** remoteBarriers, 
 					 uint64_t* localSignals, uint64_t* localBarriers, uint64_t bar1, uint64_t bar2, uint64_t signal1, int warpSize, uint64_t bar3) {
-  if (blockIdx.x >= 8)
+  if (blockIdx.x >= 1)
     return;
 
 
@@ -199,8 +216,6 @@ __global__ void anvilAlltoAllKernel(const float* __restrict__ sendbuff, float* _
   for (int i = vecCount * 4 + gid; i < chunk; i += totalThreads) {
 #pragma unroll
     for (int r = 0; r < nRanks; ++r) {
-      if (r == myRank)
-        continue;
       recvbuff[i + r * chunk] = myTempFloat[(size_t)r * (size_t)chunk + (size_t)i];
     }
   }
@@ -212,7 +227,7 @@ __global__ void anvilAlltoAllKernel(const float* __restrict__ sendbuff, float* _
   }
   __syncthreads();
 
-  //anvilIntraGpuBlockBarrier(nRanks, blockIdx.x, localBarriers, bar3+3);
+  //anvilIntraGpuBlockBarrier(nRanks, blockIdx.x, localBarriers, bar3+3);*/
   anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, bar2);
 
 }
@@ -252,9 +267,10 @@ ncclResult_t rcclAnvilAlltoAllTry(const void* sendbuff, void* recvbuff, size_t c
   int warpSize = comm->WarpSize;
   float* tmpBuf = reinterpret_cast<float*>(comm->sdmaFineGrainedTempBuf);
 
-  hipLaunchKernelGGL(anvilAlltoAllKernel, dim3(8), dim3(512), 0, stream, sb, rb, tmpBuf, icount, nr,
+  hipLaunchKernelGGL(anvilAlltoAllKernel, dim3(1), dim3(512), 0, stream, sb, rb, tmpBuf, icount, nr,
                      comm->rank, comm->sdmaFineGrainedTempPeerPtrs_d, comm->deviceHandles_d, comm->sdmaSyncBufferPeerPtrs_d, 
 		     comm->sdmaBarrierBufferPeerPtrs_d, comm->sdmaSyncBuffer, comm->sdmaBarrierBuffer, bar1, bar2, signal1, warpSize, bar3);
+  //hipMemcpyAsync(recvbuff, comm->sdmaFineGrainedTempBuf, count*comm->nRanks*sizeof(float), hipMemcpyDeviceToDevice, stream);
 
   CUDACHECK(hipGetLastError());
 

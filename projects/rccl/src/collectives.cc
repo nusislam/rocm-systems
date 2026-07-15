@@ -268,7 +268,7 @@ ncclResult_t ncclAlltoAll_impl(const void* sendbuff, void* recvbuff, size_t coun
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
   size_t msgSize = count * ncclTypeSize(datatype) * comm->nRanks;
 
-  if (rcclParamAnvilAlltoAll() != 0 && msgSize <= 33554432) {
+  if (rcclParamAnvilAlltoAll() != 0 && msgSize <= 268435456) {
     //printf("Anvil SDMA alltoall\n");
     int flag1 = comm->sdmaAnvilBarrierFlag;
     int flag2 = flag1 + 1;
