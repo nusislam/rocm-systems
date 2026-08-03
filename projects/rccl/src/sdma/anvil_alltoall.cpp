@@ -104,7 +104,7 @@ __device__ __forceinline__ void anvilIntraGpuBlockBarrier(int nRanks, int blockI
     return;
   }
 
-  const int intraBase = kMaxSdmaBarrierBlocks * nRanks;
+  const uint64_t intraBase = kMaxSdmaBarrierBlocks * nRanks;
 
   //__syncthreads();
   /*if (threadIdx.x == 0) {
@@ -125,8 +125,8 @@ __device__ __forceinline__ void anvilIntraGpuBlockBarrier(int nRanks, int blockI
   uint64_t* doneGen = localBarriers + intraBase + 1;
   __syncthreads();
   if (threadIdx.x == 0) {
-    uint32_t prev = __hip_atomic_fetch_add(arrival, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    if (prev + 1 == (uint32_t)numBlocks) {
+    uint64_t prev = __hip_atomic_fetch_add(arrival, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if (prev + 1 == (uint64_t)numBlocks) {
       __hip_atomic_store(arrival, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       __hip_atomic_store(doneGen, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
     } else {
@@ -145,7 +145,7 @@ __global__ void anvilAlltoAllKernel(const float* __restrict__ sendbuff, float* _
                                          rocshmem::anvil::SdmaQueueDeviceHandle** __restrict__ devHandles,
                                          uint64_t** __restrict__ remoteSignals, uint64_t** remoteBarriers, 
 					 uint64_t* localSignals, uint64_t* localBarriers, uint64_t bar1, uint64_t bar2, uint64_t signal1, int warpSize, uint64_t bar3) {
-  if (blockIdx.x >= 1)
+  if (blockIdx.x >= 8)
     return;
 
 
@@ -199,33 +199,35 @@ __global__ void anvilAlltoAllKernel(const float* __restrict__ sendbuff, float* _
   }
   __syncthreads();
 
-  const int gid = blockIdx.x * blockDim.x + threadIdx.x;
-  const int totalThreads = blockDim.x * gridDim.x;
-  const int vecCount = chunk / 4;
+  if (count <= 4096) {
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int totalThreads = blockDim.x * gridDim.x;
+    const int vecCount = chunk / 4;
 
-  const float* myTempFloat = reinterpret_cast<float*>(myTemp);
-  for (int vi = gid; vi < vecCount; vi += totalThreads) {
-    const int i = vi * 4;
+    const float* myTempFloat = reinterpret_cast<float*>(myTemp);
+    for (int vi = gid; vi < vecCount; vi += totalThreads) {
+      const int i = vi * 4;
 #pragma unroll
-    for (int r = 0; r < nRanks; ++r) {
-      const float* srcRank = myTempFloat + (size_t)r * (size_t)chunk;
-      anvilStoreVec16(recvbuff + i + r * chunk, anvilLoadVec16(srcRank + i));
+      for (int r = 0; r < nRanks; ++r) {
+        const float* srcRank = myTempFloat + (size_t)r * (size_t)chunk;
+        anvilStoreVec16(recvbuff + i + r * chunk, anvilLoadVec16(srcRank + i));
+      }
     }
-  }
 
-  for (int i = vecCount * 4 + gid; i < chunk; i += totalThreads) {
+    for (int i = vecCount * 4 + gid; i < chunk; i += totalThreads) {
 #pragma unroll
-    for (int r = 0; r < nRanks; ++r) {
-      recvbuff[i + r * chunk] = myTempFloat[(size_t)r * (size_t)chunk + (size_t)i];
+      for (int r = 0; r < nRanks; ++r) {
+        recvbuff[i + r * chunk] = myTempFloat[(size_t)r * (size_t)chunk + (size_t)i];
+      }
     }
-  }
 
-  __syncthreads();
+    __syncthreads();
 
-  if (threadIdx.x == 0) {
-    asm volatile("buffer_wbl2" ::: "memory");
+    if (threadIdx.x == 0) {
+      asm volatile("buffer_wbl2" ::: "memory");
+    }
+    __syncthreads();
   }
-  __syncthreads();
 
   //anvilIntraGpuBlockBarrier(nRanks, blockIdx.x, localBarriers, bar3+3);*/
   anvilCrossRankBlockBarrier(nRanks, myRank, blockIdx.x, remoteBarriers, localBarriers, bar2);
@@ -267,10 +269,12 @@ ncclResult_t rcclAnvilAlltoAllTry(const void* sendbuff, void* recvbuff, size_t c
   int warpSize = comm->WarpSize;
   float* tmpBuf = reinterpret_cast<float*>(comm->sdmaFineGrainedTempBuf);
 
-  hipLaunchKernelGGL(anvilAlltoAllKernel, dim3(1), dim3(512), 0, stream, sb, rb, tmpBuf, icount, nr,
+  hipLaunchKernelGGL(anvilAlltoAllKernel, dim3(8), dim3(512), 0, stream, sb, rb, tmpBuf, icount, nr,
                      comm->rank, comm->sdmaFineGrainedTempPeerPtrs_d, comm->deviceHandles_d, comm->sdmaSyncBufferPeerPtrs_d, 
 		     comm->sdmaBarrierBufferPeerPtrs_d, comm->sdmaSyncBuffer, comm->sdmaBarrierBuffer, bar1, bar2, signal1, warpSize, bar3);
-  //hipMemcpyAsync(recvbuff, comm->sdmaFineGrainedTempBuf, count*comm->nRanks*sizeof(float), hipMemcpyDeviceToDevice, stream);
+  if (count > 4096) {
+  	hipMemcpyAsync(recvbuff, comm->sdmaFineGrainedTempBuf, count*comm->nRanks*sizeof(float), hipMemcpyDeviceToDevice, stream);
+  }
 
   CUDACHECK(hipGetLastError());
 
