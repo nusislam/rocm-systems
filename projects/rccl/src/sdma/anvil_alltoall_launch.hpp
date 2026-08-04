@@ -17,5 +17,5 @@ int64_t rcclParamAnvilAlltoAll(void);
 // ncclInvalidArgument for invalid pointers, ncclInternalError on unexpected HIP failures.
 ncclResult_t rcclAnvilAlltoAllTry(const void* sendbuff, void* recvbuff, size_t count,
                                           ncclDataType_t datatype, ncclComm_t comm,
-                                          hipStream_t stream, uint64_t bar1, uint64_t bar2, uint64_t signal1, uint64_t bar3);
+                                          hipStream_t stream, uint64_t bar1, uint64_t bar2, uint64_t signal1, uint64_t bar3, uint64_t bar4);
 

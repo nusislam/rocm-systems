@@ -144,7 +144,7 @@ __global__ void anvilAlltoAllKernel(const float* __restrict__ sendbuff, float* _
 					void** __restrict__ peerTempPtrs,
                                          rocshmem::anvil::SdmaQueueDeviceHandle** __restrict__ devHandles,
                                          uint64_t** __restrict__ remoteSignals, uint64_t** remoteBarriers, 
-					 uint64_t* localSignals, uint64_t* localBarriers, uint64_t bar1, uint64_t bar2, uint64_t signal1, int warpSize, uint64_t bar3) {
+					 uint64_t* localSignals, uint64_t* localBarriers, uint64_t bar1, uint64_t bar2, uint64_t signal1, int warpSize, uint64_t bar3, uint64_t bar4) {
   if (blockIdx.x >= 8)
     return;
 
@@ -194,10 +194,13 @@ __global__ void anvilAlltoAllKernel(const float* __restrict__ sendbuff, float* _
 
   anvilIntraGpuBlockBarrier(nRanks, blockIdx.x, localBarriers, bar3);
 
-  if (threadIdx.x == 0) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
     asm volatile("buffer_wbl2" ::: "memory");
   }
-  __syncthreads();
+
+  anvilIntraGpuBlockBarrier(nRanks, blockIdx.x, localBarriers, bar4);
+
+  //__syncthreads();
 
   if (count <= 4096) {
     const int gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -223,10 +226,29 @@ __global__ void anvilAlltoAllKernel(const float* __restrict__ sendbuff, float* _
 
     __syncthreads();
 
-    if (threadIdx.x == 0) {
-      asm volatile("buffer_wbl2" ::: "memory");
-    }
-    __syncthreads();
+  } else {
+      if (blockIdx.x == 0) {
+	  const int warpId = static_cast<int>(threadIdx.x) / warpSize;
+  	  const int laneId = static_cast<int>(threadIdx.x) % warpSize;
+
+          if (laneId == 0 && warpId < nRanks) {
+    	     peer = warpId;
+	     if (peer == myRank) {
+             	rocshmem::anvil::SdmaQueueDeviceHandle* hqPtr = devHandles[peer * kNumSdmaChannels + 0];
+    	     	if (hqPtr != nullptr) {
+        	    rocshmem::anvil::SdmaQueueDeviceHandle& hq = *hqPtr;
+
+        	    //void* peerBase = peerTempPtrs[peer];
+        	    //char* peerC = reinterpret_cast<char*>(peerBase);
+        	    float* dst = reinterpret_cast<float*>(recvbuff);
+		    const float* src = reinterpret_cast<float*>(myTemp);
+
+        	    rocshmem::anvil::put(hq, dst, const_cast<float*>(src), count * nRanks * sizeof(float));
+		    rocshmem::anvil::quiet(*hqPtr);
+    	     	}
+	     }
+	  }
+       }
   }
 
   //anvilIntraGpuBlockBarrier(nRanks, blockIdx.x, localBarriers, bar3+3);*/
@@ -236,7 +258,7 @@ __global__ void anvilAlltoAllKernel(const float* __restrict__ sendbuff, float* _
 
 ncclResult_t rcclAnvilAlltoAllTry(const void* sendbuff, void* recvbuff, size_t count,
                                           ncclDataType_t datatype, ncclComm_t comm,
-                                          hipStream_t stream, uint64_t bar1, uint64_t bar2, uint64_t signal1, uint64_t bar3) {
+                                          hipStream_t stream, uint64_t bar1, uint64_t bar2, uint64_t signal1, uint64_t bar3, uint64_t bar4) {
   if (rcclParamAnvilAlltoAll() == 0)
     return ncclInvalidUsage;
   if (comm == nullptr || sendbuff == nullptr || recvbuff == nullptr)
@@ -271,10 +293,10 @@ ncclResult_t rcclAnvilAlltoAllTry(const void* sendbuff, void* recvbuff, size_t c
 
   hipLaunchKernelGGL(anvilAlltoAllKernel, dim3(8), dim3(512), 0, stream, sb, rb, tmpBuf, icount, nr,
                      comm->rank, comm->sdmaFineGrainedTempPeerPtrs_d, comm->deviceHandles_d, comm->sdmaSyncBufferPeerPtrs_d, 
-		     comm->sdmaBarrierBufferPeerPtrs_d, comm->sdmaSyncBuffer, comm->sdmaBarrierBuffer, bar1, bar2, signal1, warpSize, bar3);
-  if (count > 4096) {
+		     comm->sdmaBarrierBufferPeerPtrs_d, comm->sdmaSyncBuffer, comm->sdmaBarrierBuffer, bar1, bar2, signal1, warpSize, bar3, bar4);
+  /*if (count > 4096) {
   	hipMemcpyAsync(recvbuff, comm->sdmaFineGrainedTempBuf, count*comm->nRanks*sizeof(float), hipMemcpyDeviceToDevice, stream);
-  }
+  }*/
 
   CUDACHECK(hipGetLastError());
 

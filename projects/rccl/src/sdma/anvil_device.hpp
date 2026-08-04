@@ -415,6 +415,8 @@ __device__ __forceinline__ void put_signal_counter_impl(SdmaQueueDeviceHandle& h
                                                         uint64_t* counter,
                                                         uint64_t* put_index = nullptr) {
 #if SDMA_IS_OSS7 && ANVIL_USE_FUSED_MI4
+//#if SDMA_IS_OSS7
+
   // OSS7 fast path: when a copy + signal and/or counter are requested, fuse the
   // copy and one atomic into a single COPY_LINEAR_WAIT_SIGNAL_MI4 packet.
   // The HW packet has one signal slot: when both signal and counter are active,

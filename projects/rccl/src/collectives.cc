@@ -274,16 +274,17 @@ ncclResult_t ncclAlltoAll_impl(const void* sendbuff, void* recvbuff, size_t coun
     int flag2 = flag1 + 1;
     int flag3 = comm->sdmaAnvilSignalFlag;
     int flag4 = comm->sdmaAnvilIntraBarrierFlag;
+    int flag5 = comm->sdmaAnvilIntraBarrierFlag + 1;
 
 
     ncclResult_t ar =
-        rcclAnvilAlltoAllTry(sendbuff, recvbuff, count, datatype, comm, stream, flag1, flag2, flag3, flag4);
+        rcclAnvilAlltoAllTry(sendbuff, recvbuff, count, datatype, comm, stream, flag1, flag2, flag3, flag4, flag5);
     if (ar == ncclSuccess) return ncclSuccess;
     if (ar != ncclInvalidUsage) return ar;
 
     comm->sdmaAnvilBarrierFlag = flag2 + 1;
     comm->sdmaAnvilSignalFlag = comm->sdmaAnvilSignalFlag + 1;
-    comm->sdmaAnvilIntraBarrierFlag = comm->sdmaAnvilIntraBarrierFlag + 1;
+    comm->sdmaAnvilIntraBarrierFlag = comm->sdmaAnvilIntraBarrierFlag + 2;
   }
 #endif
   info = { ncclFuncAlltoAll, "AlltoAll",
