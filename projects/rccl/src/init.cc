@@ -76,6 +76,9 @@
 #include "latency_profiler/CollTrace.h"
 #include "latency_profiler/CollTraceFunc.h"
 #include "dda_all_reduce.h"
+#if defined(ENABLE_ROCSHMEM_GIN) && (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__))
+#include "gin_all_reduce.h"
+#endif
 #include "ipc_init.h"
 #include "fabric_init.h"
 #include <cpuid.h>
@@ -465,6 +468,9 @@ static ncclResult_t commFree(ncclComm_t comm) {
   }
   comm->hierarchicalCommsInitialized = false;
 
+#if defined(ENABLE_ROCSHMEM_GIN) && (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__))
+  NCCLCHECK(ncclGinAllReduceFinalize(comm));
+#endif
   if (comm->symmetricSupport) {
     NCCLCHECK(ncclSymkFinalize(comm));
   }
@@ -677,6 +683,8 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
   comm->ddaFabricBarrierState = nullptr;
   comm->ddaFabricMemHandler = nullptr;
   comm->ddaFabricMaxBlocks = 0;
+  comm->ddaScratchWin = nullptr;
+  comm->ginAllReduceDevCommReady = false;
 
   comm->rank = rank;
   comm->nRanks = ndev;

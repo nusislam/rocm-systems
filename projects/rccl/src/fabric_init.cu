@@ -14,6 +14,7 @@
 #include "dda_init_detail.h"
 #include "fabric_gpu_barrier.h"
 #include "fabric_mem_handler.h"
+#include "dev_runtime.h"
 
 #include <cuda_runtime.h>
 
@@ -116,6 +117,15 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
   comm->ddaPeerPtrsDev = peerDev;
   comm->ddaFabricBarrierState = barrierState;
   comm->ddaFabricMaxBlocks = nBlocksMax;
+#if defined(ENABLE_ROCSHMEM_GIN)
+  if (comm->symmetricSupport) {
+    ncclWindow_t scratchWinDev = nullptr;
+    if (ncclDevrInitOnce(comm) == ncclSuccess &&
+        ncclDevrWindowRegisterInGroup(comm, scratch, bytes, /*winFlags=*/0, &scratchWinDev) == ncclSuccess) {
+      (void)ncclDevrFindWindow(comm, scratch, &comm->ddaScratchWin);
+    }
+  }
+#endif
   INFO(NCCL_INIT,
        "ncclDdaFabricCommInit: nRanks %d, scratch %zu bytes (vmm), FabricGpuBarrier nBlocks=%d, peer table on device",
        nRanks, bytes, nBlocksMax);

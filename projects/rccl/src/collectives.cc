@@ -14,6 +14,9 @@
 #include "nvtx_payload_schemas.h"
 #include "device/hierarchical_ag_shuffle.h"
 #include "dda_all_reduce.h"
+#if defined(ENABLE_ROCSHMEM_GIN) && (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__))
+#include "gin_all_reduce.h"
+#endif
 #include "dda_reduce_scatter.h"
 #include "dda_all_gather.h"
 #include "dda_alltoall.h"
@@ -556,6 +559,15 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
   // buffers as symmetric windows; otherwise fall through to DDA.
   bool symEligible = (op == ncclSum) && isSymmetricKernelRequested(comm, ncclFuncAllReduce, (int)ncclDevSum, datatype,
                                                                    count, sendbuff, recvbuff);
+
+#if defined(ENABLE_ROCSHMEM_GIN) && (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__))
+  if (symEligible && ncclAllReduceGinTreeEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+    INFO(NCCL_COLL, "AllReduce: taking GIN tree path: nRanks=%d count=%zu bytes=%zu", comm->nRanks, count,
+         count * ncclTypeSize(datatype));
+    NCCLCHECK(ncclAllReduceGinTree(sendbuff, recvbuff, count, datatype, op, comm, stream));
+    return ncclSuccess;
+  }
+#endif
 
   if (!symEligible && rcclDdaEnabled(comm, count * ncclTypeSize(datatype), 8388608)) {
     if (IsArchMatch(comm->archName, "gfx1250")) {

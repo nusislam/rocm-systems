@@ -634,6 +634,9 @@ struct ncclComm {
   // True when ddaScratch is VMM (cuMem) backed (fabric path); selects the
   // matching deallocator at teardown.
   bool ddaScratchIsVmm;
+  struct ncclDevrWindow* ddaScratchWin;
+  struct ncclDevComm ginAllReduceDevComm;
+  bool ginAllReduceDevCommReady;
 
   // Bitmasks for ncclTransportP2pSetup
   struct channelMasks* connectSend;
