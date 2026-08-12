@@ -13,6 +13,7 @@
 #include "debug.h"
 #include "dda_init_detail.h"
 #include "ipc_mem_handler.h"
+#include "dev_runtime.h"
 
 #include <cuda_runtime.h>
 
@@ -191,6 +192,15 @@ ncclResult_t ncclDdaIpcCommInit(ncclComm* comm) {
   comm->ddaScratchBytes = bytes;
   comm->ddaPeerPtrsDev = peerDev;
   comm->ddaIpcBarrierState = barrierState;
+#if defined(ENABLE_ROCSHMEM_GIN)
+  if (comm->symmetricSupport) {
+    ncclWindow_t scratchWinDev = nullptr;
+    if (ncclDevrInitOnce(comm) == ncclSuccess &&
+        ncclDevrWindowRegisterInGroup(comm, scratch, bytes, /*winFlags=*/0, &scratchWinDev) == ncclSuccess) {
+      (void)ncclDevrFindWindow(comm, scratch, &comm->ddaScratchWin);
+    }
+  }
+#endif
   INFO(NCCL_INIT, "ncclDdaIpcCommInit: scratch %zu bytes, IpcGpuBarrier nBlocks=%d, peer IPC table on device", bytes,
        nBlocksMax);
   return ncclSuccess;

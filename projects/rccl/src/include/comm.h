@@ -41,6 +41,11 @@
 #include "gin/gin_host_win_stub.h"
 #endif
 
+#if defined(ENABLE_ROCSHMEM_GIN) && (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__))
+#include "gin_all_reduce.h"
+#endif
+
+
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #define HIPRT_CB
 #else
@@ -645,6 +650,9 @@ struct ncclComm {
   // Device-resident per-block epoch cells for the LL-protocol DDA collectives,
   uint32_t* ddaLLEpochDev;
   int ddaLLEpochLen;
+  struct ncclDevrWindow* ddaScratchWin;
+  struct ncclDevComm ginAllReduceDevComm;
+  bool ginAllReduceDevCommReady;
 
   // Bitmasks for ncclTransportP2pSetup
   struct channelMasks* connectSend;
