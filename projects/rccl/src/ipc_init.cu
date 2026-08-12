@@ -195,10 +195,10 @@ ncclResult_t ncclDdaIpcCommInit(ncclComm* comm) {
 #if defined(ENABLE_ROCSHMEM_GIN)
   if (comm->symmetricSupport) {
     ncclWindow_t scratchWinDev = nullptr;
-    if (ncclDevrInitOnce(comm) == ncclSuccess &&
-        ncclDevrWindowRegisterInGroup(comm, scratch, bytes, /*winFlags=*/0, &scratchWinDev) == ncclSuccess) {
+    /*if (ncclDevrInitOnce(comm) == ncclSuccess &&
+        ncclDevrWindowRegisterInGroup(comm, scratch, bytes, 0, &scratchWinDev) == ncclSuccess) {
       (void)ncclDevrFindWindow(comm, scratch, &comm->ddaScratchWin);
-    }
+	}*/
   }
 #endif
   INFO(NCCL_INIT, "ncclDdaIpcCommInit: scratch %zu bytes, IpcGpuBarrier nBlocks=%d, peer IPC table on device", bytes,
