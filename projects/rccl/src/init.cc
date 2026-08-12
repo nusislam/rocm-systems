@@ -2730,6 +2730,13 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
       NCCLCHECKGOTO(ncclDdaIpcCommInit(comm), res, fail);
     }
   }
+
+#if defined(ENABLE_ROCSHMEM_GIN) && (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__))
+    if (ncclGinAllReduceBackendConfigured(comm)) {
+      //NCCLCHECKGOTO(ncclGinAllReduceInitOnce(comm), res, fail);
+      NCCLCHECKGOTO(ncclGinAllReduceScratchInit(comm), res, fail);
+    }
+#endif
   // update communicator state
   comm->initState = ncclSuccess;
 

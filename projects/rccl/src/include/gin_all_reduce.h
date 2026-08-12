@@ -12,11 +12,14 @@
 struct ncclComm;
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+bool ncclGinAllReduceBackendConfigured(struct ncclComm* comm);
 bool ncclGinAllReduceSdmaBackendEnabled(struct ncclComm* comm);
 bool ncclAllReduceGinTreeEligible(struct ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                   ncclDataType_t datatype, ncclRedOp_t op);
 ncclResult_t ncclAllReduceGinTree(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                   ncclRedOp_t op, struct ncclComm* comm, hipStream_t stream);
+
+ncclResult_t ncclGinAllReduceScratchInit(struct ncclComm* comm);
 ncclResult_t ncclGinAllReduceInitOnce(struct ncclComm* comm);
 ncclResult_t ncclGinAllReduceFinalize(struct ncclComm* comm);
 #endif

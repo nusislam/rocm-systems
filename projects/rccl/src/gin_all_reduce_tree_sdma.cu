@@ -10,6 +10,7 @@
 
 #include "algorithms/all_reduce/all_reduce_gin_tree_sdma.h"
 #include "algorithms/CollCommon.h"
+#include "alloc.h"
 #include "checks.h"
 #include "comm.h"
 #include "dda_init_detail.h"
@@ -26,25 +27,32 @@ namespace {
 using nccl_dda_detail::ddaMaxNBlocksForScratch;
 
 constexpr size_t kGinFlatTreeThresholdBytes = 1ULL << 18;
+constexpr size_t kGinAllReduceScratchBytes = 128ULL * 1024 * 1024;
 
 static bool ginAllReduceScratchWinReady(ncclComm* comm) {
-  return comm != nullptr && comm->ddaScratchWin != nullptr && comm->ddaScratchWin->vidmem != nullptr;
+  return comm != nullptr && comm->ginAllReduceScratchWin != nullptr &&
+         comm->ginAllReduceScratchWin->vidmem != nullptr;
 }
 
-static ncclResult_t ginAllReduceEnsureScratchWin(ncclComm* comm) {
+static ncclResult_t ginAllReduceEnsureScratch(ncclComm* comm) {
   if (ginAllReduceScratchWinReady(comm)) {
     return ncclSuccess;
   }
-  if (comm->ddaScratch == nullptr || comm->ddaScratchBytes == 0) {
-    return ncclInvalidUsage;
-  }
 
+  void* scratch = nullptr;
   ncclWindow_t scratchWinDev = nullptr;
-  NCCLCHECK(ncclDevrWindowRegisterInGroup(comm, comm->ddaScratch, comm->ddaScratchBytes, /*winFlags=*/0, &scratchWinDev));
-  NCCLCHECK(ncclDevrFindWindow(comm, comm->ddaScratch, &comm->ddaScratchWin));
+  NCCLCHECK(ncclMemAlloc(&scratch, kGinAllReduceScratchBytes));
+  // Register for GIN/LSA visibility without NCCL_WIN_COLL_SYMMETRIC, which would
+  // trigger symk init and interfere with user symmetric window registration (-R 2).
+  NCCLCHECK(ncclDevrWindowRegisterInGroup(comm, scratch, kGinAllReduceScratchBytes, /*winFlags=*/0, &scratchWinDev));
+  NCCLCHECK(ncclDevrFindWindow(comm, scratch, &comm->ginAllReduceScratchWin));
   if (!ginAllReduceScratchWinReady(comm)) {
+    NCCLCHECK(ncclMemFree(scratch));
     return ncclInternalError;
   }
+  comm->ginAllReduceScratch = scratch;
+  comm->ginAllReduceScratchBytes = kGinAllReduceScratchBytes;
+  INFO(NCCL_INIT, "GIN all-reduce scratch allocated: %zu bytes", kGinAllReduceScratchBytes);
   return ncclSuccess;
 }
 
@@ -52,8 +60,10 @@ template <typename T>
 static ncclResult_t ncclAllReduceGinTreeTyped(const void* sendbuff, void* recvbuff, size_t count, ncclComm* comm,
                                               cudaStream_t stream, struct ncclDevrWindow* sendWin,
                                               struct ncclDevrWindow* recvWin) {
-  NCCLCHECK(ginAllReduceEnsureScratchWin(comm));
   NCCLCHECK(ncclGinAllReduceInitOnce(comm));
+  if (!ginAllReduceScratchWinReady(comm)) {
+    return ncclInternalError;
+  }
 
   const int nBlocksMax = ddaMaxNBlocksForScratch();
   auto gridBlock = meta::comms::getGridAndBlockDims(count, sizeof(T), static_cast<size_t>(nBlocksMax));
@@ -64,7 +74,7 @@ static ncclResult_t ncclAllReduceGinTreeTyped(const void* sendbuff, void* recvbu
   const size_t recvOff = static_cast<size_t>(static_cast<char*>(recvbuff) - static_cast<char*>(recvWin->userPtr));
 
   meta::comms::ginAllReduceTreeKernel<T><<<grid, block, 0, stream>>>(
-    comm->ginAllReduceDevComm, sendWin->vidmem, sendOff, comm->ddaScratchWin->vidmem, /*scratchOff=*/0,
+    comm->ginAllReduceDevComm, sendWin->vidmem, sendOff, comm->ginAllReduceScratchWin->vidmem, /*scratchOff=*/0,
     recvWin->vidmem, recvOff, count, comm->nRanks, comm->rank, /*rsSignalBase=*/0,
     /*agSignalBase=*/static_cast<unsigned>(nBlocksMax));
 
@@ -73,6 +83,16 @@ static ncclResult_t ncclAllReduceGinTreeTyped(const void* sendbuff, void* recvbu
 }
 
 } // namespace
+
+bool ncclGinAllReduceBackendConfigured(ncclComm* comm) {
+  if (comm == nullptr || comm->sharedRes == nullptr) {
+    return false;
+  }
+  if (comm->globalGinSupport == NCCL_GIN_CONNECTION_NONE || !comm->symmetricSupport) {
+    return false;
+  }
+  return comm->sharedRes->ginState.ginType == NCCL_NET_DEVICE_GIN_ANVIL_SDMA;
+}
 
 bool ncclGinAllReduceSdmaBackendEnabled(ncclComm* comm) {
   if (comm == nullptr || comm->sharedRes == nullptr) {
@@ -85,12 +105,22 @@ bool ncclGinAllReduceSdmaBackendEnabled(ncclComm* comm) {
          comm->sharedRes->ginState.ginType == NCCL_NET_DEVICE_GIN_ANVIL_SDMA;
 }
 
+ncclResult_t ncclGinAllReduceScratchInit(ncclComm* comm) {
+  if (ginAllReduceScratchWinReady(comm)) {
+    return ncclSuccess;
+  }
+  NCCLCHECK(ncclDevrInitOnce(comm));
+  NCCLCHECK(ginAllReduceEnsureScratch(comm));
+  return ncclSuccess;
+}
+
 ncclResult_t ncclGinAllReduceInitOnce(ncclComm* comm) {
+  NCCLCHECK(ncclGinAllReduceScratchInit(comm));
+
   if (comm->ginAllReduceDevCommReady) {
     return ncclSuccess;
   }
 
-  NCCLCHECK(ncclDevrInitOnce(comm));
   NCCLCHECK(ncclGinConnectOnce(comm));
 
   const int nBlocks = ddaMaxNBlocksForScratch();
@@ -113,9 +143,14 @@ ncclResult_t ncclGinAllReduceFinalize(ncclComm* comm) {
     NCCLCHECK(ncclDevCommDestroy(comm, &comm->ginAllReduceDevComm));
     comm->ginAllReduceDevCommReady = false;
   }
-  if (comm->ddaScratchWin != nullptr && comm->ddaScratchWin->vidmem != nullptr) {
-    NCCLCHECK(ncclCommWindowDeregister(comm, comm->ddaScratchWin->vidmem));
-    comm->ddaScratchWin = nullptr;
+  if (comm->ginAllReduceScratchWin != nullptr && comm->ginAllReduceScratchWin->vidmem != nullptr) {
+    NCCLCHECK(ncclCommWindowDeregister(comm, comm->ginAllReduceScratchWin->vidmem));
+    comm->ginAllReduceScratchWin = nullptr;
+  }
+  if (comm->ginAllReduceScratch != nullptr) {
+    NCCLCHECK(ncclMemFree(comm->ginAllReduceScratch));
+    comm->ginAllReduceScratch = nullptr;
+    comm->ginAllReduceScratchBytes = 0;
   }
   return ncclSuccess;
 }
@@ -126,9 +161,6 @@ bool ncclAllReduceGinTreeEligible(ncclComm* comm, const void* sendbuff, void* re
     return false;
   }
   if (!ncclGinAllReduceSdmaBackendEnabled(comm)) {
-    return false;
-  }
-  if (comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr) {
     return false;
   }
   if (!ginAllReduceScratchWinReady(comm)) {
@@ -156,7 +188,7 @@ bool ncclAllReduceGinTreeEligible(ncclComm* comm, const void* sendbuff, void* re
   }
 
   const size_t bytes = count * ncclTypeSize(datatype);
-  if (bytes > comm->ddaScratchBytes) {
+  if (bytes > comm->ginAllReduceScratchBytes) {
     return false;
   }
   if (bytes % 16) {
@@ -203,6 +235,11 @@ ncclResult_t ncclAllReduceGinTree(const void* sendbuff, void* recvbuff, size_t c
 
 #else
 
+bool ncclGinAllReduceBackendConfigured(ncclComm* comm) {
+  (void)comm;
+  return false;
+}
+
 bool ncclGinAllReduceSdmaBackendEnabled(ncclComm* comm) {
   (void)comm;
   return false;
@@ -228,6 +265,11 @@ ncclResult_t ncclAllReduceGinTree(const void* sendbuff, void* recvbuff, size_t c
   (void)op;
   (void)comm;
   (void)stream;
+  return ncclInvalidUsage;
+}
+
+ncclResult_t ncclGinAllReduceScratchInit(ncclComm* comm) {
+  (void)comm;
   return ncclInvalidUsage;
 }
 

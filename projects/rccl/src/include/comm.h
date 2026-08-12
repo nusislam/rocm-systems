@@ -651,6 +651,11 @@ struct ncclComm {
   uint32_t* ddaLLEpochDev;
   int ddaLLEpochLen;
   struct ncclDevrWindow* ddaScratchWin;
+
+  void* ginAllReduceScratch;
+  size_t ginAllReduceScratchBytes;
+  struct ncclDevrWindow* ginAllReduceScratchWin;
+
   struct ncclDevComm ginAllReduceDevComm;
   bool ginAllReduceDevCommReady;
 
