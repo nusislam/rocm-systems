@@ -28,6 +28,21 @@ using nccl_dda_detail::ddaMaxNBlocksForScratch;
 
 constexpr size_t kGinFlatTreeThresholdBytes = 1ULL << 18;
 constexpr size_t kGinAllReduceScratchBytes = 128ULL * 1024 * 1024;
+// Matches NCCL_GIN_ANVIL_SDMA_THRESHOLD default (single-CTA full-chunk puts).
+constexpr size_t kGinAllReduceMinPutBytes = 128;
+constexpr size_t kGinAllReduceSyncBytes = 24;
+
+static bool ginAllReduceLaunchEligible(size_t countPerRank, int typeSize, int nBlocksMax) {
+  const size_t chunkBytes = countPerRank * static_cast<size_t>(typeSize);
+  if (chunkBytes % 16) {
+    return false;
+  }
+  if (chunkBytes < kGinAllReduceMinPutBytes) {
+    return false;
+  }
+  auto gridBlock = meta::comms::getGridAndBlockDims(countPerRank, typeSize, static_cast<size_t>(nBlocksMax));
+  return gridBlock.first.x >= 1;
+}
 
 static bool ginAllReduceScratchWinReady(ncclComm* comm) {
   return comm != nullptr && comm->ginAllReduceScratchWin != nullptr &&
@@ -65,20 +80,27 @@ static ncclResult_t ncclAllReduceGinTreeTyped(const void* sendbuff, void* recvbu
     return ncclInternalError;
   }
 
-  printf("Allred init once passed\n");
   const int nBlocksMax = ddaMaxNBlocksForScratch();
-  auto gridBlock = meta::comms::getGridAndBlockDims(count, sizeof(T), static_cast<size_t>(nBlocksMax));
+  const size_t countPerRank = count / static_cast<size_t>(comm->nRanks);
+  if (!ginAllReduceLaunchEligible(countPerRank, sizeof(T), nBlocksMax)) {
+    return ncclInvalidArgument;
+  }
+  auto gridBlock = meta::comms::getGridAndBlockDims(countPerRank, sizeof(T), static_cast<size_t>(nBlocksMax));
   const dim3 grid = gridBlock.first;
   const dim3 block = gridBlock.second;
 
   const size_t sendOff = static_cast<size_t>(static_cast<const char*>(sendbuff) - static_cast<const char*>(sendWin->userPtr));
   const size_t recvOff = static_cast<size_t>(static_cast<char*>(recvbuff) - static_cast<char*>(recvWin->userPtr));
-  printf("Allred calling kernel\n");
 
+  // Zero CTA-arrival counters in scratch (placed immediately after RS data).
+  const size_t scratchDataBytes = countPerRank * sizeof(T) * static_cast<size_t>(comm->nRanks);
+  CUDACHECK(cudaMemsetAsync(static_cast<char*>(comm->ginAllReduceScratch) + scratchDataBytes, 0,
+                            kGinAllReduceSyncBytes, stream));
+
+  printf("Calling kernel\n");
   meta::comms::ginAllReduceTreeKernel<T><<<grid, block, 0, stream>>>(
     comm->ginAllReduceDevComm, sendWin->vidmem, sendOff, comm->ginAllReduceScratchWin->vidmem, /*scratchOff=*/0,
-    recvWin->vidmem, recvOff, count, comm->nRanks, comm->rank, /*rsSignalBase=*/0,
-    /*agSignalBase=*/static_cast<unsigned>(nBlocksMax));
+    recvWin->vidmem, recvOff, count, comm->nRanks, comm->rank, /*rsSignalBase=*/0, /*agSignalBase=*/1);
 
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
@@ -125,10 +147,9 @@ ncclResult_t ncclGinAllReduceInitOnce(ncclComm* comm) {
 
   NCCLCHECK(ncclGinConnectOnce(comm));
 
-  const int nBlocks = ddaMaxNBlocksForScratch();
   struct ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-  reqs.railGinBarrierCount = nBlocks;
-  reqs.ginSignalCount = 2 * nBlocks;
+  reqs.railGinBarrierCount = 1;
+  reqs.ginSignalCount = 2;
   reqs.ginConnectionType =
     comm->globalGinSupport == NCCL_GIN_CONNECTION_FULL ? NCCL_GIN_CONNECTION_FULL : NCCL_GIN_CONNECTION_RAIL;
 
@@ -165,9 +186,9 @@ bool ncclAllReduceGinTreeEligible(ncclComm* comm, const void* sendbuff, void* re
   if (!ncclGinAllReduceSdmaBackendEnabled(comm)) {
     return false;
   }
-  /*if (!ginAllReduceScratchWinReady(comm)) {
+  if (!ginAllReduceScratchWinReady(comm)) {
     return false;
-  }*/
+  }
   if (op != ncclSum) {
     return false;
   }
@@ -178,7 +199,7 @@ bool ncclAllReduceGinTreeEligible(ncclComm* comm, const void* sendbuff, void* re
     return false;
   }
 
-  /*struct ncclDevrWindow* sendWin = nullptr;
+  struct ncclDevrWindow* sendWin = nullptr;
   struct ncclDevrWindow* recvWin = nullptr;
   ncclDevrFindWindow(comm, sendbuff, &sendWin);
   ncclDevrFindWindow(comm, recvbuff, &recvWin);
@@ -187,11 +208,10 @@ bool ncclAllReduceGinTreeEligible(ncclComm* comm, const void* sendbuff, void* re
   }
   if (!(sendWin->winFlags & NCCL_WIN_COLL_SYMMETRIC) || !(recvWin->winFlags & NCCL_WIN_COLL_SYMMETRIC)) {
     return false;
-  }*/
-  printf("Check eligibility - 1\n");
+  }
 
   const size_t bytes = count * ncclTypeSize(datatype);
-  if (bytes > comm->ginAllReduceScratchBytes) {
+  if (bytes + kGinAllReduceSyncBytes > comm->ginAllReduceScratchBytes) {
     return false;
   }
   if (bytes % 16) {
@@ -200,19 +220,18 @@ bool ncclAllReduceGinTreeEligible(ncclComm* comm, const void* sendbuff, void* re
   if (bytes <= kGinFlatTreeThresholdBytes) {
     return false;
   }
-  printf("Size check pass - 2\n");
 
   if (count % static_cast<size_t>(comm->nRanks) != 0) {
     return false;
   }
-  printf("Check eligibility - 2\n");
 
-  if (((count / comm->nRanks) * ncclTypeSize(datatype)) % 16) {
+  const size_t countPerRank = count / static_cast<size_t>(comm->nRanks);
+  if ((countPerRank * ncclTypeSize(datatype)) % 16) {
     return false;
   }
-  printf("Returning true\n");
 
-  return true;
+  const int nBlocksMax = ddaMaxNBlocksForScratch();
+  return ginAllReduceLaunchEligible(countPerRank, ncclTypeSize(datatype), nBlocksMax);
 }
 
 ncclResult_t ncclAllReduceGinTree(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
@@ -221,7 +240,6 @@ ncclResult_t ncclAllReduceGinTree(const void* sendbuff, void* recvbuff, size_t c
   if (!ncclAllReduceGinTreeEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
     return ncclInvalidUsage;
   }*/
-  printf("In NCCL AR GIN Tree entry\n");
 
   struct ncclDevrWindow* sendWin = nullptr;
   struct ncclDevrWindow* recvWin = nullptr;
@@ -231,7 +249,6 @@ ncclResult_t ncclAllReduceGinTree(const void* sendbuff, void* recvbuff, size_t c
     return ncclInvalidUsage;
   }
 
-  printf("In NCCL AR GIN Tree exit\n");
   switch (datatype) {
   case ncclFloat32:
     return ncclAllReduceGinTreeTyped<float>(sendbuff, recvbuff, count, comm, stream, sendWin, recvWin);
