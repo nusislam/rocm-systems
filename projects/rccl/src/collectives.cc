@@ -617,6 +617,17 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
   bool symEligible = (op == ncclSum) && isSymmetricKernelRequested(comm, ncclFuncAllReduce, (int)ncclDevSum, datatype,
                                                                    count, sendbuff, recvbuff);
 
+#if defined(ENABLE_ROCSHMEM_GIN) && (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__))
+  if (symEligible /*&& ncclAllReduceGinTreeEligible(comm, sendbuff, recvbuff, count, datatype, op)*/) {
+    printf("Here\n");
+    INFO(NCCL_COLL, "AllReduce: taking GIN tree path: nRanks=%d count=%zu bytes=%zu", comm->nRanks, count,
+         count * ncclTypeSize(datatype));
+    NCCLCHECK(ncclAllReduceGinTree(sendbuff, recvbuff, count, datatype, op, comm, stream));
+    return ncclSuccess;
+  }
+#endif
+
+
   // CE AllReduce
   // Disable CE AllReduce while this comm has live graph-captured plans. Per-call
   // capture checks are not enough because CE AR can still deadlock on eager

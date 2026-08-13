@@ -65,6 +65,7 @@ static ncclResult_t ncclAllReduceGinTreeTyped(const void* sendbuff, void* recvbu
     return ncclInternalError;
   }
 
+  printf("Allred init once passed\n");
   const int nBlocksMax = ddaMaxNBlocksForScratch();
   auto gridBlock = meta::comms::getGridAndBlockDims(count, sizeof(T), static_cast<size_t>(nBlocksMax));
   const dim3 grid = gridBlock.first;
@@ -72,6 +73,7 @@ static ncclResult_t ncclAllReduceGinTreeTyped(const void* sendbuff, void* recvbu
 
   const size_t sendOff = static_cast<size_t>(static_cast<const char*>(sendbuff) - static_cast<const char*>(sendWin->userPtr));
   const size_t recvOff = static_cast<size_t>(static_cast<char*>(recvbuff) - static_cast<char*>(recvWin->userPtr));
+  printf("Allred calling kernel\n");
 
   meta::comms::ginAllReduceTreeKernel<T><<<grid, block, 0, stream>>>(
     comm->ginAllReduceDevComm, sendWin->vidmem, sendOff, comm->ginAllReduceScratchWin->vidmem, /*scratchOff=*/0,
@@ -163,9 +165,9 @@ bool ncclAllReduceGinTreeEligible(ncclComm* comm, const void* sendbuff, void* re
   if (!ncclGinAllReduceSdmaBackendEnabled(comm)) {
     return false;
   }
-  if (!ginAllReduceScratchWinReady(comm)) {
+  /*if (!ginAllReduceScratchWinReady(comm)) {
     return false;
-  }
+  }*/
   if (op != ncclSum) {
     return false;
   }
@@ -176,7 +178,7 @@ bool ncclAllReduceGinTreeEligible(ncclComm* comm, const void* sendbuff, void* re
     return false;
   }
 
-  struct ncclDevrWindow* sendWin = nullptr;
+  /*struct ncclDevrWindow* sendWin = nullptr;
   struct ncclDevrWindow* recvWin = nullptr;
   ncclDevrFindWindow(comm, sendbuff, &sendWin);
   ncclDevrFindWindow(comm, recvbuff, &recvWin);
@@ -185,7 +187,8 @@ bool ncclAllReduceGinTreeEligible(ncclComm* comm, const void* sendbuff, void* re
   }
   if (!(sendWin->winFlags & NCCL_WIN_COLL_SYMMETRIC) || !(recvWin->winFlags & NCCL_WIN_COLL_SYMMETRIC)) {
     return false;
-  }
+  }*/
+  printf("Check eligibility - 1\n");
 
   const size_t bytes = count * ncclTypeSize(datatype);
   if (bytes > comm->ginAllReduceScratchBytes) {
@@ -197,21 +200,28 @@ bool ncclAllReduceGinTreeEligible(ncclComm* comm, const void* sendbuff, void* re
   if (bytes <= kGinFlatTreeThresholdBytes) {
     return false;
   }
+  printf("Size check pass - 2\n");
+
   if (count % static_cast<size_t>(comm->nRanks) != 0) {
     return false;
   }
+  printf("Check eligibility - 2\n");
+
   if (((count / comm->nRanks) * ncclTypeSize(datatype)) % 16) {
     return false;
   }
+  printf("Returning true\n");
+
   return true;
 }
 
 ncclResult_t ncclAllReduceGinTree(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                     ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
-  (void)op;
+  /*(void)op;
   if (!ncclAllReduceGinTreeEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
     return ncclInvalidUsage;
-  }
+  }*/
+  printf("In NCCL AR GIN Tree entry\n");
 
   struct ncclDevrWindow* sendWin = nullptr;
   struct ncclDevrWindow* recvWin = nullptr;
@@ -221,6 +231,7 @@ ncclResult_t ncclAllReduceGinTree(const void* sendbuff, void* recvbuff, size_t c
     return ncclInvalidUsage;
   }
 
+  printf("In NCCL AR GIN Tree exit\n");
   switch (datatype) {
   case ncclFloat32:
     return ncclAllReduceGinTreeTyped<float>(sendbuff, recvbuff, count, comm, stream, sendWin, recvWin);
