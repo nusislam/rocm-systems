@@ -616,9 +616,10 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
   // buffers as symmetric windows; otherwise fall through to CE / DDA.
   bool symEligible = (op == ncclSum) && isSymmetricKernelRequested(comm, ncclFuncAllReduce, (int)ncclDevSum, datatype,
                                                                    count, sendbuff, recvbuff);
+  size_t msgBytes = count * ncclTypeSize(datatype);
 
 #if defined(ENABLE_ROCSHMEM_GIN) && (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__))
-  if (symEligible /*&& ncclAllReduceGinTreeEligible(comm, sendbuff, recvbuff, count, datatype, op)*/) {
+  if (symEligible && msgBytes >= 4194304 /*&& ncclAllReduceGinTreeEligible(comm, sendbuff, recvbuff, count, datatype, op)*/) {
    // printf("Here\n");
     INFO(NCCL_COLL, "AllReduce: taking GIN tree path: nRanks=%d count=%zu bytes=%zu", comm->nRanks, count,
          count * ncclTypeSize(datatype));
@@ -632,7 +633,7 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
   // Disable CE AllReduce while this comm has live graph-captured plans. Per-call
   // capture checks are not enough because CE AR can still deadlock on eager
   // calls sharing a graph-mode comm (e.g. rccl-tests warmup).
-  struct ncclCudaGraph ceGraph;
+  /*struct ncclCudaGraph ceGraph;
   NCCLCHECK(ncclCudaGetCapturingGraph(&ceGraph, stream, comm->config.graphUsageMode));
   bool ceCapturing = ncclCudaGraphValid(ceGraph);
   rcclCeAllReduceGraphLatchTick(comm, ceCapturing);
@@ -647,8 +648,7 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
   // Pass the decision to taskAppend() via info to avoid recomputing it.
   info.ceCapturing = ceCapturing;
   info.ceArGraphAllowed = ceArGraphAllowed;
-  info.ceGraphDecisionValid = true;
-  size_t msgBytes = count * ncclTypeSize(datatype);
+  info.ceGraphDecisionValid = true;*/
   // gfx1250 DDA fabric AR is bounded by rcclDdaEnabled (RCCL_DDA_THRESHOLD) and
   // the per-tier thresholds, so it may claim the full range; the CE min-size cap
   // only applies to the other arches' DDA paths.

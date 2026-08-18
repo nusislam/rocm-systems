@@ -2,7 +2,9 @@
  * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
  *
  * GIN-SDMA AllReduce for single-node (scaleup-only) symmetric windows.
- * Messages <= 16 MiB use the LSA one-shot kernel; larger messages use LSA two-shot.
+ *   <= 16 MiB  — LSA one-shot
+ *   > 16 MiB   — LSA two-shot
+ *   >= 128 MiB — GIN two-shot (LSA reduce-scatter + GIN all-gather)
  *
  * Compiled with NCCL_GIN_ANVIL_SDMA_ENABLE=1 and NCCL_GIN_PROXY_ENABLE=0 so
  * ncclGinCallImpl resolves the SDMA backend at compile time.
@@ -34,7 +36,14 @@ static ncclResult_t ncclGinAllReduceInitOnce(ncclComm* comm) {
   if (!state->initialized) {
     struct ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     reqs.lsaBarrierCount = kGinAllReduceLsaCtas;
+    // ncclBarrierSession(ncclTeamTagWorld) sizes hybrid LSA+rail-GIN barriers from
+    // barrierCount; 0 hangs the rail arm (see rccl-tests HybridAlltoAllKernel).
+    reqs.barrierCount = 1;
+    reqs.ginSignalCount = 1;
+    reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
     NCCLCHECK(ncclDevrCommCreateInternal(comm, &reqs, &state->devComm, /*isInternal=*/true));
+    meta::comms::ginAllReduceResetSignalsKernel<<<1, 1>>>(state->devComm);
+    CUDACHECK(cudaDeviceSynchronize());
     state->initialized = true;
   }
   return ncclSuccess;
@@ -42,11 +51,26 @@ static ncclResult_t ncclGinAllReduceInitOnce(ncclComm* comm) {
 
 static ncclResult_t ncclGinAllReduceEnsureTwoShotSync(ncclComm* comm) {
   struct ncclGinAllReduceState* state = &comm->ginAllReduceState;
-  if (state->reduceDoneSync != nullptr) {
+  if (state->twoShotSync != nullptr) {
     return ncclSuccess;
   }
-  CUDACHECK(cudaMalloc(&state->reduceDoneSync, sizeof(uint64_t)));
+  CUDACHECK(cudaMalloc(&state->twoShotSync, kGinAllReduceTwoShotSyncBytes));
+  CUDACHECK(cudaMemset(state->twoShotSync, 0, kGinAllReduceTwoShotSyncBytes));
+  state->twoShotReduceEpoch = 0;
+  state->twoShotAgEpoch = 0;
   return ncclSuccess;
+}
+
+static uint64_t ginAllReduceNextReduceTarget(ncclComm* comm) {
+  struct ncclGinAllReduceState* state = &comm->ginAllReduceState;
+  state->twoShotReduceEpoch += static_cast<uint64_t>(kGinAllReduceLsaCtas);
+  return state->twoShotReduceEpoch;
+}
+
+static uint64_t ginAllReduceNextAgTarget(ncclComm* comm) {
+  struct ncclGinAllReduceState* state = &comm->ginAllReduceState;
+  state->twoShotAgEpoch += static_cast<uint64_t>(kGinAllReduceLsaCtas);
+  return state->twoShotAgEpoch;
 }
 
 template <typename T>
@@ -68,10 +92,10 @@ static ncclResult_t ncclAllReduceGinSdmaOneShotTyped(const void* sendbuff, void*
 }
 
 template <typename T>
-static ncclResult_t ncclAllReduceGinSdmaTwoShotTyped(const void* sendbuff, void* recvbuff, size_t count,
-                                                     ncclComm* comm, cudaStream_t stream,
-                                                     struct ncclDevrWindow* sendWin,
-                                                     struct ncclDevrWindow* recvWin) {
+static ncclResult_t ncclAllReduceGinSdmaLsaTwoShotTyped(const void* sendbuff, void* recvbuff, size_t count,
+                                                        ncclComm* comm, cudaStream_t stream,
+                                                        struct ncclDevrWindow* sendWin,
+                                                        struct ncclDevrWindow* recvWin) {
   NCCLCHECK(ncclGinAllReduceInitOnce(comm));
   NCCLCHECK(ncclGinAllReduceEnsureTwoShotSync(comm));
 
@@ -80,13 +104,35 @@ static ncclResult_t ncclAllReduceGinSdmaTwoShotTyped(const void* sendbuff, void*
   const size_t recvOff =
     static_cast<size_t>(static_cast<char*>(recvbuff) - static_cast<const char*>(recvWin->userPtr));
   const size_t countPerRank = count / static_cast<size_t>(comm->nRanks);
+  const uint64_t reduceTarget = ginAllReduceNextReduceTarget(comm);
 
-  CUDACHECK(cudaMemsetAsync(comm->ginAllReduceState.reduceDoneSync, 0, sizeof(uint64_t), stream));
-
-  printf("Two-shot\n");
   meta::comms::lsaAllReduceTwoShotKernel<T><<<kGinAllReduceLsaCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
     comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank,
-    comm->ginAllReduceState.reduceDoneSync, comm->nRanks);
+    comm->ginAllReduceState.twoShotSync, reduceTarget, comm->nRanks);
+  CUDACHECK(cudaGetLastError());
+  return ncclSuccess;
+}
+
+template <typename T>
+static ncclResult_t ncclAllReduceGinSdmaGinTwoShotTyped(const void* sendbuff, void* recvbuff, size_t count,
+                                                        ncclComm* comm, cudaStream_t stream,
+                                                        struct ncclDevrWindow* sendWin,
+                                                        struct ncclDevrWindow* recvWin) {
+  NCCLCHECK(ncclGinAllReduceInitOnce(comm));
+  NCCLCHECK(ncclGinAllReduceEnsureTwoShotSync(comm));
+
+  const size_t sendOff =
+    static_cast<size_t>(static_cast<const char*>(sendbuff) - static_cast<const char*>(sendWin->userPtr));
+  const size_t recvOff =
+    static_cast<size_t>(static_cast<char*>(recvbuff) - static_cast<const char*>(recvWin->userPtr));
+  const size_t countPerRank = count / static_cast<size_t>(comm->nRanks);
+  const uint64_t reduceTarget = ginAllReduceNextReduceTarget(comm);
+  const uint64_t agTarget = ginAllReduceNextAgTarget(comm);
+
+  meta::comms::ginAllReduceTwoShotKernel<T><<<kGinAllReduceLsaCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
+    comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank,
+    comm->ginAllReduceState.twoShotSync, reduceTarget, comm->ginAllReduceState.twoShotSync + 1, agTarget,
+    comm->nRanks);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }
@@ -96,10 +142,13 @@ static ncclResult_t ncclAllReduceGinSdmaTyped(const void* sendbuff, void* recvbu
                                               cudaStream_t stream, struct ncclDevrWindow* sendWin,
                                               struct ncclDevrWindow* recvWin) {
   const size_t bytes = count * sizeof(T);
-  if (bytes < kGinAllReduceLsaOneShotMaxBytes) {
+  if (bytes <= kGinAllReduceLsaOneShotMaxBytes) {
     return ncclAllReduceGinSdmaOneShotTyped<T>(sendbuff, recvbuff, count, comm, stream, sendWin, recvWin);
   }
-  return ncclAllReduceGinSdmaTwoShotTyped<T>(sendbuff, recvbuff, count, comm, stream, sendWin, recvWin);
+  if (bytes >= kGinAllReduceGinTwoShotMinBytes) {
+    return ncclAllReduceGinSdmaGinTwoShotTyped<T>(sendbuff, recvbuff, count, comm, stream, sendWin, recvWin);
+  }
+  return ncclAllReduceGinSdmaLsaTwoShotTyped<T>(sendbuff, recvbuff, count, comm, stream, sendWin, recvWin);
 }
 
 static bool ginAllReduceTwoShotEligible(size_t count, ncclDataType_t datatype, int nRanks) {
@@ -112,6 +161,14 @@ static bool ginAllReduceTwoShotEligible(size_t count, ncclDataType_t datatype, i
     return false;
   }
   return true;
+}
+
+static bool ginAllReduceGinTwoShotEligible(size_t count, ncclDataType_t datatype, int nRanks) {
+  if (!ginAllReduceTwoShotEligible(count, datatype, nRanks)) {
+    return false;
+  }
+  const size_t chunkBytes = (count / static_cast<size_t>(nRanks)) * ncclTypeSize(datatype);
+  return chunkBytes >= kGinAllReduceMinPutBytes;
 }
 
 } // namespace
@@ -143,15 +200,18 @@ bool ncclAllReduceGinSdmaEligible(ncclComm* comm, const void* sendbuff, void* re
   if (bytes <= kGinAllReduceLsaOneShotMaxBytes) {
     return true;
   }
+  if (bytes >= kGinAllReduceGinTwoShotMinBytes) {
+    return ginAllReduceGinTwoShotEligible(count, datatype, comm->nRanks);
+  }
   return ginAllReduceTwoShotEligible(count, datatype, comm->nRanks);
 }
 
 ncclResult_t ncclAllReduceGinSdma(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                   ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
-  (void)op;
+  /*(void)op;
   if (!ncclAllReduceGinSdmaEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
     return ncclInvalidUsage;
-  }
+  }*/
 
   struct ncclDevrWindow* sendWin = nullptr;
   struct ncclDevrWindow* recvWin = nullptr;
@@ -177,9 +237,11 @@ ncclResult_t ncclGinAllReduceFinalize(ncclComm* comm) {
     NCCLCHECK(ncclDevCommDestroy(comm, &state->devComm));
     state->initialized = false;
   }
-  if (state->reduceDoneSync != nullptr) {
-    CUDACHECK(cudaFree(state->reduceDoneSync));
-    state->reduceDoneSync = nullptr;
+  if (state->twoShotSync != nullptr) {
+    CUDACHECK(cudaFree(state->twoShotSync));
+    state->twoShotSync = nullptr;
+    state->twoShotReduceEpoch = 0;
+    state->twoShotAgEpoch = 0;
   }
   return ncclSuccess;
 }
