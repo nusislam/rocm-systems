@@ -714,7 +714,7 @@ endif()
 # ===========================================================================
 set(GIN_ALLREDUCE_TREE_SDMA_FAT_OBJ "")
 if(ENABLE_ROCSHMEM_GIN)
-  set(GIN_ALLREDUCE_TREE_SDMA_FAT_OBJ "${DEVICE_BUILD_DIR}/gin_all_reduce_tree_sdma.o")
+  set(GIN_ALLREDUCE_TREE_SDMA_FAT_OBJ "${DEVICE_BUILD_DIR}/gin_all_reduce_sdma.o")
   add_custom_command(
           OUTPUT  ${GIN_ALLREDUCE_TREE_SDMA_FAT_OBJ}
     COMMAND ${DL_CLANG}
@@ -731,9 +731,9 @@ if(ENABLE_ROCSHMEM_GIN)
       -std=c++17
       -fPIC
       -c -o ${GIN_ALLREDUCE_TREE_SDMA_FAT_OBJ}
-      ${HIPIFY_DIR}/src/gin_all_reduce_tree_sdma.cu.cpp
-    DEPENDS ${HIPIFY_DIR}/src/gin_all_reduce_tree_sdma.cu.cpp
-    COMMENT "DL compile: gin_all_reduce_tree_sdma.cu.cpp (GIN-SDMA allreduce kernel)"
+      ${HIPIFY_DIR}/src/gin_all_reduce_sdma.cu.cpp
+    DEPENDS ${HIPIFY_DIR}/src/gin_all_reduce_sdma.cu.cpp
+    COMMENT "DL compile: gin_all_reduce_sdma.cu.cpp (GIN-SDMA allreduce kernel)"
     VERBATIM
   )
 endif()

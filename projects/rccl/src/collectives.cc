@@ -622,7 +622,7 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
    // printf("Here\n");
     INFO(NCCL_COLL, "AllReduce: taking GIN tree path: nRanks=%d count=%zu bytes=%zu", comm->nRanks, count,
          count * ncclTypeSize(datatype));
-    NCCLCHECK(ncclAllReduceGinTree(sendbuff, recvbuff, count, datatype, op, comm, stream));
+    NCCLCHECK(ncclAllReduceGinSdma(sendbuff, recvbuff, count, datatype, op, comm, stream));
     return ncclSuccess;
   }
 #endif

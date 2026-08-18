@@ -175,7 +175,7 @@ set(SRC_FILES
   include/gin.h
   include/gin_alltoall.h
   include/gin_all_reduce.h
-  include/algorithms/all_reduce/all_reduce_gin_tree_sdma.h
+  include/algorithms/all_reduce/all_reduce_gin_sdma.h
   include/gin/gin_host.h
   include/gin/gin_host_proxy.h
   include/gin/gin_host_rocshmem_gda.h
@@ -500,7 +500,7 @@ if(ENABLE_ROCSHMEM_GIN)
     src/gin/gin_anvil_ipc_table_host.cc
     src/gin/gin_anvil_sdma_oss7_device.cc
     src/gin_alltoall_sdma.cu
-    src/gin_all_reduce_tree_sdma.cu
+    src/gin_all_reduce_sdma.cu
   )
 endif()
 
@@ -745,7 +745,7 @@ if(ENABLE_DEVICE_LINKER)
   # Contains the GIN-SDMA alltoall __global__ kernel and its launch site, so it
   # needs full HIP compilation rather than --offload-host-only.
   list(FILTER HIP_SOURCES EXCLUDE REGEX "gin_alltoall_sdma\\.cu\\.cpp$")
-  list(FILTER HIP_SOURCES EXCLUDE REGEX "gin_all_reduce_tree_sdma\\.cu\\.cpp$")
+  list(FILTER HIP_SOURCES EXCLUDE REGEX "gin_all_reduce_sdma\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_all_reduce_fabric\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_all_reduce_fabric_ll\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_all_reduce_fabric_ll128\\.cu\\.cpp$")

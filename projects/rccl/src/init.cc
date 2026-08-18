@@ -481,6 +481,7 @@ static ncclResult_t commFree(ncclComm_t comm) {
   }
   // Self-guarded no-op if the GIN-SDMA path was never used. Must precede ncclDevrFinalize.
   NCCLCHECK(ncclGinA2AFinalize(comm));
+  NCCLCHECK(ncclGinAllReduceFinalize(comm));
   // RCCL: !symmetricSupport comms still init devrState via the non-sym window-register path (dev_runtime.cc), so finalize unconditionally to free lsaRankList.
   NCCLCHECK(ncclDevrFinalize(comm));
   NCCLCHECK(ncclRasCommFini(comm));
@@ -2732,10 +2733,9 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   }
 
 #if defined(ENABLE_ROCSHMEM_GIN) && (defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__))
-    if (ncclGinAllReduceBackendConfigured(comm)) {
-      //NCCLCHECKGOTO(ncclGinAllReduceInitOnce(comm), res, fail);
+    /*if (ncclGinAllReduceBackendConfigured(comm)) {
       NCCLCHECKGOTO(ncclGinAllReduceScratchInit(comm), res, fail);
-    }
+    }*/
 #endif
   // update communicator state
   comm->initState = ncclSuccess;
