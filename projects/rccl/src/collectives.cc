@@ -625,7 +625,9 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
          count * ncclTypeSize(datatype));
     NCCLCHECK(ncclAllReduceGinSdma(sendbuff, recvbuff, count, datatype, op, comm, stream));
     return ncclSuccess;
-  }
+  } /*else {
+    return ncclEnqueueCheck(&info);
+  }*/
 #endif
 
 

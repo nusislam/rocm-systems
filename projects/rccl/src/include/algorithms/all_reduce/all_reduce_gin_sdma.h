@@ -37,6 +37,8 @@ __device__ __forceinline__ void allReduceTwoShotCtaArrive(uint64_t* counter, uin
   }
   cta.sync();
   __threadfence_system();
+  //__threadfence();
+
 }
 
 template <typename T>
@@ -90,14 +92,14 @@ __launch_bounds__(512)
   const int tid = static_cast<int>(threadIdx.x + blockIdx.x * blockDim.x);
   const int nthreads = static_cast<int>(blockDim.x * gridDim.x);
   constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
-
-  bar.sync(cta, cuda::memory_order_acquire);
-
-  // --- Shot 1: multi-CTA LSA reduce-scatter → local recv column ---
   const size_t idxStart = static_cast<size_t>(tid) * countPerThread;
   const size_t idxEnd = countPerRank;
   const size_t idxStride = static_cast<size_t>(nthreads) * countPerThread;
 
+  const int rank = devComm.rank;
+  bar.sync(cta, cuda::memory_order_acquire);
+
+  // --- Shot 1: multi-CTA LSA reduce-scatter → local recv column ---
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
     uint4 sum{0, 0, 0, 0};
     uint4 srcVals[2];
@@ -113,16 +115,20 @@ __launch_bounds__(512)
     *reinterpret_cast<uint4*>(reducedOut + idx) = sum;
   }
 
-  allReduceTwoShotCtaArrive(reduceDoneSync, reduceTarget, cta);
+  //allReduceTwoShotCtaArrive(reduceDoneSync, reduceTarget, cta);
+  bar.sync(cta, cuda::memory_order_release);
   bar.sync(cta, cuda::memory_order_acquire);
 
-  // --- Shot 2: multi-CTA LSA all-gather from local recv column ---
+  // --- Shot 2: multi-CTA LSA all-gather via remote read into local recv ---
+  T* localRecv = reinterpret_cast<T*>(ncclGetLocalPointer(recvWin, recvOff));
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
-    const uint4 v = *reinterpret_cast<const uint4*>(reducedOut + idx);
 #pragma unroll 8
-    for (int peer = 0; peer < nRanks; ++peer) {
-      *reinterpret_cast<uint4*>(
-        reinterpret_cast<T*>(ncclGetLsaPointer(recvWin, sliceRecvByteOff, peer)) + idx) = v;
+    for (int srcRank = 0; srcRank < nRanks; ++srcRank) {
+      int peerGpu = (srcRank + 	rank) % nRanks;    
+      const size_t srcSliceRecvByteOff = recvOff + static_cast<size_t>(peerGpu) * rankChunkStride;
+      const T* srcPtr = reinterpret_cast<const T*>(ncclGetLsaPointer(recvWin, srcSliceRecvByteOff, peerGpu));
+      *reinterpret_cast<uint4*>(localRecv + static_cast<size_t>(peerGpu) * countPerRank + idx) =
+        *reinterpret_cast<const uint4*>(srcPtr + idx);
     }
   }
 
