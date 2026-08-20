@@ -4,7 +4,7 @@
  * LSA AllReduce device kernels:
  *   allReduceLsaOneShotKernel — read all peers, sum, write all peers (small messages).
  *   lsaAllReduceTwoShotKernel — LSA reduce-scatter + LSA all-gather into recv.
- *   ginAllReduceTwoShotKernel  — LSA reduce-scatter + single-CTA GIN all-gather from recv.
+ *   ginAllReduceTwoShotKernel  — LSA reduce-scatter + multi-CTA GIN all-gather from recv.
  *
  * One-shot follows projects/rccl-tests/src/all_reduce.cu allReduceLsaKernel.
  ******************************************************************************/
@@ -37,8 +37,6 @@ __device__ __forceinline__ void allReduceTwoShotCtaArrive(uint64_t* counter, uin
   }
   cta.sync();
   __threadfence_system();
-  //__threadfence();
-
 }
 
 template <typename T>
@@ -96,7 +94,6 @@ __launch_bounds__(512)
   const size_t idxEnd = countPerRank;
   const size_t idxStride = static_cast<size_t>(nthreads) * countPerThread;
 
-  const int rank = devComm.rank;
   bar.sync(cta, cuda::memory_order_acquire);
 
   // --- Shot 1: multi-CTA LSA reduce-scatter → local recv column ---
@@ -117,6 +114,7 @@ __launch_bounds__(512)
 
   //allReduceTwoShotCtaArrive(reduceDoneSync, reduceTarget, cta);
   bar.sync(cta, cuda::memory_order_release);
+
   bar.sync(cta, cuda::memory_order_acquire);
 
   // --- Shot 2: multi-CTA LSA all-gather via remote read into local recv ---
@@ -124,10 +122,9 @@ __launch_bounds__(512)
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
 #pragma unroll 8
     for (int srcRank = 0; srcRank < nRanks; ++srcRank) {
-      int peerGpu = (srcRank + 	rank) % nRanks;    
-      const size_t srcSliceRecvByteOff = recvOff + static_cast<size_t>(peerGpu) * rankChunkStride;
-      const T* srcPtr = reinterpret_cast<const T*>(ncclGetLsaPointer(recvWin, srcSliceRecvByteOff, peerGpu));
-      *reinterpret_cast<uint4*>(localRecv + static_cast<size_t>(peerGpu) * countPerRank + idx) =
+      const size_t srcSliceRecvByteOff = recvOff + static_cast<size_t>(srcRank) * rankChunkStride;
+      const T* srcPtr = reinterpret_cast<const T*>(ncclGetLsaPointer(recvWin, srcSliceRecvByteOff, srcRank));
+      *reinterpret_cast<uint4*>(localRecv + static_cast<size_t>(srcRank) * countPerRank + idx) =
         *reinterpret_cast<const uint4*>(srcPtr + idx);
     }
   }
@@ -136,11 +133,11 @@ __launch_bounds__(512)
 }
 
 __global__ void ginAllReduceResetSignalsKernel(struct ncclDevComm devComm) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
+  if (threadIdx.x != 0) {
     return;
   }
   ncclGin gin{devComm, /*ginContext=*/0};
-  gin.resetSignal(/*agSignal=*/0);
+  gin.resetSignal(static_cast<unsigned>(blockIdx.x));
 }
 
 template <typename T>
@@ -152,7 +149,6 @@ __launch_bounds__(512)
                                             uint64_t* reduceDoneSync, uint64_t reduceTarget, uint64_t* agDoneSync,
                                             uint64_t agTarget, int nRanks) {
   constexpr int ginContext = 0;
-  constexpr unsigned kAgSignal = 0;
 
   ncclGin gin{devComm, ginContext};
   ncclTeam world = ncclTeamWorld(devComm);
@@ -193,29 +189,32 @@ __launch_bounds__(512)
     *reinterpret_cast<uint4*>(reducedOut + idx) = sum;
   }
 
-  allReduceTwoShotCtaArrive(reduceDoneSync, reduceTarget, cta);
-  bar.sync(cta, cuda::memory_order_acquire);
+  //allReduceTwoShotCtaArrive(reduceDoneSync, reduceTarget, cta);
+  bar.sync(cta, cuda::memory_order_release);
+  //bar.sync(cta, cuda::memory_order_acquire);
 
-  // --- Shot 2: single-CTA GIN all-gather (rccl-tests HybridAlltoAllKernel CTA 0) ---
-  if (blockIdx.x == 0) {
-    const uint64_t signalValue = gin.readSignal(kAgSignal);
-    ncclBarrierSession<ncclCoopCta> ginBar{cta, ncclTeamTagWorld(), gin, /*barrierIndex=*/0};
-    ginBar.sync(cta, cuda::memory_order_acquire, ncclGinFenceLevel::Relaxed);
+  // --- Shot 2: multi-CTA GIN all-gather (rccl-tests GinAlltoAllKernel) ---
+  const unsigned int signalIndex = static_cast<unsigned int>(blockIdx.x);
+  const uint64_t signalValue = gin.readSignal(signalIndex);
+  ncclBarrierSession<ncclCoopCta> ginBar{cta, ncclTeamTagWorld(), gin, blockIdx.x};
+  ginBar.sync(cta, cuda::memory_order_acquire, ncclGinFenceLevel::Relaxed);
 
-    for (int dst = threadIdx.x; dst < nRanks; dst += blockDim.x) {
-      gin.put(world, dst, recvWin, sliceRecvByteOff, recvWin, sliceRecvByteOff, chunkBytes,
-              ncclGin_SignalInc{kAgSignal});
-    }
-
-    gin.waitSignal(cta, kAgSignal, signalValue + static_cast<uint64_t>(nRanks));
-    gin.flush(cta);
-
-    ginBar.sync(cta, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+  for (int dst = tid; dst < nRanks; dst += nthreads) {
+    gin.put(world, dst, recvWin, sliceRecvByteOff, recvWin, sliceRecvByteOff, chunkBytes,
+            ncclGin_SignalInc{signalIndex});
   }
 
-  bar.sync(cta, cuda::memory_order_acquire);
+  const int receivingCta = (devComm.rank % nthreads) / blockDim.x;
+  if (blockIdx.x == receivingCta) {
+    gin.waitSignal(cta, signalIndex, signalValue + static_cast<uint64_t>(nRanks));
+  }
+  gin.flush(cta);
+
+  ginBar.sync(cta, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+
+  /*bar.sync(cta, cuda::memory_order_acquire);
   allReduceTwoShotCtaArrive(agDoneSync, agTarget, cta);
-  bar.sync(cta, cuda::memory_order_release);
+  bar.sync(cta, cuda::memory_order_release);*/
 }
 
 } // namespace meta::comms

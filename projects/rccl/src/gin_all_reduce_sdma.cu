@@ -36,13 +36,12 @@ static ncclResult_t ncclGinAllReduceInitOnce(ncclComm* comm) {
   if (!state->initialized) {
     struct ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     reqs.lsaBarrierCount = kGinAllReduceLsaCtas;
-    // ncclBarrierSession(ncclTeamTagWorld) sizes hybrid LSA+rail-GIN barriers from
-    // barrierCount; 0 hangs the rail arm (see rccl-tests HybridAlltoAllKernel).
-    reqs.barrierCount = 1;
-    reqs.ginSignalCount = 1;
+    // GinAlltoAllKernel: one world barrier + GIN signal per CTA.
+    reqs.barrierCount = kGinAllReduceLsaCtas;
+    reqs.ginSignalCount = kGinAllReduceLsaCtas;
     reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
     NCCLCHECK(ncclDevrCommCreateInternal(comm, &reqs, &state->devComm, /*isInternal=*/true));
-    meta::comms::ginAllReduceResetSignalsKernel<<<1, 1>>>(state->devComm);
+    meta::comms::ginAllReduceResetSignalsKernel<<<kGinAllReduceLsaCtas, 1>>>(state->devComm);
     CUDACHECK(cudaDeviceSynchronize());
     state->initialized = true;
   }
@@ -104,10 +103,10 @@ static ncclResult_t ncclAllReduceGinSdmaLsaTwoShotTyped(const void* sendbuff, vo
   const size_t recvOff =
     static_cast<size_t>(static_cast<char*>(recvbuff) - static_cast<const char*>(recvWin->userPtr));
   const size_t countPerRank = count / static_cast<size_t>(comm->nRanks);
-  //const uint64_t reduceTarget = ginAllReduceNextReduceTarget(comm);
+//  const uint64_t reduceTarget = ginAllReduceNextReduceTarget(comm);
   const uint64_t reduceTarget = 0;
 
-  meta::comms::lsaAllReduceTwoShotKernel<T><<<kGinAllReduceLsaCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
+  meta::comms::lsaAllReduceTwoShotKernel<T><<<kGinAllReduceTwoShotLsaCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
     comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank,
     comm->ginAllReduceState.twoShotSync, reduceTarget, comm->nRanks);
   CUDACHECK(cudaGetLastError());
@@ -130,10 +129,6 @@ static ncclResult_t ncclAllReduceGinSdmaGinTwoShotTyped(const void* sendbuff, vo
   const uint64_t reduceTarget = ginAllReduceNextReduceTarget(comm);
   const uint64_t agTarget = ginAllReduceNextAgTarget(comm);
 
-  /*meta::comms::ginAllReduceTwoShotKernel<T><<<kGinAllReduceLsaCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
-    comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank,
-    comm->ginAllReduceState.twoShotSync, reduceTarget, comm->ginAllReduceState.twoShotSync + 1, agTarget,
-    comm->nRanks);*/
   meta::comms::ginAllReduceTwoShotKernel<T><<<kGinAllReduceLsaCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
     comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank,
     comm->ginAllReduceState.twoShotSync, reduceTarget, comm->ginAllReduceState.twoShotSync + 1, agTarget,
@@ -217,7 +212,6 @@ ncclResult_t ncclAllReduceGinSdma(const void* sendbuff, void* recvbuff, size_t c
   if (!ncclAllReduceGinSdmaEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
     return ncclInvalidUsage;
   }*/
-
   struct ncclDevrWindow* sendWin = nullptr;
   struct ncclDevrWindow* recvWin = nullptr;
   NCCLCHECK(ncclDevrFindWindow(comm, sendbuff, &sendWin));

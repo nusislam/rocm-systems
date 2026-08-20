@@ -18,7 +18,7 @@ struct ncclComm;
 // LSA one-shot for messages <= kGinAllReduceLsaOneShotMaxBytes.
 // LSA two-shot for (16 MiB, 128 MiB); GIN two-shot for messages >= kGinAllReduceGinTwoShotMinBytes.
 constexpr int kGinAllReduceLsaCtas = 56;
-constexpr int kGinAllReduceTwoShotLsaCtas = 56;
+constexpr int kGinAllReduceTwoShotLsaCtas = 64;
 
 constexpr int kGinAllReduceLsaThreadsPerCta = 512;
 constexpr size_t kGinAllReduceLsaOneShotMaxBytes = 16ULL * 1024 * 1024;
