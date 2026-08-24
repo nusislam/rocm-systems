@@ -4,6 +4,7 @@
  * LSA AllReduce device kernels:
  *   allReduceLsaOneShotKernel — read all peers, sum, write all peers (small messages).
  *   lsaAllReduceTwoShotKernel — LSA reduce-scatter + LSA all-gather into recv.
+ *   lsaAllReduceTwoShotOverlappedKernel — chunked RS then AG per slice (8 CTAs × nRanks).
  *   ginAllReduceTwoShotKernel  — LSA reduce-scatter + multi-CTA GIN all-gather from recv.
  *
  * One-shot follows projects/rccl-tests/src/all_reduce.cu allReduceLsaKernel.
@@ -127,6 +128,91 @@ __launch_bounds__(512)
       *reinterpret_cast<uint4*>(localRecv + static_cast<size_t>(srcRank) * countPerRank + idx) =
         *reinterpret_cast<const uint4*>(srcPtr + idx);
     }
+  }
+
+  bar.sync(cta, cuda::memory_order_release);
+}
+
+template <typename T>
+__device__ __forceinline__ void lsaAllReduceReduceScatterSlice(ncclWindow_t sendWin, ncclWindow_t recvWin, size_t sliceSendByteOff, 
+							size_t sliceRecvByteOff, T* reducedOut, size_t idxStart, size_t idxEnd,
+                                                               size_t idxStride, int nRanks) {
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    uint4 sum{0, 0, 0, 0};
+    uint4 srcVals[2];
+    *reinterpret_cast<uint4*>(&srcVals[0]) = *reinterpret_cast<const uint4*>(
+      reinterpret_cast<const T*>(ncclGetLsaPointer(sendWin, sliceSendByteOff, 0)) + idx);
+#pragma unroll 8
+    for (int peer = 0; peer < nRanks - 1; ++peer) {
+      *reinterpret_cast<uint4*>(&srcVals[(peer + 1) & 1]) = *reinterpret_cast<const uint4*>(
+        reinterpret_cast<const T*>(ncclGetLsaPointer(sendWin, sliceSendByteOff, peer + 1)) + idx);
+      sum = vecElementAdd<T>(sum, srcVals[peer & 1]);
+    }
+    sum = vecElementAdd<T>(sum, srcVals[(nRanks - 1) & 1]);
+    *reinterpret_cast<uint4*>(reducedOut + idx) = sum;
+
+#pragma unroll 8
+    for (int peer = 0; peer < nRanks; ++peer) {
+      *reinterpret_cast<uint4*>(
+        reinterpret_cast<T*>(ncclGetLsaPointer(recvWin, sliceRecvByteOff, peer)) + idx) = sum;
+    }
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ void lsaAllReduceAllGatherSlice(ncclWindow_t recvWin, size_t sliceRecvByteOff,
+                                                           const T* reducedOut, size_t idxStart, size_t idxEnd,
+                                                           size_t idxStride, int nRanks) {
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    const uint4 v = *reinterpret_cast<const uint4*>(reducedOut + idx);
+#pragma unroll 8
+    for (int peer = 0; peer < nRanks; ++peer) {
+      *reinterpret_cast<uint4*>(
+        reinterpret_cast<T*>(ncclGetLsaPointer(recvWin, sliceRecvByteOff, peer)) + idx) = v;
+    }
+  }
+}
+
+template <typename T>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+  __global__ void lsaAllReduceTwoShotOverlappedKernel(struct ncclDevComm devComm, ncclWindow_t sendWin, size_t sendOff,
+                                                      ncclWindow_t recvWin, size_t recvOff, size_t countPerRankTotal,
+                                                      size_t sliceCountPerRankStep, int ctasPerPeer, int nRanks) {
+  ncclCoopCta cta;
+  ncclLsaBarrierSession<ncclCoopCta> bar{cta, devComm, ncclTeamLsa(devComm), devComm.lsaBarrier,
+                                         static_cast<uint32_t>(blockIdx.x)};
+
+  const size_t rankChunkStride = countPerRankTotal * sizeof(T);
+  const int tid = static_cast<int>(threadIdx.x + blockIdx.x * blockDim.x);
+  const int nthreads = static_cast<int>(blockDim.x * gridDim.x);
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const size_t idxStart = static_cast<size_t>(tid) * countPerThread;
+  const size_t idxStride = static_cast<size_t>(nthreads) * countPerThread;
+  (void)ctasPerPeer;
+
+  bar.sync(cta, cuda::memory_order_acquire);
+
+  for (size_t rankElemOff = 0; rankElemOff < countPerRankTotal; rankElemOff += sliceCountPerRankStep) {
+    const size_t sliceCountPerRank = min(sliceCountPerRankStep, countPerRankTotal - rankElemOff);
+    const size_t rankByteOff = rankElemOff * sizeof(T);
+    const size_t globalElemOff = static_cast<size_t>(devComm.rank) * countPerRankTotal + rankElemOff;
+    const size_t sliceSendByteOff = sendOff + globalElemOff * sizeof(T);
+    const size_t sliceRecvByteOff = recvOff + static_cast<size_t>(devComm.rank) * rankChunkStride + rankByteOff;
+    T* reducedOut = reinterpret_cast<T*>(ncclGetLocalPointer(recvWin, sliceRecvByteOff));
+
+    lsaAllReduceReduceScatterSlice<T>(sendWin, recvWin, sliceSendByteOff, sliceRecvByteOff, reducedOut, idxStart, 
+		    sliceCountPerRank, idxStride, nRanks);
+
+    bar.sync(cta, cuda::memory_order_release);
+    /*bar.sync(cta, cuda::memory_order_acquire);
+
+    lsaAllReduceAllGatherSlice<T>(recvWin, sliceRecvByteOff, reducedOut, idxStart, sliceCountPerRank, idxStride,
+                                  nRanks);
+
+    bar.sync(cta, cuda::memory_order_release);*/
+    bar.sync(cta, cuda::memory_order_acquire);
   }
 
   bar.sync(cta, cuda::memory_order_release);

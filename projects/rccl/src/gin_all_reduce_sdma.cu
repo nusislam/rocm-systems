@@ -35,7 +35,7 @@ static ncclResult_t ncclGinAllReduceInitOnce(ncclComm* comm) {
   struct ncclGinAllReduceState* state = &comm->ginAllReduceState;
   if (!state->initialized) {
     struct ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    reqs.lsaBarrierCount = kGinAllReduceLsaCtas;
+    reqs.lsaBarrierCount = kGinAllReduceLsaTwoShotMaxCtas;
     // GinAlltoAllKernel: one world barrier + GIN signal per CTA.
     reqs.barrierCount = kGinAllReduceLsaCtas;
     reqs.ginSignalCount = kGinAllReduceLsaCtas;
@@ -72,6 +72,33 @@ static uint64_t ginAllReduceNextAgTarget(ncclComm* comm) {
   return state->twoShotAgEpoch;
 }
 
+static size_t ginAllReducePickLsaTwoShotSliceCountPerRank(size_t countPerRank, size_t typeSize, int nRanks) {
+  const size_t vecElems = 16 / typeSize;
+  if (countPerRank <= vecElems) {
+    return countPerRank;
+  }
+
+  const size_t vecChunks = countPerRank / vecElems;
+  size_t numSlices = vecChunks;
+  const size_t maxSlices =
+    static_cast<size_t>(kGinAllReduceLsaTwoShotCtasPerPeer) * static_cast<size_t>(nRanks);
+  if (numSlices > maxSlices) {
+    numSlices = maxSlices;
+  }
+  if (numSlices < 2) {
+    numSlices = 2;
+  }
+
+  while (numSlices > 2 && vecChunks % numSlices != 0) {
+    --numSlices;
+  }
+  if (vecChunks % numSlices != 0) {
+    return countPerRank;
+  }
+
+  return (vecChunks / numSlices) * vecElems;
+}
+
 template <typename T>
 static ncclResult_t ncclAllReduceGinSdmaOneShotTyped(const void* sendbuff, void* recvbuff, size_t count,
                                                      ncclComm* comm, cudaStream_t stream,
@@ -96,19 +123,22 @@ static ncclResult_t ncclAllReduceGinSdmaLsaTwoShotTyped(const void* sendbuff, vo
                                                         struct ncclDevrWindow* sendWin,
                                                         struct ncclDevrWindow* recvWin) {
   NCCLCHECK(ncclGinAllReduceInitOnce(comm));
-  NCCLCHECK(ncclGinAllReduceEnsureTwoShotSync(comm));
 
   const size_t sendOff =
     static_cast<size_t>(static_cast<const char*>(sendbuff) - static_cast<const char*>(sendWin->userPtr));
   const size_t recvOff =
     static_cast<size_t>(static_cast<char*>(recvbuff) - static_cast<const char*>(recvWin->userPtr));
   const size_t countPerRank = count / static_cast<size_t>(comm->nRanks);
-//  const uint64_t reduceTarget = ginAllReduceNextReduceTarget(comm);
-  const uint64_t reduceTarget = 0;
+  const size_t sliceCountPerRankStep =
+    ginAllReducePickLsaTwoShotSliceCountPerRank(countPerRank, sizeof(T), comm->nRanks);
+  if (sliceCountPerRankStep == 0) {
+    return ncclInvalidArgument;
+  }
+  const int gridCtas = kGinAllReduceLsaTwoShotCtasPerPeer * comm->nRanks;
 
-  meta::comms::lsaAllReduceTwoShotKernel<T><<<kGinAllReduceTwoShotLsaCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
+  meta::comms::lsaAllReduceTwoShotOverlappedKernel<T><<<gridCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
     comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank,
-    comm->ginAllReduceState.twoShotSync, reduceTarget, comm->nRanks);
+    sliceCountPerRankStep, kGinAllReduceLsaTwoShotCtasPerPeer, comm->nRanks);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }
