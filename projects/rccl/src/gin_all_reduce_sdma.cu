@@ -24,6 +24,11 @@
 #include <cuda_runtime.h>
 
 NCCL_PARAM(GinAllReduceEnable, "GIN_ALLREDUCE_ENABLE", 1);
+// LSA two-shot tuning. CTAs default to kGinAllReduceLsaTwoShotCtasPerPeer * nRanks; the DDA IPC
+// kernels top out at DDA_IPC_MAXBLOCKS (24), so this range is worth sweeping. OVERLAP=1 selects the
+// pipelined kernel that pushes reduced columns to peers instead of the non-overlapped one.
+NCCL_PARAM(GinAllReduceLsaTwoShotCtas, "GIN_ALLREDUCE_LSA_TWOSHOT_CTAS", 0);
+NCCL_PARAM(GinAllReduceLsaTwoShotOverlap, "GIN_ALLREDUCE_LSA_TWOSHOT_OVERLAP", 0);
 
 namespace {
 
@@ -72,33 +77,6 @@ static uint64_t ginAllReduceNextAgTarget(ncclComm* comm) {
   return state->twoShotAgEpoch;
 }
 
-static size_t ginAllReducePickLsaTwoShotSliceCountPerRank(size_t countPerRank, size_t typeSize, int nRanks) {
-  const size_t vecElems = 16 / typeSize;
-  if (countPerRank <= vecElems) {
-    return countPerRank;
-  }
-
-  const size_t vecChunks = countPerRank / vecElems;
-  size_t numSlices = vecChunks;
-  const size_t maxSlices =
-    static_cast<size_t>(kGinAllReduceLsaTwoShotCtasPerPeer) * static_cast<size_t>(nRanks);
-  if (numSlices > maxSlices) {
-    numSlices = maxSlices;
-  }
-  if (numSlices < 2) {
-    numSlices = 2;
-  }
-
-  while (numSlices > 2 && vecChunks % numSlices != 0) {
-    --numSlices;
-  }
-  if (vecChunks % numSlices != 0) {
-    return countPerRank;
-  }
-
-  return (vecChunks / numSlices) * vecElems;
-}
-
 template <typename T>
 static ncclResult_t ncclAllReduceGinSdmaOneShotTyped(const void* sendbuff, void* recvbuff, size_t count,
                                                      ncclComm* comm, cudaStream_t stream,
@@ -117,6 +95,41 @@ static ncclResult_t ncclAllReduceGinSdmaOneShotTyped(const void* sendbuff, void*
   return ncclSuccess;
 }
 
+// Grid must stay within the lsaBarrierCount reserved in ncclGinAllReduceInitOnce, since each CTA
+// syncs on the barrier at its own blockIdx.
+static int ginAllReduceLsaTwoShotCtas(int nRanks) {
+  const int64_t requested = ncclParamGinAllReduceLsaTwoShotCtas();
+  int ctas = requested > 0 ? static_cast<int>(requested) : kGinAllReduceLsaTwoShotCtasPerPeer * nRanks;
+  if (ctas > kGinAllReduceLsaTwoShotMaxCtas) {
+    ctas = kGinAllReduceLsaTwoShotMaxCtas;
+  }
+  return ctas < 1 ? 1 : ctas;
+}
+
+// NRANKS_CT folds the clique size into the kernel so the peer loops unroll fully; 0 is the
+// runtime fallback for clique sizes without a specialization.
+template <typename T, int NRANKS_CT>
+static void ginAllReduceLaunchLsaTwoShot(ncclComm* comm, cudaStream_t stream, struct ncclDevrWindow* sendWin,
+                                         size_t sendOff, struct ncclDevrWindow* recvWin, size_t recvOff,
+                                         size_t countPerRank, int gridCtas) {
+  gridCtas = 64;
+  size_t msgSize = countPerRank * sizeof(T) * comm->nRanks;  
+  if (ncclParamGinAllReduceLsaTwoShotOverlap() != 0) {
+    meta::comms::lsaAllReduceTwoShotOverlappedKernel<T, NRANKS_CT>
+      <<<gridCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
+        comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank,
+        comm->nRanks);
+  } else {
+    //if (msgSize <= kGinAllReduceLsaTwoShotMidBytes) {  	  
+    	meta::comms::lsaAllReduceTwoShotKernel<T, NRANKS_CT><<<gridCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
+      comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank, comm->nRanks);
+    /*} else {
+	 meta::comms::lsaAllReduceTwoShotLargeMsgKernel<T, NRANKS_CT><<<gridCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
+      comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank, comm->nRanks);
+    }*/
+  }
+}
+
 template <typename T>
 static ncclResult_t ncclAllReduceGinSdmaLsaTwoShotTyped(const void* sendbuff, void* recvbuff, size_t count,
                                                         ncclComm* comm, cudaStream_t stream,
@@ -129,16 +142,25 @@ static ncclResult_t ncclAllReduceGinSdmaLsaTwoShotTyped(const void* sendbuff, vo
   const size_t recvOff =
     static_cast<size_t>(static_cast<char*>(recvbuff) - static_cast<const char*>(recvWin->userPtr));
   const size_t countPerRank = count / static_cast<size_t>(comm->nRanks);
-  const size_t sliceCountPerRankStep =
-    ginAllReducePickLsaTwoShotSliceCountPerRank(countPerRank, sizeof(T), comm->nRanks);
-  if (sliceCountPerRankStep == 0) {
-    return ncclInvalidArgument;
-  }
-  const int gridCtas = kGinAllReduceLsaTwoShotCtasPerPeer * comm->nRanks;
+  const int gridCtas = ginAllReduceLsaTwoShotCtas(comm->nRanks);
 
-  meta::comms::lsaAllReduceTwoShotOverlappedKernel<T><<<gridCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
-    comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank,
-    sliceCountPerRankStep, kGinAllReduceLsaTwoShotCtasPerPeer, comm->nRanks);
+  switch (comm->nRanks) {
+  case 2:
+    ginAllReduceLaunchLsaTwoShot<T, 2>(comm, stream, sendWin, sendOff, recvWin, recvOff, countPerRank, gridCtas);
+    break;
+  case 4:
+    ginAllReduceLaunchLsaTwoShot<T, 4>(comm, stream, sendWin, sendOff, recvWin, recvOff, countPerRank, gridCtas);
+    break;
+  case 8:
+    ginAllReduceLaunchLsaTwoShot<T, 8>(comm, stream, sendWin, sendOff, recvWin, recvOff, countPerRank, gridCtas);
+    break;
+  case 16:
+    ginAllReduceLaunchLsaTwoShot<T, 16>(comm, stream, sendWin, sendOff, recvWin, recvOff, countPerRank, gridCtas);
+    break;
+  default:
+    ginAllReduceLaunchLsaTwoShot<T, 0>(comm, stream, sendWin, sendOff, recvWin, recvOff, countPerRank, gridCtas);
+    break;
+  }
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }
@@ -159,10 +181,14 @@ static ncclResult_t ncclAllReduceGinSdmaGinTwoShotTyped(const void* sendbuff, vo
   const uint64_t reduceTarget = ginAllReduceNextReduceTarget(comm);
   const uint64_t agTarget = ginAllReduceNextAgTarget(comm);
 
-  meta::comms::ginAllReduceTwoShotKernel<T><<<kGinAllReduceLsaCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
-    comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank,
-    comm->ginAllReduceState.twoShotSync, reduceTarget, comm->ginAllReduceState.twoShotSync + 1, agTarget,
-    comm->nRanks);
+  //if ((count * sizeof(T)) <= kGinAllReduceLsaTwoShotMidBtes) {
+  	meta::comms::ginAllReduceTwoShotKernel<T><<<kGinAllReduceLsaCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
+    		comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank,
+    		comm->ginAllReduceState.twoShotSync, reduceTarget, comm->ginAllReduceState.twoShotSync + 1, agTarget,
+    		comm->nRanks);
+  /*} else {
+	
+  }*/
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }
@@ -172,7 +198,7 @@ static ncclResult_t ncclAllReduceGinSdmaTyped(const void* sendbuff, void* recvbu
                                               cudaStream_t stream, struct ncclDevrWindow* sendWin,
                                               struct ncclDevrWindow* recvWin) {
   const size_t bytes = count * sizeof(T);
-  if (bytes <= kGinAllReduceLsaOneShotMaxBytes) {
+  if (bytes < kGinAllReduceLsaOneShotMaxBytes) {
     return ncclAllReduceGinSdmaOneShotTyped<T>(sendbuff, recvbuff, count, comm, stream, sendWin, recvWin);
   }
   if (bytes >= kGinAllReduceGinTwoShotMinBytes) {

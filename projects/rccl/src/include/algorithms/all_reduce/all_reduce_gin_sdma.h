@@ -3,8 +3,9 @@
  *
  * LSA AllReduce device kernels:
  *   allReduceLsaOneShotKernel — read all peers, sum, write all peers (small messages).
- *   lsaAllReduceTwoShotKernel — LSA reduce-scatter + LSA all-gather into recv.
- *   lsaAllReduceTwoShotOverlappedKernel — chunked RS then AG per slice (8 CTAs × nRanks).
+ *   lsaAllReduceTwoShotKernel — LSA reduce-scatter, barrier, LSA all-gather (remote reads only).
+ *   lsaAllReduceTwoShotOverlappedKernel — same two shots pipelined, pushing the reduced column to
+ *                                        peers so vector i is all-gathered while i+1 is reduced.
  *   ginAllReduceTwoShotKernel  — LSA reduce-scatter + multi-CTA GIN all-gather from recv.
  *
  * One-shot follows projects/rccl-tests/src/all_reduce.cu allReduceLsaKernel.
@@ -71,16 +72,173 @@ __launch_bounds__(512)
   bar.sync(ncclCoopCta(), cuda::memory_order_release);
 }
 
-template <typename T>
+// 16B window accesses through the global aperture.
+//
+// ncclGetLsaPointer hands back a generic (flat) pointer built by bit-twiddling a base loaded from
+// the window struct, so nothing downstream can prove it is device memory and the vector accesses
+// compile to flat_load_dwordx4 / flat_store_dwordx4. Peer windows live in the global aperture, so
+// casting to an address_space(1) pointer leaves the semantics untouched (plain, non-atomic, ordered
+// by the surrounding LSA barriers) while emitting global_load_dwordx4 / global_store_dwordx4 —
+// exactly what rccl_ptr.h prescribes for hot paths. If an ISA dump of this kernel mentions "flat",
+// one of these casts was lost.
+__device__ __forceinline__ uint4 lsaLoadVec(const char* p) {
+  union {
+    v4u vec;
+    uint4 val;
+  } u;
+  u.vec = *(v4u_gptr)(const_cast<char*>(p));
+  return u.val;
+}
+
+__device__ __forceinline__ void lsaStoreVec(char* p, uint4 val) {
+  union {
+    v4u vec;
+    uint4 val;
+  } u;
+  u.val = val;
+  *(v4u_gptr)(p) = u.vec;
+}
+
+// A rank's own column of an LSA window, resolved for every peer at once.
+//
+// ncclGetLsaPointer(win, off, peer) is lsaFlatBase + (peer * stride4G << 32) + off, i.e. linear in
+// peer. Resolving base and stride once per kernel is what keeps the window-struct loads out of the
+// hot loop: called inline, ncclGetLsaPointer reloads lsaFlatBase and stride4G for every peer of
+// every vector, because the peer stores may alias the window and stop the compiler from hoisting
+// them. That was ~2 dependent loads per peer per 16B vector ahead of every data access.
+struct LsaColumn {
+  char* base;        // peer 0, at this rank's column
+  size_t peerStride; // bytes between consecutive peers
+};
+
+__device__ __forceinline__ LsaColumn lsaColumnResolve(ncclWindow_t win, size_t colByteOff, int nRanks) {
+  char* peer0 = reinterpret_cast<char*>(ncclGetLsaPointer(win, colByteOff, 0));
+  const size_t stride =
+    nRanks > 1 ? static_cast<size_t>(reinterpret_cast<char*>(ncclGetLsaPointer(win, colByteOff, 1)) - peer0) : 0;
+  return LsaColumn{peer0, stride};
+}
+
+// NRANKS_CT > 0 folds the clique size to a constant and fully unrolls the peer loop (as the DDA
+// kernels do); NRANKS_CT == 0 is the runtime fallback with an 8-wide partial unroll.
+template <typename T, int NRANKS_CT>
+__device__ __forceinline__ uint4 lsaReduceVec(const LsaColumn& sendCol, size_t elemOff, int nRanksRuntime) {
+  const int nRanks = (NRANKS_CT > 0) ? NRANKS_CT : nRanksRuntime;
+  constexpr int kUnroll = (NRANKS_CT > 0) ? NRANKS_CT : 8;
+  const char* src = sendCol.base + elemOff * sizeof(T);
+
+  uint4 sum{0, 0, 0, 0};
+  uint4 srcVals[2];
+  srcVals[0] = lsaLoadVec(src);
+#pragma unroll kUnroll
+  for (int peer = 0; peer < nRanks - 1; ++peer) {
+    srcVals[(peer + 1) & 1] = lsaLoadVec(src + (peer + 1) * sendCol.peerStride);
+    sum = vecElementAdd<T>(sum, srcVals[peer & 1]);
+  }
+  return vecElementAdd<T>(sum, srcVals[(nRanks - 1) & 1]);
+}
+
+template <typename T, int NRANKS_CT>
+__device__ __forceinline__ void lsaBroadcastVec(const LsaColumn& recvCol, size_t elemOff, uint4 v, int nRanksRuntime) {
+  const int nRanks = (NRANKS_CT > 0) ? NRANKS_CT : nRanksRuntime;
+  constexpr int kUnroll = (NRANKS_CT > 0) ? NRANKS_CT : 8;
+  char* dst = recvCol.base + elemOff * sizeof(T);
+
+#pragma unroll kUnroll
+  for (int peer = 0; peer < nRanks; ++peer) {
+    lsaStoreVec(dst + peer * recvCol.peerStride, v);
+  }
+}
+
+// Pull all-gather: read each peer's reduced column out of its own window into the local recv
+// buffer. Column srcRank sits at (srcRank * peerStride) in the flat mapping and at
+// (srcRank * colStride) inside the window, so one combined stride walks both.
+//
+// This rank's own column is skipped: the reduce-scatter wrote it straight into the recv window, so
+// gathering it would be a local copy onto itself. (DDA cannot skip it — its reduce-scatter lands in
+// the IPC scratch, so the self shard still has to be copied out to the user buffer.) Peers are
+// visited starting at rank+1, as DDA's all-gather does, so the ranks are not all pulling from the
+// same peer at the same instant.
+template <typename T, int NRANKS_CT>
+__device__ __forceinline__ void lsaGatherVec(const char* peer0Recv, char* localRecv, size_t peerStride,
+                                             size_t colStride, size_t byteOff, int rank, int nRanksRuntime) {
+  const int nRanks = (NRANKS_CT > 0) ? NRANKS_CT : nRanksRuntime;
+  constexpr int kUnroll = (NRANKS_CT > 1) ? NRANKS_CT - 1 : 8;
+
+#pragma unroll kUnroll
+  for (int r = 1; r < nRanks; ++r) {
+    int srcRank = rank + r;
+    if (srcRank >= nRanks) {
+      srcRank -= nRanks;
+    }
+    lsaStoreVec(localRecv + srcRank * colStride + byteOff,
+                lsaLoadVec(peer0Recv + srcRank * (peerStride + colStride) + byteOff));
+  }
+}
+
+// Non-overlapped two-shot: LSA reduce-scatter into this rank's own recv column, one barrier, then
+// pull every peer's column back. All stores are local; only the loads cross the fabric.
+//
+// Three barrier round trips, matching ddaAllReduceTreeIpc: acquire on entry (peers' send buffers
+// must be complete), acq_rel in the middle, release on exit (a peer may still be reading our column
+// when we return). The middle one used to be a release barrier followed by an acquire barrier,
+// which paid two fabric round trips for ordering that one acq_rel barrier expresses: its arrive
+// carries the release fence and its wait does the acquire loads.
+template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
   __global__ void lsaAllReduceTwoShotKernel(struct ncclDevComm devComm, ncclWindow_t sendWin, size_t sendOff,
                                             ncclWindow_t recvWin, size_t recvOff, size_t countPerRank,
-                                            uint64_t* reduceDoneSync, uint64_t reduceTarget, int nRanks) {
+                                            int nRanksRuntime) {
   ncclCoopCta cta;
   ncclLsaBarrierSession<ncclCoopCta> bar{cta, devComm, ncclTeamLsa(devComm), devComm.lsaBarrier,
                                          static_cast<uint32_t>(blockIdx.x)};
+  const int nRanks = (NRANKS_CT > 0) ? NRANKS_CT : nRanksRuntime;
+
+  const size_t colStride = countPerRank * sizeof(T);
+  const size_t colByteOff = static_cast<size_t>(devComm.rank) * colStride;
+  const LsaColumn sendCol = lsaColumnResolve(sendWin, sendOff + colByteOff, nRanks);
+  const LsaColumn recvCol = lsaColumnResolve(recvWin, recvOff + colByteOff, nRanks);
+
+  // recvCol.base is peer 0's window at this rank's column; stepping one peer stride lands on this
+  // rank's own copy of it, and backing out colByteOff gives the start of each recv buffer.
+  char* localCol = recvCol.base + static_cast<size_t>(devComm.rank) * recvCol.peerStride;
+  const char* peer0Recv = recvCol.base - colByteOff;
+  char* localRecv = localCol - colByteOff;
+
+  constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
+  const size_t idxStart = (static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x) * countPerThread;
+  const size_t idxStride = static_cast<size_t>(gridDim.x) * blockDim.x * countPerThread;
+
+  bar.sync(cta, cuda::memory_order_acquire);
+
+  for (size_t idx = idxStart; idx < countPerRank; idx += idxStride) {
+    lsaStoreVec(localCol + idx * sizeof(T), lsaReduceVec<T, NRANKS_CT>(sendCol, idx, nRanks));
+  }
+
+  bar.sync(cta, cuda::memory_order_acq_rel);
+
+  for (size_t idx = idxStart; idx < countPerRank; idx += idxStride) {
+    lsaGatherVec<T, NRANKS_CT>(peer0Recv, localRecv, recvCol.peerStride, colStride, idx * sizeof(T), devComm.rank,
+                               nRanks);
+  }
+
+  bar.sync(cta, cuda::memory_order_release);
+}
+
+
+template <typename T, int NRANKS_CT>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+  __global__ void lsaAllReduceTwoShotLargeMsgKernel(struct ncclDevComm devComm, ncclWindow_t sendWin, size_t sendOff,
+                                            ncclWindow_t recvWin, size_t recvOff, size_t countPerRank, int nRanksRuntime) {
+  ncclCoopCta cta;
+  ncclLsaBarrierSession<ncclCoopCta> bar{cta, devComm, ncclTeamLsa(devComm), devComm.lsaBarrier,
+                                         static_cast<uint32_t>(blockIdx.x)};
+
+  const int nRanks = (NRANKS_CT > 0) ? NRANKS_CT : nRanksRuntime;
+  constexpr int kUnroll = (NRANKS_CT > 1) ? NRANKS_CT - 1 : 8;
 
   const size_t rankChunkStride = countPerRank * sizeof(T);
   const size_t globalElemOff = static_cast<size_t>(devComm.rank) * countPerRank;
@@ -103,7 +261,7 @@ __launch_bounds__(512)
     uint4 srcVals[2];
     *reinterpret_cast<uint4*>(&srcVals[0]) = *reinterpret_cast<const uint4*>(
       reinterpret_cast<const T*>(ncclGetLsaPointer(sendWin, sliceSendByteOff, 0)) + idx);
-#pragma unroll 8
+#pragma unroll kUnroll
     for (int peer = 0; peer < nRanks - 1; ++peer) {
       *reinterpret_cast<uint4*>(&srcVals[(peer + 1) & 1]) = *reinterpret_cast<const uint4*>(
         reinterpret_cast<const T*>(ncclGetLsaPointer(sendWin, sliceSendByteOff, peer + 1)) + idx);
@@ -111,9 +269,14 @@ __launch_bounds__(512)
     }
     sum = vecElementAdd<T>(sum, srcVals[(nRanks - 1) & 1]);
     *reinterpret_cast<uint4*>(reducedOut + idx) = sum;
+
+/*#pragma unroll kUnroll
+    for (int peer = 0; peer < nRanks; ++peer) {
+    	*reinterpret_cast<uint4*>(reinterpret_cast<T*>(ncclGetLsaPointer(recvWin, sliceRecvByteOff, peer)) + idx) = sum;
+    }*/
+
   }
 
-  //allReduceTwoShotCtaArrive(reduceDoneSync, reduceTarget, cta);
   bar.sync(cta, cuda::memory_order_release);
 
   bar.sync(cta, cuda::memory_order_acquire);
@@ -133,86 +296,43 @@ __launch_bounds__(512)
   bar.sync(cta, cuda::memory_order_release);
 }
 
-template <typename T>
-__device__ __forceinline__ void lsaAllReduceReduceScatterSlice(ncclWindow_t sendWin, ncclWindow_t recvWin, size_t sliceSendByteOff, 
-							size_t sliceRecvByteOff, T* reducedOut, size_t idxStart, size_t idxEnd,
-                                                               size_t idxStride, int nRanks) {
-  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
-    uint4 sum{0, 0, 0, 0};
-    uint4 srcVals[2];
-    *reinterpret_cast<uint4*>(&srcVals[0]) = *reinterpret_cast<const uint4*>(
-      reinterpret_cast<const T*>(ncclGetLsaPointer(sendWin, sliceSendByteOff, 0)) + idx);
-#pragma unroll 8
-    for (int peer = 0; peer < nRanks - 1; ++peer) {
-      *reinterpret_cast<uint4*>(&srcVals[(peer + 1) & 1]) = *reinterpret_cast<const uint4*>(
-        reinterpret_cast<const T*>(ncclGetLsaPointer(sendWin, sliceSendByteOff, peer + 1)) + idx);
-      sum = vecElementAdd<T>(sum, srcVals[peer & 1]);
-    }
-    sum = vecElementAdd<T>(sum, srcVals[(nRanks - 1) & 1]);
-    *reinterpret_cast<uint4*>(reducedOut + idx) = sum;
-
-#pragma unroll 8
-    for (int peer = 0; peer < nRanks; ++peer) {
-      *reinterpret_cast<uint4*>(
-        reinterpret_cast<T*>(ncclGetLsaPointer(recvWin, sliceRecvByteOff, peer)) + idx) = sum;
-    }
-  }
-}
-
-template <typename T>
-__device__ __forceinline__ void lsaAllReduceAllGatherSlice(ncclWindow_t recvWin, size_t sliceRecvByteOff,
-                                                           const T* reducedOut, size_t idxStart, size_t idxEnd,
-                                                           size_t idxStride, int nRanks) {
-  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
-    const uint4 v = *reinterpret_cast<const uint4*>(reducedOut + idx);
-#pragma unroll 8
-    for (int peer = 0; peer < nRanks; ++peer) {
-      *reinterpret_cast<uint4*>(
-        reinterpret_cast<T*>(ncclGetLsaPointer(recvWin, sliceRecvByteOff, peer)) + idx) = v;
-    }
-  }
-}
-
-template <typename T>
+// Overlapped two-shot: each rank stores its reduced column into every peer's recv window, and the
+// all-gather of vector i is pipelined with the reduce-scatter of vector i+1. No barrier is needed
+// between the phases — this rank is the only reader of its send column and the only writer of its
+// recv column anywhere, so the entry acquire and exit release bound everything, and in place each
+// thread only rewrites bytes it has already consumed itself.
+template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
   __global__ void lsaAllReduceTwoShotOverlappedKernel(struct ncclDevComm devComm, ncclWindow_t sendWin, size_t sendOff,
-                                                      ncclWindow_t recvWin, size_t recvOff, size_t countPerRankTotal,
-                                                      size_t sliceCountPerRankStep, int ctasPerPeer, int nRanks) {
+                                                      ncclWindow_t recvWin, size_t recvOff, size_t countPerRank,
+                                                      int nRanksRuntime) {
   ncclCoopCta cta;
   ncclLsaBarrierSession<ncclCoopCta> bar{cta, devComm, ncclTeamLsa(devComm), devComm.lsaBarrier,
                                          static_cast<uint32_t>(blockIdx.x)};
+  const int nRanks = (NRANKS_CT > 0) ? NRANKS_CT : nRanksRuntime;
 
-  const size_t rankChunkStride = countPerRankTotal * sizeof(T);
-  const int tid = static_cast<int>(threadIdx.x + blockIdx.x * blockDim.x);
-  const int nthreads = static_cast<int>(blockDim.x * gridDim.x);
-  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
-  const size_t idxStart = static_cast<size_t>(tid) * countPerThread;
-  const size_t idxStride = static_cast<size_t>(nthreads) * countPerThread;
-  (void)ctasPerPeer;
+  const size_t colByteOff = static_cast<size_t>(devComm.rank) * countPerRank * sizeof(T);
+  const LsaColumn sendCol = lsaColumnResolve(sendWin, sendOff + colByteOff, nRanks);
+  const LsaColumn recvCol = lsaColumnResolve(recvWin, recvOff + colByteOff, nRanks);
+
+  constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
+  const size_t idxStart = (static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x) * countPerThread;
+  const size_t idxStride = static_cast<size_t>(gridDim.x) * blockDim.x * countPerThread;
 
   bar.sync(cta, cuda::memory_order_acquire);
 
-  for (size_t rankElemOff = 0; rankElemOff < countPerRankTotal; rankElemOff += sliceCountPerRankStep) {
-    const size_t sliceCountPerRank = min(sliceCountPerRankStep, countPerRankTotal - rankElemOff);
-    const size_t rankByteOff = rankElemOff * sizeof(T);
-    const size_t globalElemOff = static_cast<size_t>(devComm.rank) * countPerRankTotal + rankElemOff;
-    const size_t sliceSendByteOff = sendOff + globalElemOff * sizeof(T);
-    const size_t sliceRecvByteOff = recvOff + static_cast<size_t>(devComm.rank) * rankChunkStride + rankByteOff;
-    T* reducedOut = reinterpret_cast<T*>(ncclGetLocalPointer(recvWin, sliceRecvByteOff));
-
-    lsaAllReduceReduceScatterSlice<T>(sendWin, recvWin, sliceSendByteOff, sliceRecvByteOff, reducedOut, idxStart, 
-		    sliceCountPerRank, idxStride, nRanks);
-
-    bar.sync(cta, cuda::memory_order_release);
-    /*bar.sync(cta, cuda::memory_order_acquire);
-
-    lsaAllReduceAllGatherSlice<T>(recvWin, sliceRecvByteOff, reducedOut, idxStart, sliceCountPerRank, idxStride,
-                                  nRanks);
-
-    bar.sync(cta, cuda::memory_order_release);*/
-    bar.sync(cta, cuda::memory_order_acquire);
+  if (idxStart < countPerRank) {
+    size_t idx = idxStart;
+    uint4 sum = lsaReduceVec<T, NRANKS_CT>(sendCol, idx, nRanks);
+    for (size_t next = idx + idxStride; next < countPerRank; next += idxStride) {
+      const uint4 nextSum = lsaReduceVec<T, NRANKS_CT>(sendCol, next, nRanks);
+      lsaBroadcastVec<T, NRANKS_CT>(recvCol, idx, sum, nRanks);
+      idx = next;
+      sum = nextSum;
+    }
+    lsaBroadcastVec<T, NRANKS_CT>(recvCol, idx, sum, nRanks);
   }
 
   bar.sync(cta, cuda::memory_order_release);
