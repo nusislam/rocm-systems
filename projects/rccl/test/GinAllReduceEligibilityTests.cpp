@@ -20,7 +20,7 @@ protected:
     GinAllReduceMockComm mockComm_;
     void*                sendbuff_{reinterpret_cast<void*>(0x1000)};
     void*                recvbuff_{reinterpret_cast<void*>(0x2000)};
-    // 4 MiB of float32: below the default 256 MiB GIN floor, above zero.
+    // 4 MiB of float32: below the default 64 MiB GIN floor, above zero.
     static constexpr size_t kSmallCount = (4ull * 1024 * 1024) / 4;
 };
 

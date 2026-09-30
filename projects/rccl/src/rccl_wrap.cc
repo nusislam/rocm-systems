@@ -914,7 +914,8 @@ ncclResult_t rcclSelectAllReduce(struct ncclComm* comm, const void* sendbuff, vo
   // Must beat CE / DDA / symmetric so rcclGetCollImplInfo names the backend that ran.
   if (ncclGroupDepth == 0 && ncclAllReduceGinSdmaEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
     decision->algo = RCCL_GIN_SDMA;
-    decision->nMaxChannels = kGinAllReduceLsaCtas;
+    decision->nMaxChannels = msgBytes >= kGinAllReduceGinTwoShotMinBytes ? kGinAllReduceSymRsGinAgCtas
+                                                                        : kGinAllReduceLsaCtas;
     return ncclSuccess;
   }
 #endif
@@ -979,7 +980,7 @@ ncclResult_t rcclSelectAllReduce(struct ncclComm* comm, const void* sendbuff, vo
   // subject to rcclDdaEnabled thresholds -- all folded into the helper.
   //
   // GIN AllReduce is selected first in this function and requires symmetric
-  // windows. By default it only claims messages >= 256 MiB, so DDA must still be
+  // windows. By default it only claims messages >= 64 MiB, so DDA must still be
   // allowed for smaller symmetric AllReduces (otherwise they would hit the
   // symmetric kernel instead of DDA). FORCE_ENABLE=1 keeps the original
   // !symEligible gate because GIN already returned above for those sizes.

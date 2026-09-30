@@ -2,12 +2,14 @@
  * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
  *
  * GIN-SDMA AllReduce for single-node (scaleup-only) symmetric windows.
- * Default: only messages >= 256 MiB take this path (GIN two-shot); smaller
- * messages fall through to DDA AllReduce. RCCL_GIN_ALLREDUCE_FORCE_ENABLE=1
- * also enables the LSA bands:
+ * Default: only messages >= 64 MiB take this path (64-CU RSxLD-style LSA
+ * reduce-scatter into scratch + CTA-0 GIN PUT all-gather). Smaller messages
+ * fall through to DDA AllReduce. RCCL_GIN_ALLREDUCE_FORCE_ENABLE=1 also
+ * enables the LSA bands:
  *   <= 4 MiB   — LSA one-shot
- *   (4, 256) MiB — LSA two-shot
- *   >= 256 MiB — GIN two-shot (LSA reduce-scatter + GIN all-gather)
+ *   (4, 64) MiB — LSA two-shot
+ *   >= 64 MiB — ginAllReduceSymRsGinAgKernel when scratch holds the reduced
+ *                column; otherwise ginScatter.
  *
  * Compiled with NCCL_GIN_ANVIL_SDMA_ENABLE=1 and NCCL_GIN_PROXY_ENABLE=0 so
  * ncclGinCallImpl resolves the SDMA backend at compile time.
@@ -29,9 +31,13 @@
 #include <cuda_runtime.h>
 
 NCCL_PARAM(GinAllReduceEnable, "GIN_ALLREDUCE_ENABLE", 1);
-// When 0 (default), GIN AllReduce is eligible only for messages >= 256 MiB.
+// When 0 (default), GIN AllReduce is eligible only for messages >= 64 MiB.
 // Set to 1 to also take LSA one-shot / LSA two-shot for smaller sizes.
 RCCL_PARAM(GinAllReduceForceEnable, "GIN_ALLREDUCE_FORCE_ENABLE", 0);
+// Symmetric 512 MiB scratch: ginScatter CE ping-pong incoming slots, or the
+// LSA-RS reduced column. Allocated once before GIN connect. 0 skips allocation.
+NCCL_PARAM(GinAllReduceScratchBytes, "GIN_ALLREDUCE_SCRATCH_BYTES",
+           static_cast<int64_t>(kGinAllReduceTwoShotScratchBytes));
 // LSA two-shot tuning. CTAs default to kGinAllReduceLsaTwoShotCtasPerPeer * nRanks; the DDA IPC
 // kernels top out at DDA_IPC_MAXBLOCKS (24), so this range is worth sweeping. 
 NCCL_PARAM(GinAllReduceLsaTwoShotCtas, "GIN_ALLREDUCE_LSA_TWOSHOT_CTAS", 0);
@@ -39,6 +45,56 @@ NCCL_PARAM(GinAllReduceLsaTwoShotCtas, "GIN_ALLREDUCE_LSA_TWOSHOT_CTAS", 0);
 namespace {
 
 constexpr bool kSdmaDeviceBackendCompiled = (NCCL_GIN_ANVIL_SDMA_ENABLE != 0);
+
+static bool ginAllReduceScratchWinReady(ncclComm* comm) {
+  struct ncclGinAllReduceState* state = &comm->ginAllReduceState;
+  return state->scratchWin != nullptr && state->scratchWin->vidmem != nullptr;
+}
+
+static ncclResult_t ginAllReduceFreeScratch(ncclComm* comm) {
+  struct ncclGinAllReduceState* state = &comm->ginAllReduceState;
+  if (state->scratchWin != nullptr) {
+    NCCLCHECK(ncclCommWindowDeregister(comm, state->scratchWin->vidmem));
+    state->scratchWin = nullptr;
+  }
+  if (state->scratch != nullptr) {
+    NCCLCHECK(ncclMemFree(state->scratch));
+    state->scratch = nullptr;
+  }
+  state->scratchBytes = 0;
+  return ncclSuccess;
+}
+
+static ncclResult_t ginAllReduceScratchInitOnce(ncclComm* comm) {
+  struct ncclGinAllReduceState* state = &comm->ginAllReduceState;
+  if (state->scratch != nullptr) {
+    return ncclSuccess;
+  }
+
+  const int64_t requested = ncclParamGinAllReduceScratchBytes();
+  if (requested <= 0) {
+    return ncclSuccess;
+  }
+  const size_t allocBytes = static_cast<size_t>(requested);
+
+  void* scratch = nullptr;
+  ncclWindow_t scratchWinDev = nullptr;
+  NCCLCHECK(ncclMemAlloc(&scratch, allocBytes));
+  NCCLCHECK(ncclDevrWindowRegisterInGroup(comm, scratch, allocBytes, NCCL_WIN_COLL_SYMMETRIC, &scratchWinDev));
+  NCCLCHECK(ncclDevrFindWindow(comm, scratch, &state->scratchWin));
+  if (scratchWinDev == nullptr || !ginAllReduceScratchWinReady(comm)) {
+    if (scratchWinDev != nullptr) {
+      (void)ncclCommWindowDeregister(comm, scratchWinDev);
+    }
+    state->scratchWin = nullptr;
+    NCCLCHECK(ncclMemFree(scratch));
+    return ncclInternalError;
+  }
+  state->scratch = scratch;
+  state->scratchBytes = allocBytes;
+  INFO(NCCL_INIT, "GIN AllReduce two-shot scratch: %zu bytes", allocBytes);
+  return ncclSuccess;
+}
 
 // Runs on the first eligible AllReduce, which may itself be inside a graph capture. Everything
 // here has to stay out of the captured graph and must not disturb the capture in progress:
@@ -56,6 +112,9 @@ constexpr bool kSdmaDeviceBackendCompiled = (NCCL_GIN_ANVIL_SDMA_ENABLE != 0);
 // barrier before every rank has finished initializing.
 static ncclResult_t ncclGinAllReduceInitOnce(ncclComm* comm) {
   NCCLCHECK(ncclDevrInitOnce(comm));
+  // Window-register scratch while GIN is still off. ncclDevrCommCreateInternal
+  // then GIN-registers every memHead entry, including this one.
+  NCCLCHECK(ginAllReduceScratchInitOnce(comm));
   struct ncclGinAllReduceState* state = &comm->ginAllReduceState;
   if (state->initialized) {
     return ncclSuccess;
@@ -63,7 +122,8 @@ static ncclResult_t ncclGinAllReduceInitOnce(ncclComm* comm) {
 
   struct ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
   reqs.lsaBarrierCount = kGinAllReduceLsaTwoShotMaxCtas;
-  // ginAllReduceTwoShotKernel: one world barrier + GIN signal per CTA.
+  // ginAllReduceSymRsGinAgKernel: LSA barrier per CTA (64), world barrier 0,
+  // GIN signal 0. ginScatter still uses signals 0/1/2 and up to 56 CTAs.
   reqs.barrierCount = kGinAllReduceLsaCtas;
   reqs.ginSignalCount = kGinAllReduceLsaCtas;
   reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
@@ -185,10 +245,29 @@ static ncclResult_t ncclAllReduceGinSdmaGinTwoShotTyped(const void* sendbuff, vo
   const size_t recvOff =
     static_cast<size_t>(static_cast<char*>(recvbuff) - static_cast<const char*>(recvWin->userPtr));
   const size_t countPerRank = count / static_cast<size_t>(comm->nRanks);
+  const size_t chunkBytes = countPerRank * sizeof(T);
 
-  gin::sdma::ginAllReduceTwoShotKernel<T><<<kGinAllReduceLsaCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
-    comm->ginAllReduceState.devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, countPerRank, comm->nRanks,
-    comm->ginAllReduceState.intraGpuCtaBar);
+  struct ncclGinAllReduceState* state = &comm->ginAllReduceState;
+  if (!ginAllReduceScratchWinReady(comm)) {
+    WARN("GIN AllReduce two-shot scratch is not registered");
+    return ncclInvalidUsage;
+  }
+
+  if (state->scratchBytes >= chunkBytes) {
+    gin::sdma::ginAllReduceSymRsGinAgKernel<T>
+      <<<kGinAllReduceSymRsGinAgCtas, kGinAllReduceSymRsGinAgThreadsPerCta, 0, stream>>>(
+        state->devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, state->scratchWin->vidmem,
+        /*scratchOff=*/0, countPerRank, comm->nRanks, state->intraGpuCtaBar);
+  } else if (ginAllReduceGinScatterLaunch(count * sizeof(T), chunkBytes, comm->nRanks, state->scratchBytes)) {
+    gin::sdma::ginAllReduceTwoShotGinScatterKernel<T>
+      <<<kGinAllReduceLsaCtas, kGinAllReduceLsaThreadsPerCta, 0, stream>>>(
+        state->devComm, sendWin->vidmem, sendOff, recvWin->vidmem, recvOff, state->scratchWin->vidmem,
+        /*scratchOff=*/0, countPerRank, comm->nRanks, state->scratchBytes, state->intraGpuCtaBar);
+  } else {
+    WARN("GIN AllReduce two-shot scratch %zu bytes cannot hold reduced column %zu bytes", state->scratchBytes,
+         chunkBytes);
+    return ncclInvalidUsage;
+  }
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }
@@ -275,6 +354,7 @@ ncclResult_t ncclAllReduceGinSdma(const void* sendbuff, void* recvbuff, size_t c
 
 ncclResult_t ncclGinAllReduceFinalize(ncclComm* comm) {
   struct ncclGinAllReduceState* state = &comm->ginAllReduceState;
+  NCCLCHECK(ginAllReduceFreeScratch(comm));
   if (state->intraGpuCtaBar != nullptr) {
     NCCLCHECK(ncclCudaFree(state->intraGpuCtaBar, comm->memManager));
     state->intraGpuCtaBar = nullptr;

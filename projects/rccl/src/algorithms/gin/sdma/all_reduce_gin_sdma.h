@@ -4,7 +4,19 @@
  * LSA AllReduce device kernels:
  *   allReduceLsaOneShotKernel — read all peers, sum, write all peers (small messages).
  *   lsaAllReduceTwoShotKernel — LSA reduce-scatter, barrier, LSA all-gather (remote reads only).
- *   ginAllReduceTwoShotKernel  — LSA reduce-scatter, intra-GPU CTA barrier, GIN all-gather from recv.
+ *   ginAllReduceTwoShotKernel  — LSA reduce-scatter into scratch, intra-GPU CTA
+ *     barrier, GIN all-gather from that scratch column into recv.
+ *   ginAllReduceSymRsGinAgKernel — 64 CUs, RSxLD-style LSA reduce-scatter
+ *     into scratch (same UnrollPacks/UnrollPeers/peer rotation as
+ *     ncclSymkRun_AllReduce_RSxLD_AGxST), then CTA 0 GIN-PUTs that column
+ *     into every recv.
+ *   ginAllReduceTwoShotGinScatterKernel — CTA 0 GIN-puts remote send slices
+ *     (self from send, remotes from scratch). Scratch is 512 MiB of CE-style
+ *     ping-pong incoming slots; reduced output is recvbuff. Local reduce matches
+ *     CE (16B vectors, GpuUnroll=4, ranks 0..nRanks-1). Used from 64 MiB.
+ *     Below 512 MiB scatter of a step completes before reduce; at 512 MiB+ put
+ *     of chunk i+1 overlaps reduce of chunk i. Pipeline steps use waitSignal /
+ *     WeakSignalInc doorbells; one world barrier snapshots signal baselines.
  *
  * One-shot follows projects/rccl-tests/src/all_reduce.cu allReduceLsaKernel.
  ******************************************************************************/
@@ -14,6 +26,7 @@
 #include "nccl_device.h"
 #include "nccl_device/ptr.h"
 #include "algorithms/dda/device/CollCommon.h"
+#include "algorithms/gin/gin_all_reduce_policy.h"
 
 namespace gin::sdma {
 using dda::common::vecElementAdd;
@@ -203,16 +216,6 @@ __launch_bounds__(512)
   bar.sync(cta, cuda::memory_order_release);
 }
 
-// One-time init only, never part of a captured graph: replaying this would zero signals that
-// peers are concurrently incrementing. ncclGinAllReduceInitOnce runs it on a private stream.
-__global__ void ginAllReduceResetSignalsKernel(struct ncclDevComm devComm) {
-  if (threadIdx.x != 0) {
-    return;
-  }
-  ncclGin gin{devComm, /*ginContext=*/0};
-  gin.resetSignal(static_cast<unsigned>(blockIdx.x));
-}
-
 // Intra-GPU barrier across every CTA on this device. LSA/world bar.sync only
 // pair CTA i with CTA i on other ranks, so they do not wait for sibling CTAs here.
 // Sense-reversing (same pattern as ncclCoopWarpSpan::sync / ncclCeGlobalBlockBarrier):
@@ -255,12 +258,330 @@ __device__ __forceinline__ void ginIntraGpuCtaBarrier(uint32_t* bar, unsigned nC
   __syncthreads();
 }
 
+// flattenIx(lane, WARP_SIZE, block, nBlocks, warp, nWarps) as in
+// ncclSymkRun_ReduceScatter_LD. RSxLD_AGxST also folds rank into the global
+// id because it owns the full buffer; this kernel only owns this rank's
+// contiguous shard, so rank is omitted.
+__device__ __forceinline__ int ginAllReduceSymRsThreadId(int nBlocks) {
+  const int lane = static_cast<int>(threadIdx.x % WARP_SIZE);
+  const int warp = static_cast<int>(threadIdx.x / WARP_SIZE);
+  const int block = static_cast<int>(blockIdx.x);
+  return lane + WARP_SIZE * (block + nBlocks * warp);
+}
+
+// Load-reduce of this rank's send column, store locally. Control flow matches
+// allreduceDeep<16, 4, 2> in device/symmetric/all_reduce.cuh (EnableTma=false):
+// own-rank preload, rotate peers, UnrollPeers=2 batches, then local store
+// instead of the AGxST remote stores.
+template <typename T>
+__device__ __forceinline__ void ginAllReduceSymRsDeep(const LsaColumn& sendCol, char* localOut, int rank,
+                                                      int nRanks, int tn, int t, int32_t nIters) {
+  constexpr int BytePerPack = 16;
+  constexpr int UnrollPacks = 4;
+  constexpr int UnrollPeers = 2;
+  const int wn = tn / WARP_SIZE;
+  const int w = t / WARP_SIZE;
+  const int lane = t % WARP_SIZE;
+  size_t packBase = static_cast<size_t>(w) * UnrollPacks * WARP_SIZE + static_cast<size_t>(lane);
+
+  uint4 acc0[UnrollPacks];
+  nIters -= w;
+  if (0 < nIters) {
+#pragma unroll
+    for (int u = 0; u < UnrollPacks; u++) {
+      acc0[u] = lsaLoadVec(sendCol.base + static_cast<size_t>(rank) * sendCol.peerStride +
+                           (packBase + static_cast<size_t>(u) * WARP_SIZE) * BytePerPack);
+    }
+  }
+
+  if (0 < nIters) {
+    while (true) {
+      uint4 acc1[UnrollPacks];
+      int r = rank;
+      if (++r == nRanks) r = 0;
+      {
+        uint4 tmp1[UnrollPacks];
+#pragma unroll
+        for (int u = 0; u < UnrollPacks; u++) {
+          tmp1[u] = lsaLoadVec(sendCol.base + static_cast<size_t>(r) * sendCol.peerStride +
+                               (packBase + static_cast<size_t>(u) * WARP_SIZE) * BytePerPack);
+        }
+#pragma unroll
+        for (int u = 0; u < UnrollPacks; u++) {
+          acc1[u] = vecElementAdd<T>(acc0[u], tmp1[u]);
+        }
+      }
+
+      if (++r == nRanks) r = 0;
+
+      int dr = 2;
+#pragma unroll 2
+      for (int partial = 0; partial <= 1; partial++) {
+        for (int i = 0; partial ? i < 1 : (dr + UnrollPeers <= nRanks); partial ? i++ : (dr += UnrollPeers)) {
+          if (partial && dr == nRanks) break;
+
+          uint4 tmp1[UnrollPeers][UnrollPacks];
+#pragma unroll
+          for (int ur = 0; ur < UnrollPeers - partial; ur++) {
+            if (partial && ur != 0 && dr + ur == nRanks) break;
+#pragma unroll
+            for (int u = 0; u < UnrollPacks; u++) {
+              tmp1[ur][u] = lsaLoadVec(sendCol.base + static_cast<size_t>(r) * sendCol.peerStride +
+                                       (packBase + static_cast<size_t>(u) * WARP_SIZE) * BytePerPack);
+            }
+            if (++r == nRanks) r = 0;
+          }
+#pragma unroll
+          for (int ur = 0; ur < UnrollPeers - partial; ur++) {
+            if (partial && ur != 0 && dr + ur == nRanks) break;
+#pragma unroll
+            for (int u = 0; u < UnrollPacks; u++) {
+              acc1[u] = vecElementAdd<T>(acc1[u], tmp1[ur][u]);
+            }
+          }
+        }
+      }
+
+#pragma unroll
+      for (int u = 0; u < UnrollPacks; u++) {
+        lsaStoreVec(localOut + (packBase + static_cast<size_t>(u) * WARP_SIZE) * BytePerPack, acc1[u]);
+      }
+
+      packBase += static_cast<size_t>(wn) * UnrollPacks * WARP_SIZE;
+      nIters -= wn;
+      if (nIters <= 0) break;
+
+#pragma unroll
+      for (int u = 0; u < UnrollPacks; u++) {
+        acc0[u] = lsaLoadVec(sendCol.base + static_cast<size_t>(rank) * sendCol.peerStride +
+                             (packBase + static_cast<size_t>(u) * WARP_SIZE) * BytePerPack);
+      }
+    }
+  }
+}
+
+// 64-CU two-shot: RSxLD-style LSA reduce-scatter of this rank's column into
+// scratch, intra-GPU CTA barrier, then CTA 0 GIN-PUTs that column into every
+// recv (including self). Scratch keeps in-place AllReduce from clobbering send
+// and keeps gin.put's source off the user recv buffer.
+template <typename T>
+#if defined(USE_ROCM)
+__launch_bounds__(kGinAllReduceSymRsGinAgThreadsPerCta)
+#endif
+  __global__ void ginAllReduceSymRsGinAgKernel(struct ncclDevComm devComm, ncclWindow_t sendWin, size_t sendOff,
+                                               ncclWindow_t recvWin, size_t recvOff, ncclWindow_t scratchWin,
+                                               size_t scratchOff, size_t countPerRank, int nRanks,
+                                               uint32_t* intraGpuCtaBar) {
+  constexpr int ginContext = 0;
+  constexpr int BytePerPack = 16;
+  constexpr int UnrollPacks = 4;
+  constexpr int MinWarpPerBlock = 4;
+  constexpr int BytePerChunk = MinWarpPerBlock * UnrollPacks * WARP_SIZE * BytePerPack;
+
+  ncclGin gin{devComm, ginContext};
+  ncclTeam world = ncclTeamWorld(devComm);
+  ncclCoopCta cta;
+  ncclLsaBarrierSession<ncclCoopCta> bar{cta, devComm, ncclTeamLsa(devComm), devComm.lsaBarrier,
+                                         static_cast<uint32_t>(blockIdx.x)};
+
+  const int nBlocks = static_cast<int>(gridDim.x);
+  const int t = ginAllReduceSymRsThreadId(nBlocks);
+  const int tn = nBlocks * static_cast<int>(blockDim.x);
+  const size_t colStride = countPerRank * sizeof(T);
+  const size_t colByteOff = static_cast<size_t>(devComm.rank) * colStride;
+  const LsaColumn sendCol = lsaColumnResolve(sendWin, sendOff + colByteOff, nRanks);
+  char* reducedOut = reinterpret_cast<char*>(ncclGetLocalPointer(scratchWin, scratchOff));
+  const size_t sliceRecvByteOff = recvOff + colByteOff;
+  const size_t nBytes = colStride;
+  const size_t countPerThread = sizeof(uint4) / sizeof(T);
+
+  bar.sync(cta, cuda::memory_order_acquire);
+
+  uint32_t chunks = static_cast<uint32_t>(nBytes / BytePerChunk);
+  chunks -= chunks % static_cast<uint32_t>(nRanks * nBlocks);
+  if (chunks != 0) {
+    ginAllReduceSymRsDeep<T>(sendCol, reducedOut, devComm.rank, nRanks, tn, t,
+                             static_cast<int32_t>(chunks) * MinWarpPerBlock);
+  }
+
+  const size_t cursorBytes = static_cast<size_t>(chunks) * BytePerChunk;
+  const size_t nSufPacks = (nBytes - cursorBytes) / BytePerPack;
+  for (size_t p = static_cast<size_t>(t); p < nSufPacks; p += static_cast<size_t>(tn)) {
+    const size_t elemOff = (cursorBytes / sizeof(T)) + p * countPerThread;
+    lsaStoreVec(reducedOut + cursorBytes + p * BytePerPack, lsaReduceVec<T, 0>(sendCol, elemOff, nRanks));
+  }
+
+  bar.sync(cta, cuda::memory_order_release);
+  ginIntraGpuCtaBarrier(intraGpuCtaBar, static_cast<unsigned>(gridDim.x));
+
+  if (blockIdx.x == 0) {
+    const unsigned int signalIndex = static_cast<unsigned int>(blockIdx.x);
+    const uint64_t signalValue = gin.readSignal(signalIndex);
+    ncclBarrierSession<ncclCoopCta> ginBar{cta, ncclTeamTagWorld(), gin, blockIdx.x};
+    ginBar.sync(cta, cuda::memory_order_acquire, ncclGinFenceLevel::None);
+
+    for (int dst = static_cast<int>(threadIdx.x); dst < nRanks; dst += static_cast<int>(blockDim.x)) {
+      gin.put(world, dst, recvWin, sliceRecvByteOff, scratchWin, scratchOff, nBytes, ncclGin_SignalInc{signalIndex});
+    }
+    gin.waitSignal(cta, signalIndex, signalValue + static_cast<uint64_t>(nRanks));
+    gin.flush(cta);
+    ginBar.sync(cta, cuda::memory_order_release, ncclGinFenceLevel::None);
+  }
+}
+
+// One-time init only, never part of a captured graph: replaying this would zero signals that
+// peers are concurrently incrementing. ncclGinAllReduceInitOnce runs it on a private stream.
+__global__ void ginAllReduceResetSignalsKernel(struct ncclDevComm devComm) {
+  if (threadIdx.x != 0) {
+    return;
+  }
+  ncclGin gin{devComm, /*ginContext=*/0};
+  gin.resetSignal(static_cast<unsigned>(blockIdx.x));
+}
+
+// GIN-put one pipeline chunk of send[dst] into dest dst's staging slot for every dst != rank.
+__device__ __forceinline__ void ginScatterPutRemoteChunk(ncclGin& gin, ncclTeam world, int rank, int nRanks,
+                                                         ncclWindow_t scratchWin, size_t destSlotOff,
+                                                         ncclWindow_t sendWin, size_t sendOff, size_t perRankBytes,
+                                                         size_t sendChunkOff, size_t chunkBytes, unsigned signalIndex) {
+  for (int dst = static_cast<int>(threadIdx.x); dst < nRanks; dst += static_cast<int>(blockDim.x)) {
+    if (dst == rank) {
+      continue;
+    }
+    gin.put(world, dst, scratchWin, destSlotOff, sendWin,
+            sendOff + static_cast<size_t>(dst) * perRankBytes + sendChunkOff, chunkBytes,
+            ncclGin_WeakSignalInc{signalIndex});
+  }
+}
+
+__device__ __forceinline__ size_t ginScatterPutDestOff(size_t scratchOff, int rank, int nRanks, size_t perRankBytes,
+                                                       size_t slotBytes, int slot, size_t chunkOff, bool staged) {
+  if (!staged) {
+    return scratchOff + static_cast<size_t>(rank) * perRankBytes + chunkOff;
+  }
+  return scratchOff + static_cast<size_t>(slot) * static_cast<size_t>(nRanks) * slotBytes +
+         static_cast<size_t>(rank) * slotBytes;
+}
+
+__device__ __forceinline__ const char* ginScatterIncomingBase(const char* scratchBase, int nRanks, size_t slotBytes,
+                                                             int slot, bool staged) {
+  if (!staged) {
+    return scratchBase;
+  }
+  return scratchBase + static_cast<size_t>(slot) * static_cast<size_t>(nRanks) * slotBytes;
+}
+
+// CE ncclCeLocalReduceKernelVec: 16B vectors, GpuUnroll=4, rank loop 0..nRanks-1
+// into recvbuff + rank*shard. Self is not written to scratch (GIN-put skips it),
+// so rank == myRank loads from send instead of the incoming slot.
+template <typename T>
+__device__ __forceinline__ const char* ginScatterReduceSrc(int peer, int rank, const char* selfSend,
+                                                          const char* incomingBase, size_t incomingStride, size_t elem,
+                                                          size_t elemStart, bool staged) {
+  if (peer == rank) {
+    return selfSend + elem * sizeof(T);
+  }
+  const size_t srcOff = staged ? (elem - elemStart) * sizeof(T) : elem * sizeof(T);
+  return incomingBase + static_cast<size_t>(peer) * incomingStride + srcOff;
+}
+
+template <typename T>
+__device__ __forceinline__ void ginScatterReduceChunk(const char* selfSend, const char* incomingBase, char* reducedOut,
+                                                     int rank, int nRanks, size_t incomingStride, size_t elemStart,
+                                                     size_t elemEnd, bool staged) {
+  constexpr int W = static_cast<int>(sizeof(uint4) / sizeof(T));
+  constexpr int U = 4;
+  const size_t nVec = (elemEnd - elemStart) / static_cast<size_t>(W);
+  const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+
+  size_t vi = tid;
+  for (; vi + static_cast<size_t>(U - 1) * stride < nVec; vi += stride * static_cast<size_t>(U)) {
+    uint4 acc[U];
+    size_t elem[U];
+#pragma unroll
+    for (int i = 0; i < U; ++i) {
+      elem[i] = elemStart + (vi + static_cast<size_t>(i) * stride) * static_cast<size_t>(W);
+      acc[i] = lsaLoadVec(ginScatterReduceSrc<T>(0, rank, selfSend, incomingBase, incomingStride, elem[i], elemStart,
+                                                staged));
+    }
+#pragma clang loop unroll(disable) vectorize(disable)
+    for (int r = 1; r < nRanks; ++r) {
+      uint4 tmp[U];
+#pragma unroll
+      for (int i = 0; i < U; ++i) {
+        tmp[i] = lsaLoadVec(ginScatterReduceSrc<T>(r, rank, selfSend, incomingBase, incomingStride, elem[i], elemStart,
+                                                  staged));
+      }
+#pragma unroll
+      for (int i = 0; i < U; ++i) {
+        acc[i] = vecElementAdd<T>(acc[i], tmp[i]);
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < U; ++i) {
+      lsaStoreVec(reducedOut + elem[i] * sizeof(T), acc[i]);
+    }
+  }
+
+  const size_t vectorTailStart = nVec - (nVec % (stride * static_cast<size_t>(U)));
+  if (nVec > 0 && nVec % (stride * static_cast<size_t>(U)) != 0) {
+    for (size_t vIdx = vectorTailStart + tid; vIdx < nVec; vIdx += stride) {
+      const size_t e = elemStart + vIdx * static_cast<size_t>(W);
+      uint4 acc =
+        lsaLoadVec(ginScatterReduceSrc<T>(0, rank, selfSend, incomingBase, incomingStride, e, elemStart, staged));
+#pragma clang loop unroll(disable) vectorize(disable)
+      for (int r = 1; r < nRanks; ++r) {
+        acc = vecElementAdd<T>(
+          acc, lsaLoadVec(ginScatterReduceSrc<T>(r, rank, selfSend, incomingBase, incomingStride, e, elemStart,
+                                                staged)));
+      }
+      lsaStoreVec(reducedOut + e * sizeof(T), acc);
+    }
+  }
+}
+
+__device__ __forceinline__ void ginScatterIssuePut(ncclGin& gin, ncclTeam world, int rank, int nRanks,
+                                                  ncclWindow_t scratchWin, size_t scratchOff, ncclWindow_t sendWin,
+                                                  size_t sendOff, size_t perRankBytes, size_t slotBytes,
+                                                  size_t uniformBytes, size_t lastBytes, int nChunks, int nPhases,
+                                                  bool staged, int chunk, unsigned signalIndex) {
+  const size_t chunkOff = ginAllReduceGinScatterChunkOff(chunk, uniformBytes);
+  const size_t chunkBytes = ginAllReduceGinScatterChunkSize(chunk, nChunks, uniformBytes, lastBytes);
+  const int slot = staged ? ((nPhases <= 1) ? 0 : (chunk % nPhases)) : 0;
+  const size_t destOff =
+    ginScatterPutDestOff(scratchOff, rank, nRanks, perRankBytes, slotBytes, slot, staged ? 0 : chunkOff, staged);
+  ginScatterPutRemoteChunk(gin, world, rank, nRanks, scratchWin, destOff, sendWin, sendOff, perRankBytes, chunkOff,
+                           chunkBytes, signalIndex);
+}
+
+// Thread 0 polls; callers that need the rest of the CTA to observe completion
+// follow with ginIntraGpuCtaBarrier or __syncthreads.
+__device__ __forceinline__ void ginScatterWaitThread0(ncclGin& gin, unsigned signalIndex, uint64_t least) {
+  if (threadIdx.x == 0) {
+    gin.waitSignal(ncclCoopThread(), signalIndex, least);
+  }
+}
+
+// One-way doorbell: this rank finished reading a reused scratch slot. Cheaper than
+// a world barrier (CE uses per-slot signal==0 the same way).
+__device__ __forceinline__ void ginScatterNotifySlotFree(ncclGin& gin, ncclTeam world, int rank, int nRanks,
+                                                         unsigned doneSignal) {
+  for (int dst = static_cast<int>(threadIdx.x); dst < nRanks; dst += static_cast<int>(blockDim.x)) {
+    if (dst == rank) {
+      continue;
+    }
+    gin.signal(world, dst, ncclGin_WeakSignalInc{doneSignal});
+  }
+}
+
 template <typename T>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
   __global__ void ginAllReduceTwoShotKernel(struct ncclDevComm devComm, ncclWindow_t sendWin, size_t sendOff,
-                                            ncclWindow_t recvWin, size_t recvOff, size_t countPerRank, int nRanks,
+                                            ncclWindow_t recvWin, size_t recvOff, ncclWindow_t scratchWin,
+                                            size_t scratchOff, size_t countPerRank, int nRanks,
                                             uint32_t* intraGpuCtaBar) {
   constexpr int ginContext = 0;
 
@@ -274,7 +595,10 @@ __launch_bounds__(512)
   const size_t globalElemOff = static_cast<size_t>(devComm.rank) * countPerRank;
   const size_t sliceSendByteOff = sendOff + globalElemOff * sizeof(T);
   const size_t sliceRecvByteOff = recvOff + static_cast<size_t>(devComm.rank) * rankChunkStride;
-  T* reducedOut = reinterpret_cast<T*>(ncclGetLocalPointer(recvWin, sliceRecvByteOff));
+  // Reduced column lives in a dedicated symmetric window so in-place AllReduce
+  // cannot clobber send data peers are still LSA-reading, and so gin.put's
+  // source is not the user recv buffer.
+  T* reducedOut = reinterpret_cast<T*>(ncclGetLocalPointer(scratchWin, scratchOff));
   const size_t chunkBytes = countPerRank * sizeof(T);
 
   const int tid = static_cast<int>(threadIdx.x + blockIdx.x * blockDim.x);
@@ -283,7 +607,7 @@ __launch_bounds__(512)
 
   bar.sync(cta, cuda::memory_order_acquire);
 
-  // --- Shot 1: multi-CTA LSA reduce-scatter → local recv column ---
+  // --- Shot 1: multi-CTA LSA reduce-scatter → local scratch column ---
   const size_t idxStart = static_cast<size_t>(tid) * countPerThread;
   const size_t idxEnd = countPerRank;
   const size_t idxStride = static_cast<size_t>(nthreads) * countPerThread;
@@ -308,7 +632,7 @@ __launch_bounds__(512)
   // RS stores before CTA 0 GIN-puts the full reduced column.
   ginIntraGpuCtaBarrier(intraGpuCtaBar, static_cast<unsigned>(gridDim.x));
 
-  // --- Shot 2: CTA 0 GIN all-gather of the full reduced column ---
+  // --- Shot 2: CTA 0 GIN all-gather of the scratch column into every recv ---
   // The wait target is relative to a baseline read on the device at launch time, so it stays
   // correct across graph replays: nothing about the expected signal value is fixed on the host.
   if (blockIdx.x == 0) {
@@ -318,16 +642,155 @@ __launch_bounds__(512)
     ginBar.sync(cta, cuda::memory_order_acquire, ncclGinFenceLevel::None);
 
     for (int dst = static_cast<int>(threadIdx.x); dst < nRanks; dst += static_cast<int>(blockDim.x)) {
-      gin.put(world, dst, recvWin, sliceRecvByteOff, recvWin, sliceRecvByteOff, chunkBytes,
+      gin.put(world, dst, recvWin, sliceRecvByteOff, scratchWin, scratchOff, chunkBytes,
               ncclGin_SignalInc{signalIndex});
     }
     gin.waitSignal(cta, signalIndex, signalValue + static_cast<uint64_t>(nRanks));
-  
+
     gin.flush(cta);
 
     ginBar.sync(cta, cuda::memory_order_release, ncclGinFenceLevel::None);
   }
+}
 
+// Two-shot AllReduce over GIN-SDMA. Grid is 56 CTAs x 512 threads.
+//
+// Scratch follows CE AllReduce (512 MiB, NCCL_CE_NUM_SLOTS ping-pong):
+//   Fit:     [peer 0 .. nRanks) full incoming columns (reduced shard is recvbuff)
+//   Staged:  [slot 0: nRanks slots][slot 1: nRanks slots], slot = step % nPhases
+//            Default 512 MiB scratch stages ginScatter messages above 512 MiB.
+//
+// Shot 1: CTA 0 GIN-puts send[dst] into dest's staging slot (dst != myRank).
+// Local reduce is CE: 16B vectors, unroll 4, rank 0..nRanks-1 into recv[myRank]
+// (self from send). Below 512 MiB a step completes scatter before reduce. At
+// 512 MiB+ put of chunk i+1 overlaps reduce of chunk i. CTA 0 GIN all-gathers.
+//
+// Sync: one world acquire so all ranks snapshot GIN signal baselines. Each pipeline
+// step is waitSignal on fused WeakSignalInc (scatter/AG) or a one-way slot-free
+// doorbell — not ginBar.sync or gin.flush. Intra-GPU CTA bars only join the 56 CTAs.
+template <typename T>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+  __global__ void ginAllReduceTwoShotGinScatterKernel(struct ncclDevComm devComm, ncclWindow_t sendWin, size_t sendOff,
+                                                      ncclWindow_t recvWin, size_t recvOff, ncclWindow_t scratchWin,
+                                                      size_t scratchOff, size_t countPerRank, int nRanks,
+                                                      size_t scratchBytes, uint32_t* intraGpuCtaBar) {
+  constexpr int ginContext = 0;
+  constexpr unsigned scatterSignal = 0;
+  constexpr unsigned agSignal = 1;
+  constexpr unsigned doneSignal = 2;
+
+  // gin/ginBar must outlive the first put; only CTA 0 snapshots signals and world-syncs.
+  // Pipeline steps use waitSignal / WeakSignalInc (CE doorbells), not world barriers.
+  ncclGin gin{devComm, ginContext};
+  ncclTeam world = ncclTeamWorld(devComm);
+  ncclCoopCta cta;
+  ncclBarrierSession<ncclCoopCta> ginBar{cta, ncclTeamTagWorld(), gin, blockIdx.x};
+
+  const size_t perRankBytes = countPerRank * sizeof(T);
+  const size_t sliceRecvByteOff = recvOff + static_cast<size_t>(devComm.rank) * perRankBytes;
+  char* scratchBase = reinterpret_cast<char*>(ncclGetLocalPointer(scratchWin, scratchOff));
+  char* reducedOut = reinterpret_cast<char*>(ncclGetLocalPointer(recvWin, sliceRecvByteOff));
+  const char* selfSend = reinterpret_cast<const char*>(ncclGetLocalPointer(sendWin, sendOff)) +
+                         static_cast<size_t>(devComm.rank) * perRankBytes;
+
+  int nChunks = 1;
+  int nPhases = 1;
+  size_t uniformBytes = perRankBytes;
+  size_t lastBytes = perRankBytes;
+  ginAllReduceGinScatterChunkPlan(perRankBytes, nRanks, scratchBytes, &nChunks, &uniformBytes, &lastBytes, &nPhases);
+  const bool staged = ginAllReduceGinScatterStaged(perRankBytes, nRanks, scratchBytes);
+  const size_t slotBytes = staged ? ginAllReduceGinScatterFitSlot(scratchBytes, nRanks, nPhases) : perRankBytes;
+  const size_t incomingStride = staged ? slotBytes : perRankBytes;
+  const bool overlap = (nChunks > 1) && !(staged && nPhases <= 1);
+
+  const uint64_t signalsPerChunk = static_cast<uint64_t>(nRanks - 1);
+  uint64_t scatterValue = 0;
+  uint64_t doneValue = 0;
+  uint64_t agValue = 0;
+
+  // One world acquire so every rank snapshots signal baselines before any put.
+  // Later pipeline steps are waitSignal doorbells (CE), not ginBar.sync.
+  if (blockIdx.x == 0) {
+    scatterValue = gin.readSignal(scatterSignal);
+    doneValue = gin.readSignal(doneSignal);
+    agValue = gin.readSignal(agSignal);
+    ginBar.sync(cta, cuda::memory_order_acquire, ncclGinFenceLevel::None);
+  }
+
+  if (overlap) {
+    if (blockIdx.x == 0) {
+      ginScatterIssuePut(gin, world, devComm.rank, nRanks, scratchWin, scratchOff, sendWin, sendOff, perRankBytes,
+                         slotBytes, uniformBytes, lastBytes, nChunks, nPhases, staged, 0, scatterSignal);
+      ginScatterWaitThread0(gin, scatterSignal, scatterValue + signalsPerChunk);
+    }
+    ginIntraGpuCtaBarrier(intraGpuCtaBar, static_cast<unsigned>(gridDim.x));
+
+    for (int c = 0; c < nChunks; ++c) {
+      if (blockIdx.x == 0 && c + 1 < nChunks) {
+        if (staged && c + 1 >= nPhases) {
+          ginScatterWaitThread0(gin, doneSignal, doneValue + static_cast<uint64_t>(c + 2 - nPhases) * signalsPerChunk);
+          __syncthreads();
+        }
+        ginScatterIssuePut(gin, world, devComm.rank, nRanks, scratchWin, scratchOff, sendWin, sendOff, perRankBytes,
+                           slotBytes, uniformBytes, lastBytes, nChunks, nPhases, staged, c + 1, scatterSignal);
+      }
+      const size_t chunkOff = ginAllReduceGinScatterChunkOff(c, uniformBytes);
+      const size_t chunkBytes = ginAllReduceGinScatterChunkSize(c, nChunks, uniformBytes, lastBytes);
+      const size_t elemStart = chunkOff / sizeof(T);
+      const size_t elemEnd = elemStart + chunkBytes / sizeof(T);
+      const int slot = staged ? ((nPhases <= 1) ? 0 : (c % nPhases)) : 0;
+      ginScatterReduceChunk<T>(selfSend, ginScatterIncomingBase(scratchBase, nRanks, slotBytes, slot, staged),
+                               reducedOut, devComm.rank, nRanks, incomingStride, elemStart, elemEnd, staged);
+      if (blockIdx.x == 0 && c + 1 < nChunks) {
+        ginScatterWaitThread0(gin, scatterSignal, scatterValue + static_cast<uint64_t>(c + 2) * signalsPerChunk);
+      }
+      ginIntraGpuCtaBarrier(intraGpuCtaBar, static_cast<unsigned>(gridDim.x));
+      if (blockIdx.x == 0 && staged && c + nPhases < nChunks) {
+        ginScatterNotifySlotFree(gin, world, devComm.rank, nRanks, doneSignal);
+        __syncthreads();
+      }
+    }
+  } else {
+    for (int c = 0; c < nChunks; ++c) {
+      if (blockIdx.x == 0) {
+        if (c > 0 && staged) {
+          ginScatterWaitThread0(gin, doneSignal, doneValue + static_cast<uint64_t>(c) * signalsPerChunk);
+          __syncthreads();
+        }
+        ginScatterIssuePut(gin, world, devComm.rank, nRanks, scratchWin, scratchOff, sendWin, sendOff, perRankBytes,
+                           slotBytes, uniformBytes, lastBytes, nChunks, nPhases, staged, c, scatterSignal);
+        ginScatterWaitThread0(gin, scatterSignal, scatterValue + static_cast<uint64_t>(c + 1) * signalsPerChunk);
+      }
+      ginIntraGpuCtaBarrier(intraGpuCtaBar, static_cast<unsigned>(gridDim.x));
+      const size_t chunkOff = ginAllReduceGinScatterChunkOff(c, uniformBytes);
+      const size_t chunkBytes = ginAllReduceGinScatterChunkSize(c, nChunks, uniformBytes, lastBytes);
+      const size_t elemStart = chunkOff / sizeof(T);
+      const size_t elemEnd = elemStart + chunkBytes / sizeof(T);
+      const int slot = staged ? ((nPhases <= 1) ? 0 : (c % nPhases)) : 0;
+      ginScatterReduceChunk<T>(selfSend, ginScatterIncomingBase(scratchBase, nRanks, slotBytes, slot, staged),
+                               reducedOut, devComm.rank, nRanks, incomingStride, elemStart, elemEnd, staged);
+      ginIntraGpuCtaBarrier(intraGpuCtaBar, static_cast<unsigned>(gridDim.x));
+      if (blockIdx.x == 0 && staged && c + 1 < nChunks) {
+        ginScatterNotifySlotFree(gin, world, devComm.rank, nRanks, doneSignal);
+        __syncthreads();
+      }
+    }
+  }
+
+  if (blockIdx.x == 0) {
+    // Shot 2: waitSignal on fused AG puts is the completion doorbell; no world barrier.
+    for (int dst = static_cast<int>(threadIdx.x); dst < nRanks; dst += static_cast<int>(blockDim.x)) {
+      if (dst == devComm.rank) {
+        continue;
+      }
+      gin.put(world, dst, recvWin, sliceRecvByteOff, recvWin, sliceRecvByteOff, perRankBytes,
+              ncclGin_WeakSignalInc{agSignal});
+    }
+    ginScatterWaitThread0(gin, agSignal, agValue + static_cast<uint64_t>(nRanks - 1));
+    __syncthreads();
+  }
 }
 
 } // namespace gin::sdma

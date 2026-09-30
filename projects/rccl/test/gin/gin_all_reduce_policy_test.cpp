@@ -26,26 +26,36 @@ size_t countForBytes(size_t bytes, size_t typeSize = kFloat) { return bytes / ty
 TEST(GinAllReducePolicy, ThresholdsMatchDocumentedBands) {
   EXPECT_EQ(kGinAllReduceMinBytes, static_cast<int>(512 * kKiB));
   EXPECT_EQ(kGinAllReduceLsaOneShotMaxBytes, 4ull * kMiB);
-  EXPECT_EQ(kGinAllReduceGinTwoShotMinBytes, 256ull * kMiB);
+  EXPECT_EQ(kGinAllReduceGinTwoShotMinBytes, 64ull * kMiB);
+  EXPECT_EQ(kGinAllReduceGinScatterMinBytes, 64ull * kMiB);
+  EXPECT_EQ(kGinAllReduceGinScatterPipelineMinBytes, 512ull * kMiB);
+  EXPECT_EQ(kGinAllReduceGinScatterMaxBytes, 4ull * 1024ull * kMiB);
   EXPECT_EQ(kGinAllReduceMaxRanks, 8);
+  EXPECT_EQ(kGinAllReduceLsaCtas, 56);
+  EXPECT_EQ(kGinAllReduceSymRsGinAgCtas, 64);
+  EXPECT_EQ(kGinAllReduceSymRsGinAgThreadsPerCta, 256);
   EXPECT_EQ(kGinAllReduceMinPutBytes, 128u);
+  EXPECT_EQ(kGinAllReduceTwoShotScratchBytes, 512ull * kMiB);
+  EXPECT_EQ(kGinAllReduceGinScatterChunkBytes, 16ull * kMiB);
+  EXPECT_EQ(kGinAllReduceGinScatterNumSlots, 2);
 }
 
-TEST(GinAllReducePolicy, DefaultRejectsBelow256MiB) {
+TEST(GinAllReducePolicy, DefaultRejectsBelow64MiB) {
   EXPECT_FALSE(ginAllReduceSizePolicyEligible(countForBytes(4 * kMiB), kFloat, kRanks, false));
   EXPECT_FALSE(ginAllReduceSizePolicyEligible(countForBytes(8 * kMiB), kFloat, kRanks, false));
-  EXPECT_FALSE(ginAllReduceSizePolicyEligible(countForBytes(128 * kMiB), kFloat, kRanks, false));
-  EXPECT_FALSE(ginAllReduceSizePolicyEligible(countForBytes(256 * kMiB - 16), kFloat, kRanks, false));
+  EXPECT_FALSE(ginAllReduceSizePolicyEligible(countForBytes(32 * kMiB), kFloat, kRanks, false));
+  EXPECT_FALSE(ginAllReduceSizePolicyEligible(countForBytes(64 * kMiB - 16), kFloat, kRanks, false));
 }
 
-TEST(GinAllReducePolicy, DefaultAcceptsAligned256MiB) {
+TEST(GinAllReducePolicy, DefaultAcceptsAligned64MiB) {
+  EXPECT_TRUE(ginAllReduceSizePolicyEligible(countForBytes(64 * kMiB), kFloat, kRanks, false));
   EXPECT_TRUE(ginAllReduceSizePolicyEligible(countForBytes(256 * kMiB), kFloat, kRanks, false));
   EXPECT_TRUE(ginAllReduceSizePolicyEligible(countForBytes(512 * kMiB), kFloat, kRanks, false));
 }
 
-TEST(GinAllReducePolicy, DefaultRejectsUnaligned256MiB) {
+TEST(GinAllReducePolicy, DefaultRejectsUnaligned64MiB) {
   // count not divisible by nRanks
-  EXPECT_FALSE(ginAllReduceSizePolicyEligible(countForBytes(256 * kMiB) + 1, kFloat, kRanks, false));
+  EXPECT_FALSE(ginAllReduceSizePolicyEligible(countForBytes(64 * kMiB) + 1, kFloat, kRanks, false));
 }
 
 TEST(GinAllReducePolicy, ForceRejectsBelowMinBytes) {
@@ -84,18 +94,18 @@ TEST(GinAllReducePolicy, ForceAcceptsAlignedGinTwoShot) {
   EXPECT_TRUE(ginAllReduceSizePolicyEligible(countForBytes(256 * kMiB), kFloat, kRanks, true));
 }
 
-TEST(GinAllReducePolicy, HalfAndBf16Default256MiB) {
+TEST(GinAllReducePolicy, HalfAndBf16Default64MiB) {
   constexpr size_t kHalf = 2;
-  EXPECT_FALSE(ginAllReduceSizePolicyEligible(countForBytes(128 * kMiB, kHalf), kHalf, kRanks, false));
-  EXPECT_TRUE(ginAllReduceSizePolicyEligible(countForBytes(256 * kMiB, kHalf), kHalf, kRanks, false));
+  EXPECT_FALSE(ginAllReduceSizePolicyEligible(countForBytes(32 * kMiB, kHalf), kHalf, kRanks, false));
+  EXPECT_TRUE(ginAllReduceSizePolicyEligible(countForBytes(64 * kMiB, kHalf), kHalf, kRanks, false));
 }
 
 TEST(GinAllReducePolicy, YieldToDdaBySize) {
   EXPECT_TRUE(ginAllReduceYieldToDdaBySize(countForBytes(4 * kMiB), kFloat, false));
-  EXPECT_TRUE(ginAllReduceYieldToDdaBySize(countForBytes(255 * kMiB), kFloat, false));
-  EXPECT_FALSE(ginAllReduceYieldToDdaBySize(countForBytes(256 * kMiB), kFloat, false));
+  EXPECT_TRUE(ginAllReduceYieldToDdaBySize(countForBytes(63 * kMiB), kFloat, false));
+  EXPECT_FALSE(ginAllReduceYieldToDdaBySize(countForBytes(64 * kMiB), kFloat, false));
   EXPECT_FALSE(ginAllReduceYieldToDdaBySize(countForBytes(4 * kMiB), kFloat, true));
-  EXPECT_FALSE(ginAllReduceYieldToDdaBySize(countForBytes(256 * kMiB), kFloat, true));
+  EXPECT_FALSE(ginAllReduceYieldToDdaBySize(countForBytes(64 * kMiB), kFloat, true));
 }
 
 TEST(GinAllReducePolicy, TwoShotRejectsZeroRanks) {
@@ -105,6 +115,150 @@ TEST(GinAllReducePolicy, TwoShotRejectsZeroRanks) {
 
 TEST(GinAllReducePolicy, TwoShotRejectsCountNotDivisibleByRanks) {
   EXPECT_FALSE(ginAllReduceTwoShotEligible(7, kFloat, kRanks));
+}
+
+TEST(GinAllReducePolicy, GinScatterLaunchFrom64MiB) {
+  const size_t scratch = kGinAllReduceTwoShotScratchBytes;
+  const size_t chunk64 = (64ull * kMiB) / kRanks;
+  const size_t chunk256 = (256ull * kMiB) / kRanks;
+  const size_t chunk512 = (512ull * kMiB) / kRanks;
+  EXPECT_FALSE(ginAllReduceGinScatterLaunch(64ull * kMiB - 16, chunk64, kRanks, scratch));
+  EXPECT_TRUE(ginAllReduceGinScatterLaunch(64ull * kMiB, chunk64, kRanks, scratch));
+  EXPECT_TRUE(ginAllReduceGinScatterLaunch(256ull * kMiB, chunk256, kRanks, scratch));
+  EXPECT_TRUE(ginAllReduceGinScatterLaunch(512ull * kMiB, chunk512, kRanks, scratch));
+  EXPECT_TRUE(ginAllReduceGinScatterLaunch(2ull * 1024ull * kMiB, 256ull * kMiB, kRanks, scratch));
+  EXPECT_TRUE(ginAllReduceGinScatterLaunch(kGinAllReduceGinScatterMaxBytes, 512ull * kMiB, kRanks, scratch));
+}
+
+TEST(GinAllReducePolicy, GinScatterLaunchWhenMessageExceedsScratch) {
+  const size_t chunk4g = kGinAllReduceGinScatterMaxBytes / kRanks;
+  // 512 MiB scratch cannot hold 8 * 512 MiB incoming columns, but one 64 MiB slot fits.
+  EXPECT_TRUE(ginAllReduceGinScatterLaunch(kGinAllReduceGinScatterMaxBytes, chunk4g, kRanks, 512ull * kMiB));
+  const size_t minScratch = ginAllReduceGinScatterStagedScratchBytes(kGinAllReduceGinScatterChunkAlign, kRanks, 1);
+  EXPECT_TRUE(ginAllReduceGinScatterLaunch(64ull * kMiB, (64ull * kMiB) / kRanks, kRanks, minScratch));
+  EXPECT_FALSE(ginAllReduceGinScatterLaunch(64ull * kMiB, (64ull * kMiB) / kRanks, kRanks, minScratch - 1));
+}
+
+TEST(GinAllReducePolicy, GinScatterDefaultScratchStagesAbove512MiB) {
+  const size_t scratch = kGinAllReduceTwoShotScratchBytes;
+  EXPECT_FALSE(ginAllReduceGinScatterStaged((64ull * kMiB) / kRanks, kRanks, scratch));
+  EXPECT_FALSE(ginAllReduceGinScatterStaged((256ull * kMiB) / kRanks, kRanks, scratch));
+  EXPECT_FALSE(ginAllReduceGinScatterStaged((512ull * kMiB) / kRanks, kRanks, scratch));
+  EXPECT_TRUE(ginAllReduceGinScatterStaged((1024ull * kMiB) / kRanks, kRanks, scratch));
+  EXPECT_TRUE(ginAllReduceGinScatterStaged((2ull * 1024ull * kMiB) / kRanks, kRanks, scratch));
+  EXPECT_TRUE(ginAllReduceGinScatterStaged(kGinAllReduceGinScatterMaxBytes / kRanks, kRanks, scratch));
+}
+
+TEST(GinAllReducePolicy, GinScatterStagesWhenMessageExceedsScratch) {
+  int nChunks = 0;
+  int nPhases = 0;
+  size_t uniformBytes = 0;
+  size_t lastBytes = 0;
+  // Sequential window of 16 MiB slots: 8 * 16 MiB. 32 MiB/rank (256 MiB total) must stage; < 512 MiB so no overlap.
+  const size_t smallSeq = ginAllReduceGinScatterStagedScratchBytes(kGinAllReduceGinScatterChunkBytes, kRanks, 1);
+  ginAllReduceGinScatterChunkPlan(32ull * kMiB, kRanks, smallSeq, &nChunks, &uniformBytes, &lastBytes, &nPhases);
+  EXPECT_EQ(nChunks, 2);
+  EXPECT_EQ(nPhases, 1);
+  EXPECT_EQ(uniformBytes, kGinAllReduceGinScatterChunkBytes);
+  // Ping-pong window of 16 MiB slots: 16 * 16 MiB. 512 MiB/rank (4 GiB total) pipelines at >= 512 MiB.
+  const size_t smallPipe = ginAllReduceGinScatterStagedScratchBytes(kGinAllReduceGinScatterChunkBytes, kRanks, 2);
+  ginAllReduceGinScatterChunkPlan(512ull * kMiB, kRanks, smallPipe, &nChunks, &uniformBytes, &lastBytes, &nPhases);
+  EXPECT_EQ(nChunks, 32);
+  EXPECT_EQ(nPhases, 2);
+  EXPECT_EQ(uniformBytes, kGinAllReduceGinScatterChunkBytes);
+}
+
+TEST(GinAllReducePolicy, GinScatterNoPipelineBelow512MiB) {
+  int nChunks = 0;
+  int nPhases = 0;
+  size_t uniformBytes = 0;
+  size_t lastBytes = 0;
+  const size_t scratch = kGinAllReduceTwoShotScratchBytes;
+  ginAllReduceGinScatterChunkPlan((64ull * kMiB) / kRanks, kRanks, scratch, &nChunks, &uniformBytes, &lastBytes,
+                                  &nPhases);
+  EXPECT_EQ(nChunks, 1);
+  EXPECT_EQ(nPhases, 1);
+  EXPECT_EQ(uniformBytes, 8ull * kMiB);
+  ginAllReduceGinScatterChunkPlan(32ull * kMiB, kRanks, scratch, &nChunks, &uniformBytes, &lastBytes, &nPhases);
+  EXPECT_EQ(nChunks, 1);
+  EXPECT_EQ(nPhases, 1);
+  EXPECT_EQ(uniformBytes, 32ull * kMiB);
+  ginAllReduceGinScatterChunkPlan(63ull * kMiB, kRanks, scratch, &nChunks, &uniformBytes, &lastBytes, &nPhases);
+  EXPECT_EQ(nChunks, 1);
+  EXPECT_EQ(nPhases, 1);
+}
+
+TEST(GinAllReducePolicy, GinScatterChunksOverlapAt512MiB) {
+  // 8 ranks, 512 MiB → 64 MiB per rank. Fits in scratch; 16 MiB full-slot stages.
+  int nChunks = 0;
+  int nPhases = 0;
+  size_t uniformBytes = 0;
+  size_t lastBytes = 0;
+  ginAllReduceGinScatterChunkPlan(64ull * kMiB, kRanks, kGinAllReduceTwoShotScratchBytes, &nChunks, &uniformBytes,
+                                  &lastBytes, &nPhases);
+  EXPECT_EQ(nChunks, 4);
+  EXPECT_EQ(nPhases, 1);
+  EXPECT_EQ(uniformBytes, kGinAllReduceGinScatterChunkBytes);
+  EXPECT_EQ(lastBytes, kGinAllReduceGinScatterChunkBytes);
+}
+
+TEST(GinAllReducePolicy, GinScatterStagedPingPongAt1GiB) {
+  // 8 ranks, 1 GiB → 128 MiB per rank. 512 MiB scratch ping-pongs 32 MiB slots.
+  int nChunks = 0;
+  int nPhases = 0;
+  size_t uniformBytes = 0;
+  size_t lastBytes = 0;
+  ginAllReduceGinScatterChunkPlan(128ull * kMiB, kRanks, kGinAllReduceTwoShotScratchBytes, &nChunks, &uniformBytes,
+                                  &lastBytes, &nPhases);
+  EXPECT_EQ(nChunks, 4);
+  EXPECT_EQ(nPhases, 2);
+  EXPECT_EQ(uniformBytes, 32ull * kMiB);
+  EXPECT_EQ(lastBytes, 32ull * kMiB);
+}
+
+TEST(GinAllReducePolicy, GinScatterSingleChunkWhenAtMostChunkSize) {
+  int nChunks = 0;
+  int nPhases = 0;
+  size_t uniformBytes = 0;
+  size_t lastBytes = 0;
+  ginAllReduceGinScatterChunkPlan(kGinAllReduceGinScatterChunkBytes, kRanks, kGinAllReduceTwoShotScratchBytes, &nChunks,
+                                  &uniformBytes, &lastBytes, &nPhases);
+  EXPECT_EQ(nChunks, 1);
+  EXPECT_EQ(nPhases, 1);
+  EXPECT_EQ(uniformBytes, kGinAllReduceGinScatterChunkBytes);
+  ginAllReduceGinScatterChunkPlan(0, kRanks, kGinAllReduceTwoShotScratchBytes, &nChunks, &uniformBytes, &lastBytes,
+                                  &nPhases);
+  EXPECT_EQ(nChunks, 1);
+  EXPECT_EQ(uniformBytes, 0u);
+}
+
+TEST(GinAllReducePolicy, GinScatterChunksTilePerRankBytes) {
+  const size_t perRank = 132ull * kMiB; // 8 ranks → 1056 MiB >= 512 MiB, staged through 32 MiB slots.
+  int nChunks = 0;
+  int nPhases = 0;
+  size_t uniformBytes = 0;
+  size_t lastBytes = 0;
+  ginAllReduceGinScatterChunkPlan(perRank, kRanks, kGinAllReduceTwoShotScratchBytes, &nChunks, &uniformBytes, &lastBytes,
+                                  &nPhases);
+  EXPECT_GT(nChunks, 1);
+  EXPECT_EQ(nChunks, 5);
+  EXPECT_EQ(nPhases, 2);
+  EXPECT_EQ(uniformBytes, 32ull * kMiB);
+  EXPECT_EQ(lastBytes, 4ull * kMiB);
+  EXPECT_EQ(uniformBytes * static_cast<size_t>(nChunks - 1) + lastBytes, perRank);
+  EXPECT_EQ(ginAllReduceGinScatterChunkOff(nChunks - 1, uniformBytes),
+            uniformBytes * static_cast<size_t>(nChunks - 1));
+  EXPECT_EQ(ginAllReduceGinScatterChunkSize(0, nChunks, uniformBytes, lastBytes), uniformBytes);
+  EXPECT_EQ(ginAllReduceGinScatterChunkSize(nChunks - 1, nChunks, uniformBytes, lastBytes), lastBytes);
+}
+
+TEST(GinAllReducePolicy, GinScatterScratchIsIncomingSlots) {
+  EXPECT_EQ(ginAllReduceGinScatterScratchBytes(32ull * kMiB, kRanks), 8ull * 32ull * kMiB);
+  EXPECT_EQ(ginAllReduceGinScatterStagedScratchBytes(8ull * kMiB, kRanks, 2), 16ull * 8ull * kMiB);
+  EXPECT_EQ(ginAllReduceGinScatterScratchBytes(16, 1), 16u);
+  EXPECT_EQ(ginAllReduceGinScatterScratchBytes(16, 0), 0u);
+  EXPECT_EQ(ginAllReduceGinScatterFitSlot(kGinAllReduceTwoShotScratchBytes, kRanks, 1), 64ull * kMiB);
+  EXPECT_EQ(ginAllReduceGinScatterFitSlot(kGinAllReduceTwoShotScratchBytes, kRanks, 2), 32ull * kMiB);
 }
 
 } // namespace
