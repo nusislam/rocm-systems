@@ -1034,7 +1034,7 @@ ncclResult_t ncclAlltoAllvValidatePeerSendSize(size_t sendBytes, size_t peerRecv
   return ncclSuccess;
 }
 
-ncclResult_t ncclCeAlltoAllv(struct ncclComm* comm, struct ncclCeCollArgs* args, cudaStream_t stream) {
+/*ncclResult_t ncclCeAlltoAllv(struct ncclComm* comm, struct ncclCeCollArgs* args, cudaStream_t stream) {
   ncclResult_t ret = ncclSuccess;
 
   if (args->sizes == nullptr) {
@@ -1113,7 +1113,107 @@ exit:
   return ret;
 fail:
   goto exit;
+}*/
+
+ncclResult_t ncclCeAlltoAllv(struct ncclComm* comm, struct ncclCeCollArgs* args, cudaStream_t stream) {
+  ncclResult_t ret = ncclSuccess;
+
+  if (args->sizes == nullptr) {
+    WARN("CE AlltoAllv: missing size metadata");
+    return ncclInvalidUsage;
+  }
+
+  const int nRanks = comm->nRanks;
+  const int freq = (int)comm->ceColl.intraBatchSyncFreq;
+  const uint64_t threshold = comm->ceColl.intraBatchSyncMsgThreshold;
+
+  size_t* sendSizes = ncclAlltoAllvSendSizes(args->sizes, comm->rank, nRanks);
+  size_t* sendDispls = ncclAlltoAllvSendDispls(args->sizes, comm->rank, nRanks);
+  size_t* recvDispls = ncclAlltoAllvRecvDispls(args->sizes, comm->rank, nRanks);
+  size_t peerDispls = 0;
+
+  uint8_t* mySendBuff = (uint8_t*)args->sendBuff;
+  uint8_t* myRecvBuff = (uint8_t*)args->recvBuff;
+  void* peerRecvBuff;
+  size_t offset, winOff;
+  struct ncclCeBatchOpsParams batchOpsParams = {};
+  bool roundSync = false;
+
+  NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&batchOpsParams, nRanks), ret, fail);
+  NCCLCHECKGOTO(ncclAlltoAllvValidateSizeMatrix(args->sizes, nRanks), ret, fail);
+
+  // ncclMemOpSync is collective. Barrier on destination-slot rounds, which
+  // every rank executes the same number of times. Gating on this rank's
+  // compacted numOps (zeros skipped) or its own byte total deadlocks once
+  // nRanks > intraBatchSyncFreq. intraBatchSync stays false so
+  // ncclCeLaunchBatchOps does not add further barriers.
+  if (freq > 0 && nRanks > freq) {
+    for (int src = 0; src < nRanks && !roundSync; src++) {
+      size_t* srcSizes = ncclAlltoAllvSendSizes(args->sizes, src, nRanks);
+      size_t bytes = 0;
+      int ops = 0;
+      for (int dst = 0; dst < nRanks; dst++) {
+        if (srcSizes[dst] == 0) continue;
+        ops++;
+        bytes += srcSizes[dst];
+      }
+      if (ops > freq && bytes >= threshold) roundSync = true;
+    }
+  }
+
+  NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+
+  batchOpsParams.intraBatchSync = false;
+  for (int r = 0; r < nRanks; r++) {
+    int dstRank = (comm->rank + r) % nRanks;
+    const size_t chunkBytes = sendSizes[dstRank];
+    if (chunkBytes != 0) {
+      uint8_t* srcPtr = mySendBuff + sendDispls[dstRank];
+      uint8_t* dstPtr = myRecvBuff + recvDispls[comm->rank];
+
+      if (dstRank == comm->rank) {
+        if (srcPtr != dstPtr) {
+          batchOpsParams.srcs[batchOpsParams.numOps] = (void*)srcPtr;
+          batchOpsParams.dsts[batchOpsParams.numOps] = (void*)dstPtr;
+          batchOpsParams.sizes[batchOpsParams.numOps] = chunkBytes;
+          batchOpsParams.numOps++;
+        }
+      } else {
+        size_t* peerRecvDispls = ncclAlltoAllvRecvDispls(args->sizes, dstRank, nRanks);
+        peerDispls = peerRecvDispls[comm->rank];
+
+        uint8_t* peerDst = (uint8_t*)myRecvBuff + peerDispls;
+        offset = peerDst - (uint8_t*)args->recvBuff;
+        winOff = offset + ((uint8_t*)args->recvBuff - (uint8_t*)args->recvWin->userPtr);
+
+        NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, args->recvWin, winOff, dstRank, &peerRecvBuff), ret, fail);
+
+        batchOpsParams.srcs[batchOpsParams.numOps] = (void*)srcPtr;
+        batchOpsParams.dsts[batchOpsParams.numOps] = (void*)peerRecvBuff;
+        batchOpsParams.sizes[batchOpsParams.numOps] = chunkBytes;
+        batchOpsParams.numOps++;
+      }
+    }
+
+    bool flush = (r + 1 == nRanks) || (roundSync && freq > 0 && ((r + 1) % freq == 0));
+    if (flush) {
+      NCCLCHECKGOTO(ncclCeLaunchBatchOps(comm, &batchOpsParams, stream, args), ret, fail);
+      batchOpsParams.numOps = 0;
+      if (roundSync && (r + 1) < nRanks) {
+        NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+      }
+    }
+  }
+
+  NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+
+exit:
+  ncclCeFreeBatchOpsParams(&batchOpsParams);
+  return ret;
+fail:
+  goto exit;
 }
+
 
 // Scatter across the LSA team (intra-node only).
 ncclResult_t ncclCeScatter(struct ncclComm* comm, struct ncclCeCollArgs* args, cudaStream_t stream) {
