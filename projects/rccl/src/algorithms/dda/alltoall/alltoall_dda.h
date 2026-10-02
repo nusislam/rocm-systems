@@ -15,7 +15,7 @@
 
 namespace dda::common {
 
-template <typename T, int NRANKS, bool hasAcc, bool kStagingCopyInKernel = false>
+template <typename T, int NRANKS, bool hasAcc>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
@@ -33,16 +33,14 @@ __launch_bounds__(512)
   const auto idxEnd = countPerRank;
   const auto idxStride = gridDim.x * blockDim.x * countPerThread;
 
-  if constexpr (kStagingCopyInKernel) {
-    // Small messages: fuse sendbuff -> scratch copy into the kernel to avoid
-    // cudaMemcpyAsync launch overhead on ROCm.
-    const size_t copyCount = count * NRANKS;
-    copyFromSrcToDest<T>(sendbuff, ipcbuffs[selfRank], idxStart, copyCount, idxStride);
-    barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
-  } else {
-    // Large messages: host enqueues cudaMemcpyAsync into ddaScratch before launch.
-    barrier.syncOnSameBlockIdx<false /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+  // hipMemcpyAsync is expensive on ROCm. Copy this block's slice of every rank
+  // chunk; peers read that same slice, so the same-blockIdx barrier publishes it.
+#pragma unroll NRANKS
+  for (int s = 0; s < NRANKS; ++s) {
+    const size_t off = static_cast<size_t>(s) * countPerRank;
+    copyFromSrcToDest<T>(sendbuff + off, ipcbuffs[selfRank] + off, idxStart, idxEnd, idxStride);
   }
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
 
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
 #pragma unroll NRANKS
