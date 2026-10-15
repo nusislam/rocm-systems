@@ -38,23 +38,26 @@ constexpr size_t ddaLL128RsSlotWords(size_t bankSize, int nRanks) {
   return ddaLL128SlotWords(bankSize, nRanks, 1);
 }
 
-// Fixed-width peer staging for phase 1: unlike one-shot all-reduce, each peer
-// receives a different shard, so the pack cannot be hoisted out of the peer
-// loop. Loading a batch before storing it keeps the per-peer streams overlapped
-// -- interleaved, every store waits on the next pack. 8 covers rank counts 4
-// and 8 in one pass; the rank test is a predicate on a fixed trip count so both
-// loops unroll and the unused entries fold away when NRANKS_CT is known.
-constexpr int kDdaLL128RsPeerBatch = 8;
+// Most peers a block stores to before draining. Rank counts 4 and 8 are one
+// wave; larger cliques take several. The rank test is a predicate on a fixed
+// trip count so both inner loops unroll and the unused entries fold away when
+// NRANKS_CT is known. Loading a wave before storing it overlaps the packs.
+constexpr int kDdaLL128RsFanout = 8;
 
 // LL128 reduce-scatter kernel. One warp owns one slice of a shard at a time, so
 // the launcher sizes the grid on the shard's slices, not the message's.
 //
 // Phase 1 (scatter): send peer p the shard p owns, into p's scratch at slot
-// selfRank, as LL128 lines carrying the epoch flag.
+// selfRank, as LL128 lines carrying the epoch flag. Peers go out in waves of
+// kDdaLL128RsFanout. Every warp finishes the wave, waits until those stores
+// have retired, then the block opens the next wave, so a CU has remote stores
+// in flight to at most 8 peers.
 // Phase 2 (reduce): poll my slot for each peer's copy of my shard, sum with my
-// own, and unpack the result into recvbuff.
+// own, and unpack the result into recvbuff. Those polls read this rank's own
+// scratch; the remote stores landed in phase 1.
 //
-// Flag polling provides all the cross-rank ordering, so no GPU barrier is used.
+// Flag polling provides all the cross-rank ordering. The barrier between waves
+// only keeps this block on one set of 8 peers; it does not order other ranks.
 // Scratch is double buffered: bank = flag & 1. Self does not round-trip through
 // scratch; its contribution seeds the accumulator straight from sendbuff.
 //
@@ -101,17 +104,19 @@ __launch_bounds__(512)
   int8_t* dstBytes = reinterpret_cast<int8_t*>(recvbuff);
   const uint64_t* gatherBase = reinterpret_cast<const uint64_t*>(peerScratch[selfRank]) + bankWords;
 
-  // Phase 1: send each peer the shard that peer owns.
-  for (size_t s = gwarp; s < slicesTotal; s += wstride) {
-    const size_t sliceByte = s * (size_t)kDdaLL128DataBytesPerSlice;
-    const size_t rem = shardBytes - sliceByte;
-    const int eltInSlice = rem < (size_t)kDdaLL128DataBytesPerSlice ? (int)rem : kDdaLL128DataBytesPerSlice;
-    const size_t wireOff = s * (size_t)kDdaLL128WireWordsPerSlice + 2 * lane;
+  // Phase 1: send each peer the shard that peer owns, one fanout wave at a time.
+  // The wave loop is outside the slice loop and every warp runs every wave, so
+  // the barrier below is uniform when the last slices do not fill the grid.
+  for (int base = 1; base < nRanks; base += kDdaLL128RsFanout) {
+    for (size_t s = gwarp; s < slicesTotal; s += wstride) {
+      const size_t sliceByte = s * (size_t)kDdaLL128DataBytesPerSlice;
+      const size_t rem = shardBytes - sliceByte;
+      const int eltInSlice = rem < (size_t)kDdaLL128DataBytesPerSlice ? (int)rem : kDdaLL128DataBytesPerSlice;
+      const size_t wireOff = s * (size_t)kDdaLL128WireWordsPerSlice + 2 * lane;
 
-    for (int base = 1; base < nRanks; base += kDdaLL128RsPeerBatch) {
-      uint64_t regs[kDdaLL128RsPeerBatch][kDdaLL128WordsPerThread] = {};
+      uint64_t regs[kDdaLL128RsFanout][kDdaLL128WordsPerThread] = {};
 #pragma unroll
-      for (int i = 0; i < kDdaLL128RsPeerBatch; ++i) {
+      for (int i = 0; i < kDdaLL128RsFanout; ++i) {
         const int r = base + i;
         if (r < nRanks) {
           const int peer = (selfRank + r) % nRanks;
@@ -120,7 +125,7 @@ __launch_bounds__(512)
         }
       }
 #pragma unroll
-      for (int i = 0; i < kDdaLL128RsPeerBatch; ++i) {
+      for (int i = 0; i < kDdaLL128RsFanout; ++i) {
         const int r = base + i;
         if (r < nRanks) {
           const int peer = (selfRank + r) % nRanks;
@@ -130,6 +135,11 @@ __launch_bounds__(512)
         }
       }
     }
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+    // Retire this wave's remote stores before any warp opens the next 8 peers.
+    asm volatile("s_wait_storecnt 0x0" ::: "memory");
+#endif
+    __syncthreads();
   }
 
   // Phase 2: fold every copy of my shard into recvbuff.
