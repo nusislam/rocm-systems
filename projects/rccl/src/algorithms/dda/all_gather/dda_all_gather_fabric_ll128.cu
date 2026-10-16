@@ -53,29 +53,29 @@ unsigned ddaLL128AGThreads(unsigned blockSize) {
   return blockSize;
 }
 
-// Blocks in one peer column: a warp per slice, capped by the column's share of
-// the grid budget.
-unsigned ddaLL128AGBlocksPerPeer(size_t slices, size_t warps, int nPeers, size_t totalBlockCap) {
-  const size_t cap = totalBlockCap / (size_t)nPeers;
-  size_t blocksPerPeer = (slices + warps - 1) / warps;
-  if (blocksPerPeer > cap) {
-    blocksPerPeer = cap;
+// 1D grid: one warp per slice, capped by the CU block budget. Every block talks
+// to every peer, so the cap is not split across a peer column.
+unsigned ddaLL128AGBlocks(size_t slices, size_t warps, size_t totalBlockCap) {
+  size_t blocks = (slices + warps - 1) / warps;
+  if (blocks > totalBlockCap) {
+    blocks = totalBlockCap;
   }
-  return blocksPerPeer < 1 ? 1u : (unsigned)blocksPerPeer;
+  return blocks < 1 ? 1u : (unsigned)blocks;
 }
 
-// Single source of the launch geometry: grid.x = one column per remote peer,
-// grid.y = the per-peer slice split.
+// Single source of the launch geometry. Peer fanout lives in the kernel
+// (kDdaLL128AGFanout); the grid only divides slices across CUs.
 static inline std::pair<dim3, dim3> ddaAllGatherFabricLL128Geom(ncclComm* comm, size_t perRankBytes) {
   const unsigned threads = ddaLL128AGThreads(kDdaLL128AGDefaultThreads);
   const size_t warps = threads / (unsigned)kDdaLL128Warp;
-  const int nPeers = comm->nRanks - 1;
   int nBlocksMax = comm->ddaFabricMaxBlocks;
   if (nBlocksMax < 1) nBlocksMax = 1;
-  if (nBlocksMax < nPeers) nBlocksMax = nPeers;
-  const unsigned blocksPerPeer =
-    ddaLL128AGBlocksPerPeer(ddaLL128Slices(perRankBytes), warps, nPeers, (size_t)nBlocksMax);
-  return std::make_pair(dim3((unsigned)nPeers, blocksPerPeer), dim3(threads));
+  unsigned blocks = ddaLL128AGBlocks(ddaLL128Slices(perRankBytes), warps, (size_t)nBlocksMax);
+  if (comm->ddaLLEpochLen > 0 && (int)blocks > comm->ddaLLEpochLen) {
+    blocks = (unsigned)comm->ddaLLEpochLen;
+    if (blocks < 1) blocks = 1;
+  }
+  return std::make_pair(dim3(blocks), dim3(threads));
 }
 
 template <typename T>
@@ -91,17 +91,18 @@ static ncclResult_t ncclAllGatherDdaFabricLL128Typed(
   auto gridBlock = ddaAllGatherFabricLL128Geom(comm, perRankBytes);
   const dim3 grid = gridBlock.first;
   const dim3 block = gridBlock.second;
-  const unsigned blocksPerPeer = grid.y;
+  const int nPeers = nRanks - 1;
+  const int fanout = dda::common::kDdaLL128AGFanout;
+  const int nBatches = nPeers > 0 ? (nPeers + fanout - 1) / fanout : 0;
 
   T** peers = reinterpret_cast<T**>(comm->ddaPeerPtrsDev);
   uint32_t* epochDev = comm->ddaLLEpochDev;
   const int epochLen = comm->ddaLLEpochLen;
 
   INFO(NCCL_COLL,
-       "DDA fabric AllGather LL128: nRanks=%d perRankBytes=%zu slices=%zu grid=%ux%u block=%u "
-       "(warp-per-slice, bpp=%u, slotWords=%zu)",
-       nRanks, perRankBytes, slices, grid.x, grid.y, block.x, blocksPerPeer,
-       ddaLL128AgSlotWords(bankSize, nRanks));
+       "DDA fabric AllGather LL128: nRanks=%d perRankBytes=%zu slices=%zu grid=%u block=%u "
+       "(warp-per-slice, fanout=%d, batches=%d, slotWords=%zu)",
+       nRanks, perRankBytes, slices, grid.x, block.x, fanout, nBatches, ddaLL128AgSlotWords(bankSize, nRanks));
 
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
   // NRANKS_CT 4/8: unrolled; 0: runtime fallback.
