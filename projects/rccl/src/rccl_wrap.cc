@@ -2339,7 +2339,22 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
     // CE ReduceScatter always stages through ceARTmpBuf, so user-buffer symmetric
     // registration is not required (unlike CE AllReduce's registered-window path).
     const bool ceReduceScatterAllowed =
-      ncclGroupDepth == 0 && ceArGraphAllowed && rcclUseCeReduceScatter(comm, recvcount, datatype, op);
+      comm->nNodes == 1 && ncclGroupDepth == 0 && ceArGraphAllowed &&
+      rcclUseCeReduceScatter(comm, recvcount, datatype, op);
+    // Multi-node CE ReduceScatter needs registered user windows: the local
+    // stage reads LSA peers through sendWin and the rail stage uses the
+    // internal symmetric staging window through RMA. Keep this separate from
+    // rcclUseCeReduceScatter(), whose legacy single-node path permits
+    // unregistered buffers because it never leaves the LSA domain.
+    const bool hierCeReduceScatterAllowed =
+      ncclGroupDepth == 0 && ceArGraphAllowed && rcclParamCeReduceScatter() && recvcount != 0 &&
+      (op == ncclSum || op == ncclProd || op == ncclMin || op == ncclMax) && !hasSysmemSegment &&
+      ncclHierCeAvailable(comm, ncclFuncReduceScatter, op, datatype, rsWinRegType, rsSendWin, rsRecvWin);
+    if (!symEligible && hierCeReduceScatterAllowed) {
+      decision->algo = RCCL_CE_REGISTERED;
+      decision->nMaxChannels = ncclCeLocalReduceBlocks(datatype, recvcount);
+      return ncclSuccess;
+    }
     if (!symEligible && ceReduceScatterAllowed && comm->ceColl.ceARTmpBuf != NULL) {
       decision->algo = RCCL_CE_2SHOT;
       decision->nMaxChannels = ncclCeLocalReduceBlocks(datatype, recvcount);

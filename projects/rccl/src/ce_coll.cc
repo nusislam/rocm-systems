@@ -1388,8 +1388,14 @@ bool ncclHierCeAvailable(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRe
     TRACE(NCCL_TUNING, "Skipping hierarchical CE collective: host-backed cuMem segments are not supported");
     return false;
   }
-  if (coll != ncclFuncAllGather && coll != ncclFuncAlltoAll && coll != ncclFuncAlltoAllv) {
-    TRACE(NCCL_TUNING, "Skipping hierarchical CE collective: only AllGather, AlltoAll, and AlltoAllv are supported");
+  if (coll != ncclFuncAllGather && coll != ncclFuncAlltoAll && coll != ncclFuncAlltoAllv &&
+      coll != ncclFuncReduceScatter) {
+    TRACE(NCCL_TUNING,
+          "Skipping hierarchical CE collective: only AllGather, AlltoAll, AlltoAllv, and ReduceScatter are supported");
+    return false;
+  }
+  if (coll == ncclFuncReduceScatter && !rcclParamCeReduceScatter()) {
+    TRACE(NCCL_TUNING, "Skipping hierarchical CE ReduceScatter: RCCL_CE_REDUCESCATTER is disabled");
     return false;
   }
   if (!comm->symmetricSupport) {
@@ -1413,6 +1419,12 @@ bool ncclHierCeAvailable(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRe
   // and not on the large ones, and the answer gates a group join in taskAppend.
   if (ncclTeamLsa(comm).nRanks < comm->maxLocalRanks) {
     TRACE(NCCL_TUNING, "Skipping hierarchical CE collective: LSA team does not cover all local ranks");
+    return false;
+  }
+  const int rsStage0Slots =
+    ncclTeamLsa(comm).nRanks == 1 ? comm->nNodes : ncclTeamLsa(comm).nRanks + comm->nNodes;
+  if (coll == ncclFuncReduceScatter && rsStage0Slots > comm->nRanks) {
+    TRACE(NCCL_TUNING, "Skipping hierarchical CE ReduceScatter: staging layout does not fit the topology");
     return false;
   }
   // Need RMA proxy for inter-node puts, and the internal RMA contexts that back
@@ -2644,6 +2656,216 @@ ncclResult_t ncclHierCeAllGather(struct ncclComm* comm, struct ncclKernelPlan* p
   return ncclHierCeAllGatherDirect(comm, plan, stream);
 }
 
+// Hierarchical ReduceScatter: locally reduce every destination rail's shard,
+// exchange the node partials through the RMA rail, then reduce the received
+// partials on the destination rank.
+//
+// For destination rank (node d, local rank l), each rank (node n, local rank
+// l) first reduces the contributions from all LSA peers on node n for d's
+// shard. The resulting partial is sent to (d, l), where one final local
+// reduction produces the reduce-scatter result. This is the CE counterpart of
+// the LSA-reduce -> rail-A2A -> rail-reduce structure in reduce_scatter_gin.cuh.
+static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKernelPlan* plan,
+                                            cudaStream_t stream) {
+  ncclResult_t ret = ncclSuccess;
+  struct ncclCeCollArgs* args = plan->ceCollArgs;
+  struct ncclCeColl* ceColl = &comm->ceColl;
+  struct ncclRmaProxyState* rmaProxyState = &comm->rmaState.rmaProxyState;
+  const int nNodes = comm->nNodes;
+  const int myNode = comm->node;
+  const int localRank = comm->localRank;
+  const int myLsaRank = comm->devrState.lsaSelf;
+  const int lsaSize = comm->devrState.lsaSize;
+  const int nRanks = comm->nRanks;
+  const int nRemoteNodes = nNodes - 1;
+  const int railCtx = comm->config.numRmaCtx;
+  const bool persistent = plan->persistent;
+  const size_t eltSize = args->eltSize;
+  const size_t shardElems = args->nElts;
+  const size_t shardBytes = shardElems * eltSize;
+  const size_t slotChunkBytes =
+    ncclCeAllReduceSlotChunkBytes(ceColl->ceArStagingBytes / (size_t)nRanks);
+  const size_t slotChunkElems = slotChunkBytes / eltSize;
+  struct ncclCeBatchOpsParams copyOps = {};
+  struct ncclRmaProxyCtx* railProxyCtx = nullptr;
+  int* waitPeers = nullptr;
+
+  if (args->redOp != ncclSum && args->redOp != ncclProd && args->redOp != ncclMin && args->redOp != ncclMax) {
+    WARN("Hierarchical CE ReduceScatter: unsupported reduction operation");
+    return ncclInvalidArgument;
+  }
+  if (args->sendWin == nullptr || ceColl->ceARTmpBuf == nullptr || ceColl->ceARTmpWin == nullptr ||
+      ceColl->signalBuffer == nullptr) {
+    WARN("Hierarchical CE ReduceScatter: staging is not available");
+    return ncclInvalidUsage;
+  }
+  if (shardElems == 0 || slotChunkBytes < eltSize) {
+    WARN("Hierarchical CE ReduceScatter: no valid chunk layout");
+    return ncclInvalidArgument;
+  }
+  // Slot 0 holds lsaSize input shards followed by one local partial per
+  // destination node. With one rank per node the input is already a node
+  // partial, so no stage-0 staging slots are needed. Slot 1 holds the nNodes
+  // partials received for this rank.
+  const int stage0Slots = lsaSize == 1 ? nNodes : lsaSize + nNodes;
+  if (stage0Slots > nRanks) {
+    WARN("Hierarchical CE ReduceScatter: staging layout does not fit (lsaSize %d, nNodes %d, nRanks %d)", lsaSize,
+         nNodes, nRanks);
+    return ncclInvalidUsage;
+  }
+
+  const size_t chunkBytes =
+    shardBytes <= slotChunkBytes ? shardBytes : ncclCeAllReduceChooseChunkBytes(shardBytes, slotChunkBytes);
+  if (chunkBytes == 0) return ncclInvalidArgument;
+  const size_t chunks = DIVUP(shardBytes, chunkBytes);
+  const size_t slotStrideBytes = (size_t)nRanks * slotChunkBytes;
+  uint8_t* const stage0Inputs = ceColl->ceARTmpBuf;
+  uint8_t* const stage1Inputs = ceColl->ceARTmpBuf + slotStrideBytes;
+  const size_t stage1Offset = slotStrideBytes;
+  const size_t sendWinOffset = (const uint8_t*)args->sendBuff - (const uint8_t*)args->sendWin->userPtr;
+
+  railProxyCtx = (struct ncclRmaProxyCtx*)rmaProxyState->rmaProxyCtxs[railCtx];
+  if (railProxyCtx == nullptr || ncclDevrGetRmaWin(ceColl->ceARTmpWin, railProxyCtx->collCommIdx) == nullptr) {
+    WARN("Hierarchical CE ReduceScatter: staging window is not registered with the RMA rail");
+    return ncclInvalidUsage;
+  }
+  if (nRemoteNodes > 0) NCCLCHECKGOTO(ncclCalloc(&waitPeers, nRemoteNodes), ret, fail);
+
+  // The local CE copies below read all LSA peers' user buffers. This entry
+  // barrier also prevents a following invocation from reusing staging early.
+  NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+
+  for (size_t ch = 0; ch < chunks; ch++) {
+    const size_t chunkOff = ch * chunkBytes;
+    const size_t currentBytes = std::min(chunkBytes, shardBytes - chunkOff);
+    const size_t currentElems = currentBytes / eltSize;
+    struct ncclRmaPutSignalOp* groupOps = nullptr;
+    struct ncclRmaProxyDesc* groupDesc = nullptr;
+    CUstreamBatchMemOpParams* groupStart = nullptr;
+    CUstreamBatchMemOpParams* groupDone = nullptr;
+    const uint8_t* selfPartial = nullptr;
+    int waitCount = 0;
+
+    // Stage 0: for every destination node, CE-gather its shard from local
+    // peers, then reduce those lsaSize values into a node partial. With one
+    // local rank, the input shard itself is the partial and is sent directly.
+    if (lsaSize > 1) {
+      NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&copyOps, lsaSize), ret, fail);
+      for (int dstNode = 0; dstNode < nNodes; dstNode++) {
+        const int dstRank = comm->nodeRanks[dstNode].localRankToRank[localRank];
+        const size_t srcOffset = sendWinOffset + (size_t)dstRank * shardBytes + chunkOff;
+        copyOps.numOps = 0;
+        for (int lsaRank = 0; lsaRank < lsaSize; lsaRank++) {
+          void* src = nullptr;
+          if (lsaRank == myLsaRank) {
+            src = (uint8_t*)args->sendBuff + (size_t)dstRank * shardBytes + chunkOff;
+          } else {
+            NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, args->sendWin, srcOffset, lsaRank, &src), ret, fail);
+          }
+          copyOps.srcs[copyOps.numOps] = src;
+          copyOps.dsts[copyOps.numOps] = stage0Inputs + (size_t)lsaRank * slotChunkBytes;
+          copyOps.sizes[copyOps.numOps] = currentBytes;
+          copyOps.numOps++;
+        }
+        NCCLCHECKGOTO(ncclCeLaunchBatchOps(comm, &copyOps, stream, args), ret, fail);
+        NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(stage0Inputs,
+                                                    stage0Inputs + (size_t)(lsaSize + dstNode) * slotChunkBytes,
+                                                    lsaSize, currentElems, /*tailChunkElems=*/0, /*chunksPerShard=*/1,
+                                                    slotChunkElems, ceColl->signalBuffer, /*totalSteps=*/1,
+                                                    ceColl->d_barrierSync, args->datatype, args->redOp, stream,
+                                                    rcclParamCeCoopLaunch()),
+                      ret, fail);
+      }
+      ncclCeFreeBatchOpsParams(&copyOps);
+    }
+
+    // All rails must finish producing their partials before any incoming rail
+    // put can reuse a rank's staging allocation.
+    NCCLCHECKGOTO(ncclRailSync(comm, railProxyCtx, plan, railCtx, stream), ret, fail);
+
+    if (nRemoteNodes > 0) {
+      const int startOps = ncclRmaProxyPutGroupStartNumOps(persistent);
+      const int doneOps = ncclRmaProxyPutGroupDoneNumOps(persistent);
+      int op = 0;
+      NCCLCHECKGOTO(ncclCalloc(&groupOps, nRemoteNodes), ret, chunk_fail);
+      NCCLCHECKGOTO(ncclCalloc(&groupDesc, 1), ret, chunk_fail);
+      NCCLCHECKGOTO(ncclCalloc(&groupStart, startOps), ret, chunk_fail);
+      NCCLCHECKGOTO(ncclCalloc(&groupDone, doneOps), ret, chunk_fail);
+
+      for (int dstNode = 0; dstNode < nNodes; dstNode++) {
+        if (dstNode == myNode) continue;
+        const int dstRank = comm->nodeRanks[dstNode].localRankToRank[localRank];
+        const size_t inboundOffset = stage1Offset + (size_t)myNode * slotChunkBytes;
+        struct ncclDevrWindow* srcWin = lsaSize == 1 ? args->sendWin : ceColl->ceARTmpWin;
+        const size_t srcOffset = lsaSize == 1
+                                   ? sendWinOffset + (size_t)dstRank * shardBytes + chunkOff
+                                   : (size_t)(lsaSize + dstNode) * slotChunkBytes;
+        NCCLCHECKGOTO(ncclRmaProxyPutBuildOp(comm, railProxyCtx, railCtx, persistent, srcWin, srcOffset,
+                                             ceColl->ceARTmpWin, inboundOffset, currentBytes, dstRank,
+                                             /*signalIdx=*/0, NCCL_SIGNAL, &groupOps[op++]),
+                      ret, chunk_fail);
+      }
+      NCCLCHECKGOTO(ncclRmaProxyPutGroupBuildDesc(comm, railProxyCtx, plan, op, &groupOps, railCtx, groupDesc), ret,
+                    chunk_fail);
+      NCCLCHECKGOTO(ncclRmaProxyPutGroupStartParams(groupDesc, groupStart), ret, chunk_fail);
+      NCCLCHECKGOTO(ncclRmaProxyPutGroupDoneParams(groupDesc, groupDone), ret, chunk_fail);
+      NCCLCHECKGOTO(ncclRmaProxyEnqueueDesc(railProxyCtx, &groupDesc), ret, chunk_fail);
+      NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, startOps, groupStart), ret, chunk_fail);
+    }
+
+    // The local node's partial takes the same source-node slot as remotely
+    // delivered partials. The final reduction therefore has exactly nNodes
+    // contiguous inputs irrespective of where they came from.
+    selfPartial = lsaSize == 1 ? (const uint8_t*)args->sendBuff + (size_t)comm->rank * shardBytes + chunkOff
+                               : stage0Inputs + (size_t)(lsaSize + myNode) * slotChunkBytes;
+    CUDACHECKGOTO(cudaMemcpyAsync(stage1Inputs + (size_t)myNode * slotChunkBytes, selfPartial, currentBytes,
+                                  cudaMemcpyDeviceToDevice, stream),
+                  ret, chunk_fail);
+
+    for (int srcNode = 0; srcNode < nNodes; srcNode++) {
+      if (srcNode == myNode) continue;
+      waitPeers[waitCount++] = comm->nodeRanks[srcNode].localRankToRank[localRank];
+    }
+    if (waitCount > 0) {
+      std::vector<int> signalCounts((size_t)waitCount, 1);
+      NCCLCHECKGOTO(ncclProxyWaitPeers(comm, railProxyCtx, plan, stream, waitCount, waitPeers, signalCounts.data()),
+                    ret, chunk_fail);
+    }
+
+    NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(stage1Inputs, (uint8_t*)args->recvBuff + chunkOff, nNodes, currentElems,
+                                                /*tailChunkElems=*/0, /*chunksPerShard=*/1, slotChunkElems,
+                                                ceColl->signalBuffer, /*totalSteps=*/1, ceColl->d_barrierSync,
+                                                args->datatype, args->redOp, stream, rcclParamCeCoopLaunch()),
+                  ret, chunk_fail);
+
+    if (nRemoteNodes > 0)
+      NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, ncclRmaProxyPutGroupDoneNumOps(persistent), groupDone), ret,
+                    chunk_fail);
+
+chunk_exit:
+    if (groupDesc != nullptr) (void)ncclRmaProxyDestroyDesc(comm, &groupDesc);
+    free(groupOps);
+    free(groupStart);
+    free(groupDone);
+    if (ret != ncclSuccess) goto fail;
+    continue;
+chunk_fail:
+    goto chunk_exit;
+  }
+
+  NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+  if (comm->rank == 0)
+    INFO(NCCL_TUNING, "ReduceScatter [Hierarchical CE]: %zu Bytes -> local CE reduce + RMA rail + local CE reduce",
+         shardBytes);
+
+exit:
+  ncclCeFreeBatchOpsParams(&copyOps);
+  free(waitPeers);
+  return ret;
+fail:
+  goto exit;
+}
+
 // Hierarchical AlltoAll: alltoall inter-node + intra-node CE alltoall.
 // DAG on the user stream:
 //   RailSync                    // rail-only entry barrier
@@ -3820,6 +4042,9 @@ ncclResult_t ncclLaunchCeColl(struct ncclComm* comm, struct ncclKernelPlan* plan
       break;
     case ncclFuncAlltoAllv:
       NCCLCHECKGOTO(ncclHierCeAlltoAllv(comm, plan, stream), ret, fail);
+      break;
+    case ncclFuncReduceScatter:
+      NCCLCHECKGOTO(ncclHierCeReduceScatter(comm, plan, stream), ret, fail);
       break;
     default:
       WARN("Hierarchical CE collective not supported for %s", ncclFuncToString(args->func));
