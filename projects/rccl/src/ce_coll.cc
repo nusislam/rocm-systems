@@ -2665,6 +2665,52 @@ ncclResult_t ncclHierCeAllGather(struct ncclComm* comm, struct ncclKernelPlan* p
 // shard. The resulting partial is sent to (d, l), where one final local
 // reduction produces the reduce-scatter result. This is the CE counterpart of
 // the LSA-reduce -> rail-A2A -> rail-reduce structure in reduce_scatter_gin.cuh.
+static ncclResult_t ncclHierCeReduceScatterPrepareLocal(struct ncclComm* comm, struct ncclCeCollArgs* args,
+                                                        uint8_t* stage, int lsaSize, int myLsaRank, int nNodes,
+                                                        int localRank, size_t slotChunkBytes, size_t slotChunkElems,
+                                                        size_t shardBytes, size_t chunkOff, size_t currentBytes,
+                                                        size_t currentElems, size_t sendWinOffset,
+                                                        cudaStream_t stream) {
+  ncclResult_t ret = ncclSuccess;
+  struct ncclCeBatchOpsParams copyOps = {};
+
+  // One GPU per node already has the node partial in its input shard. The
+  // caller uses the user window directly as the rail source in that case.
+  if (lsaSize == 1) return ncclSuccess;
+
+  NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&copyOps, lsaSize), ret, fail);
+  for (int dstNode = 0; dstNode < nNodes; dstNode++) {
+    const int dstRank = comm->nodeRanks[dstNode].localRankToRank[localRank];
+    const size_t srcOffset = sendWinOffset + (size_t)dstRank * shardBytes + chunkOff;
+    copyOps.numOps = 0;
+    for (int lsaRank = 0; lsaRank < lsaSize; lsaRank++) {
+      void* src = nullptr;
+      if (lsaRank == myLsaRank) {
+        src = (uint8_t*)args->sendBuff + (size_t)dstRank * shardBytes + chunkOff;
+      } else {
+        NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, args->sendWin, srcOffset, lsaRank, &src), ret, fail);
+      }
+      copyOps.srcs[copyOps.numOps] = src;
+      copyOps.dsts[copyOps.numOps] = stage + (size_t)lsaRank * slotChunkBytes;
+      copyOps.sizes[copyOps.numOps] = currentBytes;
+      copyOps.numOps++;
+    }
+    NCCLCHECKGOTO(ncclCeLaunchBatchOps(comm, &copyOps, stream, args), ret, fail);
+    NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(stage, stage + (size_t)(lsaSize + dstNode) * slotChunkBytes,
+                                                lsaSize, currentElems, /*tailChunkElems=*/0, /*chunksPerShard=*/1,
+                                                slotChunkElems, comm->ceColl.signalBuffer, /*totalSteps=*/1,
+                                                comm->ceColl.d_barrierSync, args->datatype, args->redOp, stream,
+                                                rcclParamCeCoopLaunch()),
+                  ret, fail);
+  }
+
+exit:
+  ncclCeFreeBatchOpsParams(&copyOps);
+  return ret;
+fail:
+  goto exit;
+}
+
 static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKernelPlan* plan,
                                             cudaStream_t stream) {
   ncclResult_t ret = ncclSuccess;
@@ -2686,7 +2732,6 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
   const size_t slotChunkBytes =
     ncclCeAllReduceSlotChunkBytes(ceColl->ceArStagingBytes / (size_t)nRanks);
   const size_t slotChunkElems = slotChunkBytes / eltSize;
-  struct ncclCeBatchOpsParams copyOps = {};
   struct ncclRmaProxyCtx* railProxyCtx = nullptr;
   int* waitPeers = nullptr;
 
@@ -2731,57 +2776,40 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
   }
   if (nRemoteNodes > 0) NCCLCHECKGOTO(ncclCalloc(&waitPeers, nRemoteNodes), ret, fail);
 
-  // The local CE copies below read all LSA peers' user buffers. This entry
-  // barrier also prevents a following invocation from reusing staging early.
+  // The rail barrier establishes the signal epoch before the first chunk.
+  // Subsequent chunks are ordered by their per-peer RMA signal counts, which
+  // lets the local reduction of chunk c+1 overlap chunk c's outgoing puts.
+  NCCLCHECKGOTO(ncclRailSync(comm, railProxyCtx, plan, railCtx, stream), ret, fail);
+
+  // The local CE copies below read all LSA peers' user buffers. This barrier
+  // also prevents a following invocation from reusing staging early.
   NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+  {
+    const size_t firstBytes = std::min(chunkBytes, shardBytes);
+    NCCLCHECKGOTO(ncclHierCeReduceScatterPrepareLocal(comm, args, stage0Inputs, lsaSize, myLsaRank, nNodes,
+                                                       localRank, slotChunkBytes, slotChunkElems, shardBytes,
+                                                       /*chunkOff=*/0, firstBytes, firstBytes / eltSize, sendWinOffset,
+                                                       stream),
+                  ret, fail);
+  }
 
   for (size_t ch = 0; ch < chunks; ch++) {
     const size_t chunkOff = ch * chunkBytes;
     const size_t currentBytes = std::min(chunkBytes, shardBytes - chunkOff);
     const size_t currentElems = currentBytes / eltSize;
+    // The prior iteration prepared this chunk in the buffer that its final
+    // reduction had just consumed. Alternating the two full slot regions keeps
+    // an old chunk's rail source intact until its PutGroupDone below.
+    uint8_t* const localStage = (ch & 1) == 0 ? stage0Inputs : stage1Inputs;
+    uint8_t* const inboundStage = (ch & 1) == 0 ? stage1Inputs : stage0Inputs;
+    const size_t localStageOffset = (ch & 1) == 0 ? 0 : stage1Offset;
+    const size_t inboundOffset = (ch & 1) == 0 ? stage1Offset : 0;
     struct ncclRmaPutSignalOp* groupOps = nullptr;
     struct ncclRmaProxyDesc* groupDesc = nullptr;
     CUstreamBatchMemOpParams* groupStart = nullptr;
     CUstreamBatchMemOpParams* groupDone = nullptr;
     const uint8_t* selfPartial = nullptr;
     int waitCount = 0;
-
-    // Stage 0: for every destination node, CE-gather its shard from local
-    // peers, then reduce those lsaSize values into a node partial. With one
-    // local rank, the input shard itself is the partial and is sent directly.
-    if (lsaSize > 1) {
-      NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&copyOps, lsaSize), ret, fail);
-      for (int dstNode = 0; dstNode < nNodes; dstNode++) {
-        const int dstRank = comm->nodeRanks[dstNode].localRankToRank[localRank];
-        const size_t srcOffset = sendWinOffset + (size_t)dstRank * shardBytes + chunkOff;
-        copyOps.numOps = 0;
-        for (int lsaRank = 0; lsaRank < lsaSize; lsaRank++) {
-          void* src = nullptr;
-          if (lsaRank == myLsaRank) {
-            src = (uint8_t*)args->sendBuff + (size_t)dstRank * shardBytes + chunkOff;
-          } else {
-            NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, args->sendWin, srcOffset, lsaRank, &src), ret, fail);
-          }
-          copyOps.srcs[copyOps.numOps] = src;
-          copyOps.dsts[copyOps.numOps] = stage0Inputs + (size_t)lsaRank * slotChunkBytes;
-          copyOps.sizes[copyOps.numOps] = currentBytes;
-          copyOps.numOps++;
-        }
-        NCCLCHECKGOTO(ncclCeLaunchBatchOps(comm, &copyOps, stream, args), ret, fail);
-        NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(stage0Inputs,
-                                                    stage0Inputs + (size_t)(lsaSize + dstNode) * slotChunkBytes,
-                                                    lsaSize, currentElems, /*tailChunkElems=*/0, /*chunksPerShard=*/1,
-                                                    slotChunkElems, ceColl->signalBuffer, /*totalSteps=*/1,
-                                                    ceColl->d_barrierSync, args->datatype, args->redOp, stream,
-                                                    rcclParamCeCoopLaunch()),
-                      ret, fail);
-      }
-      ncclCeFreeBatchOpsParams(&copyOps);
-    }
-
-    // All rails must finish producing their partials before any incoming rail
-    // put can reuse a rank's staging allocation.
-    NCCLCHECKGOTO(ncclRailSync(comm, railProxyCtx, plan, railCtx, stream), ret, fail);
 
     if (nRemoteNodes > 0) {
       const int startOps = ncclRmaProxyPutGroupStartNumOps(persistent);
@@ -2795,13 +2823,13 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
       for (int dstNode = 0; dstNode < nNodes; dstNode++) {
         if (dstNode == myNode) continue;
         const int dstRank = comm->nodeRanks[dstNode].localRankToRank[localRank];
-        const size_t inboundOffset = stage1Offset + (size_t)myNode * slotChunkBytes;
         struct ncclDevrWindow* srcWin = lsaSize == 1 ? args->sendWin : ceColl->ceARTmpWin;
         const size_t srcOffset = lsaSize == 1
                                    ? sendWinOffset + (size_t)dstRank * shardBytes + chunkOff
-                                   : (size_t)(lsaSize + dstNode) * slotChunkBytes;
+                                   : localStageOffset + (size_t)(lsaSize + dstNode) * slotChunkBytes;
         NCCLCHECKGOTO(ncclRmaProxyPutBuildOp(comm, railProxyCtx, railCtx, persistent, srcWin, srcOffset,
-                                             ceColl->ceARTmpWin, inboundOffset, currentBytes, dstRank,
+                                             ceColl->ceARTmpWin,
+                                             inboundOffset + (size_t)myNode * slotChunkBytes, currentBytes, dstRank,
                                              /*signalIdx=*/0, NCCL_SIGNAL, &groupOps[op++]),
                       ret, chunk_fail);
       }
@@ -2817,8 +2845,8 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
     // delivered partials. The final reduction therefore has exactly nNodes
     // contiguous inputs irrespective of where they came from.
     selfPartial = lsaSize == 1 ? (const uint8_t*)args->sendBuff + (size_t)comm->rank * shardBytes + chunkOff
-                               : stage0Inputs + (size_t)(lsaSize + myNode) * slotChunkBytes;
-    CUDACHECKGOTO(cudaMemcpyAsync(stage1Inputs + (size_t)myNode * slotChunkBytes, selfPartial, currentBytes,
+                               : localStage + (size_t)(lsaSize + myNode) * slotChunkBytes;
+    CUDACHECKGOTO(cudaMemcpyAsync(inboundStage + (size_t)myNode * slotChunkBytes, selfPartial, currentBytes,
                                   cudaMemcpyDeviceToDevice, stream),
                   ret, chunk_fail);
 
@@ -2832,12 +2860,28 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
                     ret, chunk_fail);
     }
 
-    NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(stage1Inputs, (uint8_t*)args->recvBuff + chunkOff, nNodes, currentElems,
+    NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(inboundStage, (uint8_t*)args->recvBuff + chunkOff, nNodes, currentElems,
                                                 /*tailChunkElems=*/0, /*chunksPerShard=*/1, slotChunkElems,
                                                 ceColl->signalBuffer, /*totalSteps=*/1, ceColl->d_barrierSync,
                                                 args->datatype, args->redOp, stream, rcclParamCeCoopLaunch()),
                   ret, chunk_fail);
 
+    // Once the final reduction has consumed the inbound partials, prepare the
+    // next chunk in that now-free region. Its CE copies and local reductions
+    // are stream-ordered after this reduction but may run while this chunk's
+    // outbound RMA puts are still in flight.
+    if (ch + 1 < chunks) {
+      const size_t nextOff = chunkOff + currentBytes;
+      const size_t nextBytes = std::min(chunkBytes, shardBytes - nextOff);
+      NCCLCHECKGOTO(ncclHierCeReduceScatterPrepareLocal(comm, args, inboundStage, lsaSize, myLsaRank, nNodes,
+                                                         localRank, slotChunkBytes, slotChunkElems, shardBytes, nextOff,
+                                                         nextBytes, nextBytes / eltSize, sendWinOffset, stream),
+                    ret, chunk_fail);
+    }
+
+    // Do not reuse localStage until the proxy has finished reading its node
+    // partials. Placing this after the next chunk's local preparation creates
+    // the reduction-to-rail pipeline.
     if (nRemoteNodes > 0)
       NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, ncclRmaProxyPutGroupDoneNumOps(persistent), groupDone), ret,
                     chunk_fail);
@@ -2859,7 +2903,6 @@ chunk_fail:
          shardBytes);
 
 exit:
-  ncclCeFreeBatchOpsParams(&copyOps);
   free(waitPeers);
   return ret;
 fail:
