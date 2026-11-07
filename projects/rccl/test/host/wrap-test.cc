@@ -8575,6 +8575,39 @@ TEST(WrapMicrotestIsolated, SelectReduceScatter_LateCeRegisteredPreemptsSymmetri
       });
 }
 
+// Hierarchical CE ReduceScatter reads the same symmetric windows that make symk
+// eligible. RCCL_CE_REDUCESCATTER=1 must still select CE; with the opt-in off,
+// the same call stays on the symmetric kernel.
+TEST(WrapMicrotestIsolated, SelectReduceScatter_HierCePreemptsSymmetricWhenOptedIn) {
+  RUN_ISOLATED_TEST(
+      "Wrap_SelectReduceScatter_HierCePreemptsSymmetricWhenOptedIn",
+      []() {
+        ScopedHook symRequested(g_isSymmetricKernelRequested, [](struct ncclComm*, ncclFunc_t, int, ncclDataType_t,
+                                                                 size_t, const void*, void*, bool) { return true; });
+        ncclComm* comm = MakeSelectComm();
+        comm->nRanks = kCeRsRegisteredArmRanks;
+        comm->nNodes = 2;
+        comm->symmetricSupport = 1;
+        comm->config.CTAPolicy = NCCL_CTA_POLICY_ZERO;
+        g_hierCeAvailableValue = true;
+
+        rcclCollDecision symk{};
+        EXPECT_EQ(ncclSuccess, rcclSelectReduceScatter(comm, nullptr, nullptr, /*recvcount=*/8, ncclFloat32,
+                                                       ncclSum, /*query=*/false, &symk));
+        EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_SYMMETRIC, symk.algo);
+
+        EnableCeReduceScatterForSelectTest();
+        for (bool query : {false, true}) {
+          rcclCollDecision decision{};
+          EXPECT_EQ(ncclSuccess, rcclSelectReduceScatter(comm, nullptr, nullptr, /*recvcount=*/8, ncclFloat32,
+                                                         ncclSum, query, &decision));
+          EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_CE_REGISTERED, decision.algo) << "query=" << query;
+          EXPECT_NE((int)rcclAddonAlgos_t::RCCL_SYMMETRIC, decision.algo) << "query=" << query;
+        }
+        DeleteCommWithArch(comm);
+      });
+}
+
 // Late arm must reuse ceReduceScatterAllowed (incl. nNodes==1). On a multi-node
 // CTA-ZERO comm where DDA/hier/Direct decline, CE must not be selected.
 TEST(WrapMicrotestIsolated, SelectReduceScatter_LateCeRegisteredDeclinedOnMultiNode) {

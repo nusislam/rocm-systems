@@ -2350,7 +2350,12 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
       ncclGroupDepth == 0 && ceArGraphAllowed && rcclParamCeReduceScatter() && recvcount != 0 &&
       (op == ncclSum || op == ncclProd || op == ncclMin || op == ncclMax) && !hasSysmemSegment &&
       ncclHierCeAvailable(comm, ncclFuncReduceScatter, op, datatype, rsWinRegType, rsSendWin, rsRecvWin);
-    if (!symEligible && hierCeReduceScatterAllowed) {
+    // The windows hierarchical CE requires are the same windows that make the
+    // symmetric kernel eligible, so gating this on !symEligible made
+    // RCCL_CE_REDUCESCATTER=1 a no-op for the rccl-tests sum path. The opt-in
+    // outranks symk, as the single-node late CE arm does; symk stays the
+    // fallback when this arm declines.
+    if (hierCeReduceScatterAllowed) {
       decision->algo = RCCL_CE_REGISTERED;
       decision->nMaxChannels = ncclCeLocalReduceBlocks(datatype, recvcount);
       return ncclSuccess;
