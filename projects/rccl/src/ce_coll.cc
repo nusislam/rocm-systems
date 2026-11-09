@@ -1411,6 +1411,13 @@ static void ncclHierCeDecline(ncclFunc_t coll, const char* why) {
   WARN("Hierarchical CE ReduceScatter declined: %s", why);
 }
 
+// Slots of ceARTmpBuf the direct hierarchical ReduceScatter needs: two inbound
+// regions of nNodes partials, plus a local stage of lsaSize inputs and nNodes
+// partials when more than one rank shares the node.
+static int ncclHierCeRsDirectStagingSlots(int nNodes, int lsaSize) {
+  return 2 * nNodes + (lsaSize > 1 ? lsaSize + nNodes : 0);
+}
+
 bool ncclHierCeAvailable(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRedOp_t*/ red, ncclDataType_t ty,
                          ncclSymRegType_t winRegType, struct ncclDevrWindow* sendWin, struct ncclDevrWindow* recvWin) {
   if (!ncclCeImplemented(coll, red, ty)) {
@@ -1466,11 +1473,11 @@ bool ncclHierCeAvailable(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRe
     ncclHierCeDecline(coll, why);
     return false;
   }
-  const int rsStage0Slots = lsaRanks == 1 ? comm->nNodes : lsaRanks + comm->nNodes;
-  if (coll == ncclFuncReduceScatter && rsStage0Slots > comm->nRanks) {
+  const int rsStagingSlots = ncclHierCeRsDirectStagingSlots(comm->nNodes, lsaRanks);
+  if (coll == ncclFuncReduceScatter && rsStagingSlots > NCCL_CE_NUM_SLOTS * comm->nRanks) {
     char why[160];
-    snprintf(why, sizeof(why), "staging layout does not fit (lsa %d + nodes %d > nRanks %d)", lsaRanks, comm->nNodes,
-             comm->nRanks);
+    snprintf(why, sizeof(why), "staging layout does not fit (%d slots for lsa %d, nodes %d, nRanks %d)", rsStagingSlots,
+             lsaRanks, comm->nNodes, comm->nRanks);
     ncclHierCeDecline(coll, why);
     return false;
   }
@@ -2853,7 +2860,9 @@ struct ncclHierCeRsRingLayout {
 
 static bool ncclHierCeRsRingPlanLayout(int nNodes, int lsaSize, int nRanks, struct ncclHierCeRsRingLayout* out) {
   if (nNodes < 2 || lsaSize < 1 || nRanks < 1 || out == nullptr) return false;
-  out->nParity = nNodes > 2 ? 2 : 1;
+  // Two pairs even on two nodes: a neighbour can post its next chunk's first
+  // put while this rank is still combining the last step of the current one.
+  out->nParity = 2;
   // Two nodes exchange once and write recvbuff, so the only fwd slot is the
   // outbound partial built when more than one GPU shares the node.
   out->nFwd = nNodes > 2 ? 2 : (lsaSize > 1 ? 1 : 0);
@@ -3114,7 +3123,13 @@ static ncclResult_t ncclHierCeReduceScatterRing(struct ncclComm* comm, struct nc
       const int sendFwdIdx = sendFromUserBuf ? -1 : (producedBefore - 1) & 1;
       const bool last = step == nRounds;
       const int outFwdIdx = last ? -1 : (producedBefore & 1);
-      const int parity = layout.nParity == 1 ? 0 : ((step - 1) & 1);
+      // The pair alternates on a step counter that keeps running across
+      // chunks. A neighbour posts its first put of chunk ch + 1 as soon as it
+      // has received this rank's last put of chunk ch, which can be before
+      // this rank's last combine has finished reading its pair. The next
+      // global step uses the other pair, and the step after that cannot start
+      // until this rank's combine has published its send buffer.
+      const int parity = (int)((ch * (size_t)nRounds + (size_t)(step - 1)) & 1);
       uint8_t* const localIn = staging + (size_t)(layout.pairBase + 2 * parity) * slotChunkBytes;
       const size_t remoteSlotOff = (size_t)(layout.pairBase + 2 * parity + 1) * slotChunkBytes;
       uint8_t* const outPtr =
@@ -3357,12 +3372,18 @@ static ncclResult_t ncclHierCeReduceScatterDirect(struct ncclComm* comm, struct 
     WARN("Hierarchical CE ReduceScatter: no valid chunk layout");
     return ncclInvalidArgument;
   }
-  // Slot 0 holds lsaSize input shards followed by one local partial per
-  // destination node. With one rank per node the input is already a node
-  // partial, so no stage-0 staging slots are needed. Slot 1 holds the nNodes
-  // partials received for this rank.
-  const int stage0Slots = lsaSize == 1 ? nNodes : lsaSize + nNodes;
-  if (stage0Slots > nRanks) {
+  // Staging layout, in slots of slotChunkBytes:
+  //   [0, nNodes)             inbound partials of even chunks
+  //   [nNodes, 2 * nNodes)    inbound partials of odd chunks
+  //   [2 * nNodes, ...)       local stage: lsaSize input shards followed by one
+  //                           partial per destination node (lsaSize > 1 only;
+  //                           one rank per node sends straight from sendbuff)
+  // Remote ranks write the inbound slots at any time after they finish the
+  // previous chunk, so those slots must never double as local scratch. The
+  // inbound parity alternates so a peer that runs one chunk ahead cannot
+  // overwrite partials this rank has not yet reduced.
+  const int stagingSlots = ncclHierCeRsDirectStagingSlots(nNodes, lsaSize);
+  if (stagingSlots > NCCL_CE_NUM_SLOTS * nRanks) {
     WARN("Hierarchical CE ReduceScatter: staging layout does not fit (lsaSize %d, nNodes %d, nRanks %d)", lsaSize,
          nNodes, nRanks);
     return ncclInvalidUsage;
@@ -3372,10 +3393,9 @@ static ncclResult_t ncclHierCeReduceScatterDirect(struct ncclComm* comm, struct 
     shardBytes <= slotChunkBytes ? shardBytes : ncclCeAllReduceChooseChunkBytes(shardBytes, slotChunkBytes);
   if (chunkBytes == 0) return ncclInvalidArgument;
   const size_t chunks = DIVUP(shardBytes, chunkBytes);
-  const size_t slotStrideBytes = (size_t)nRanks * slotChunkBytes;
-  uint8_t* const stage0Inputs = ceColl->ceARTmpBuf;
-  uint8_t* const stage1Inputs = ceColl->ceARTmpBuf + slotStrideBytes;
-  const size_t stage1Offset = slotStrideBytes;
+  const size_t inboundRegionBytes = (size_t)nNodes * slotChunkBytes;
+  const size_t localStageOffset = 2 * inboundRegionBytes;
+  uint8_t* const localStage = ceColl->ceARTmpBuf + localStageOffset;
   const size_t sendWinOffset = (const uint8_t*)args->sendBuff - (const uint8_t*)args->sendWin->userPtr;
 
   railProxyCtx = (struct ncclRmaProxyCtx*)rmaProxyState->rmaProxyCtxs[railCtx];
@@ -3416,14 +3436,14 @@ static ncclResult_t ncclHierCeReduceScatterDirect(struct ncclComm* comm, struct 
     const size_t chunkOff = ch * chunkBytes;
     const size_t currentBytes = std::min(chunkBytes, shardBytes - chunkOff);
     const size_t currentElems = currentBytes / eltSize;
-    // Two staging regions. This chunk's outbound partials live in localStage
-    // until its put-done fence; inbound partials land in the other region.
-    // The next chunk swaps the roles, so it cannot start until both fences
-    // of this chunk have completed.
-    uint8_t* const localStage = (ch & 1) == 0 ? stage0Inputs : stage1Inputs;
-    uint8_t* const inboundStage = (ch & 1) == 0 ? stage1Inputs : stage0Inputs;
-    const size_t localStageOffset = (ch & 1) == 0 ? 0 : stage1Offset;
-    const size_t inboundOffset = (ch & 1) == 0 ? stage1Offset : 0;
+    // This chunk's outbound partials live in the local stage until its
+    // put-done fence, and the next chunk's produce waits for that join before
+    // reusing it. Inbound partials alternate between two regions by chunk
+    // parity: a peer can start chunk ch + 1 as soon as it has received this
+    // rank's chunk ch partial, so its puts must land away from the region the
+    // final reduce of chunk ch is still reading.
+    const size_t inboundOffset = (ch & 1) * inboundRegionBytes;
+    uint8_t* const inboundStage = ceColl->ceARTmpBuf + inboundOffset;
     int nPosted = 0;
     uint64_t selfToken = 0;
     uint64_t produceToken = 0;

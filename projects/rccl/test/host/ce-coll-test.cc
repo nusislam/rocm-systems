@@ -786,7 +786,7 @@ TEST(HierCeRsRingMicrotest, Layout_FitsTheDirectStagingBudget) {
     ASSERT_TRUE(ncclHierCeRsRingPlanLayout(c.nNodes, c.lsaSize, c.nRanks, &layout))
       << c.nNodes << " nodes, lsa " << c.lsaSize;
     EXPECT_LE(layout.slotsUsed, layout.slotsAvail);
-    EXPECT_EQ(layout.nParity, c.nNodes > 2 ? 2 : 1);
+    EXPECT_EQ(layout.nParity, 2);
     // L[p] is pairBase + 2*p and R[p] is the next slot, which is what the
     // 2-input reduce kernel addresses as rank 1.
     EXPECT_GE(layout.pairBase, 0);
@@ -815,6 +815,18 @@ TEST(HierCeRsRingMicrotest, Layout_RejectsAStagingBufferThatCannotHoldThePairs) 
   // 2-rank buffer only has 4 slots.
   EXPECT_FALSE(ncclHierCeRsRingPlanLayout(/*nNodes=*/3, /*lsaSize=*/1, /*nRanks=*/2, &layout));
   EXPECT_GT(layout.slotsUsed, layout.slotsAvail);
+}
+
+// The direct rail keeps inbound partials (written by remote ranks) apart from
+// the local stage, so a neighbour that is a chunk ahead cannot clobber scratch.
+TEST(HierCeRsDirectMicrotest, StagingSlots_SeparateInboundFromLocalStage) {
+  // One rank per node: two inbound regions, no local stage.
+  EXPECT_EQ(ncclHierCeRsDirectStagingSlots(/*nNodes=*/4, /*lsaSize=*/1), 8);
+  // 4 nodes x 8 GPUs (32 ranks): 2 * 4 inbound + (8 inputs + 4 partials).
+  EXPECT_EQ(ncclHierCeRsDirectStagingSlots(/*nNodes=*/4, /*lsaSize=*/8), 20);
+  EXPECT_LE(ncclHierCeRsDirectStagingSlots(4, 8), NCCL_CE_NUM_SLOTS * 32);
+  // Smallest multi-GPU case still fits the 2 * nRanks staging buffer.
+  EXPECT_LE(ncclHierCeRsDirectStagingSlots(2, 2), NCCL_CE_NUM_SLOTS * 4);
 }
 
 class HierCeRsRingSelectMicrotest : public ::testing::Test {
