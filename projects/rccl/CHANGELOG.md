@@ -5,6 +5,7 @@ Full documentation for RCCL is available at [https://rccl.readthedocs.io](https:
 ## RCCL 2.32.3 for ROCm 10.3.0 (Unreleased)
 
 ### Added
+* `NCCL_HIER_CE_COLL_RS_RAIL_RING_ENABLE` (default `-1`): a positive value selects a bidirectional ring for the inter-node rail of hierarchical Copy Engine `ncclReduceScatter`. Each half of a chunk moves one node per step, and the local reduction of the next contribution overlaps that transfer. The default keeps the direct (all-to-all) rail.
 * `ncclGinFlushTimeout` and `ncclGinWaitTimeout` support on the rocSHMEM GDA and Anvil SDMA GIN backends, along with `ncclGinFlushAsync` and `ncclGinWait` on rocSHMEM GDA. Flush and wait on both backends also return when the communicator is aborted, except blocking flush on Anvil SDMA.
 
 ### Changed

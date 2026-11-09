@@ -685,4 +685,157 @@ INSTANTIATE_TEST_SUITE_P(LaunchPaths, CeAlltoAllvSyncMicrotest,
                                            LaunchPath::kLegacyNullStream, LaunchPath::kGraphCapture),
                          LaunchPathName);
 
+// Rail ring reduce-scatter: step indexing, the half split, staging layout, and
+// the NCCL_HIER_CE_COLL_RS_RAIL_RING_ENABLE selection. The collective itself
+// needs a GPU and the RMA proxy; these lock the host decisions it is built on.
+TEST(HierCeRsRingMicrotest, Split_KeepsHalves16ByteAligned) {
+  size_t cw = 1, ccw = 1;
+  ncclHierCeRsRingSplit(0, &cw, &ccw);
+  EXPECT_EQ(cw, 0u);
+  EXPECT_EQ(ccw, 0u);
+  ncclHierCeRsRingSplit(16, &cw, &ccw);
+  EXPECT_EQ(cw, 16u);
+  EXPECT_EQ(ccw, 0u);
+  ncclHierCeRsRingSplit(32, &cw, &ccw);
+  EXPECT_EQ(cw, 16u);
+  EXPECT_EQ(ccw, 16u);
+  ncclHierCeRsRingSplit(40, &cw, &ccw);
+  EXPECT_EQ(cw, 16u);
+  EXPECT_EQ(ccw, 24u);
+  ncclHierCeRsRingSplit(64, &cw, &ccw);
+  EXPECT_EQ(cw, 32u);
+  EXPECT_EQ(ccw, 32u);
+}
+
+TEST(HierCeRsRingMicrotest, Step_EvenRingForwardsBothHalvesOfOneDestinationToOppositePeers) {
+  // nNodes == 4, step == 2: both directions forward destination 2, but the
+  // clockwise peer is node+1 and the counter-clockwise peer is node-1. The
+  // put path must not collapse those into one send just because the
+  // destination node matches.
+  int sendCw = -1, recvCw = -1, sendCcw = -1, recvCcw = -1;
+  ncclHierCeRsRingStep(/*myNode=*/0, /*nNodes=*/4, /*step=*/2, &sendCw, &recvCw, &sendCcw, &recvCcw);
+  EXPECT_EQ(sendCw, 2);
+  EXPECT_EQ(sendCcw, 2);
+  EXPECT_NE((0 + 1) % 4, (0 - 1 + 4) % 4);
+}
+
+// Walk both ring directions for every node count. Each node's contribution to
+// a shard is added by the node that receives that shard, and the running
+// partial is what the next step forwards. A bitmask would still look complete
+// if one node were added twice, so the counts themselves have to stay at one.
+TEST(HierCeRsRingMicrotest, Step_EveryNodeEndsWithTheFullReductionOfItsOwnShard) {
+  for (int nNodes = 2; nNodes <= 16; ++nNodes) {
+    for (int ccw = 0; ccw < 2; ++ccw) {
+      const int nRounds = nNodes - 1;
+      std::vector<int> holdDest(nNodes, -1);
+      std::vector<int> holdCount(nNodes * nNodes, 0);
+      for (int step = 1; step <= nRounds; ++step) {
+        std::vector<int> sendingDest(nNodes, -1);
+        std::vector<int> sendingCount(nNodes * nNodes, 0);
+        for (int node = 0; node < nNodes; ++node) {
+          int sendCw, recvCw, sendCcw, recvCcw;
+          ncclHierCeRsRingStep(node, nNodes, step, &sendCw, &recvCw, &sendCcw, &recvCcw);
+          const int sendNode = ccw ? sendCcw : sendCw;
+          if (step == 1) {
+            sendingDest[node] = sendNode;
+            sendingCount[node * nNodes + node] = 1;
+          } else {
+            sendingDest[node] = holdDest[node];
+            for (int k = 0; k < nNodes; ++k) sendingCount[node * nNodes + k] = holdCount[node * nNodes + k];
+          }
+        }
+        std::vector<int> nextDest(nNodes, -1);
+        std::vector<int> nextCount(nNodes * nNodes, 0);
+        for (int node = 0; node < nNodes; ++node) {
+          int sendCw, recvCw, sendCcw, recvCcw;
+          ncclHierCeRsRingStep(node, nNodes, step, &sendCw, &recvCw, &sendCcw, &recvCcw);
+          const int recvNode = ccw ? recvCcw : recvCw;
+          // Clockwise arrives from node-1; counter-clockwise from node+1.
+          const int sender = ccw ? (node + 1) % nNodes : (node - 1 + nNodes) % nNodes;
+          ASSERT_EQ(sendingDest[sender], recvNode) << "nNodes " << nNodes << " step " << step << " node " << node;
+          for (int k = 0; k < nNodes; ++k) nextCount[node * nNodes + k] = sendingCount[sender * nNodes + k];
+          nextCount[node * nNodes + node] += 1;
+          for (int k = 0; k < nNodes; ++k) {
+            EXPECT_LE(nextCount[node * nNodes + k], 1)
+              << "nNodes " << nNodes << " step " << step << " node " << node << " contrib " << k;
+          }
+          if (step == nRounds) {
+            EXPECT_EQ(recvNode, node) << "nNodes " << nNodes << " ccw " << ccw;
+            for (int k = 0; k < nNodes; ++k) {
+              EXPECT_EQ(nextCount[node * nNodes + k], 1)
+                << "nNodes " << nNodes << " node " << node << " ccw " << ccw << " contrib " << k;
+            }
+          } else {
+            nextDest[node] = recvNode;
+          }
+        }
+        holdDest.swap(nextDest);
+        holdCount.swap(nextCount);
+      }
+    }
+  }
+}
+
+TEST(HierCeRsRingMicrotest, Layout_FitsTheDirectStagingBudget) {
+  struct Case {
+    int nNodes, lsaSize, nRanks;
+  };
+  const Case cases[] = {{2, 1, 2}, {2, 8, 16}, {3, 1, 3}, {3, 8, 24}, {4, 1, 4}, {8, 8, 64}};
+  for (const Case& c : cases) {
+    ncclHierCeRsRingLayout layout = {};
+    ASSERT_TRUE(ncclHierCeRsRingPlanLayout(c.nNodes, c.lsaSize, c.nRanks, &layout))
+      << c.nNodes << " nodes, lsa " << c.lsaSize;
+    EXPECT_LE(layout.slotsUsed, layout.slotsAvail);
+    EXPECT_EQ(layout.nParity, c.nNodes > 2 ? 2 : 1);
+    // L[p] is pairBase + 2*p and R[p] is the next slot, which is what the
+    // 2-input reduce kernel addresses as rank 1.
+    EXPECT_GE(layout.pairBase, 0);
+    int cursor = 0;
+    if (c.lsaSize > 1) {
+      EXPECT_EQ(layout.lsaBase, cursor);
+      cursor += c.lsaSize;
+    } else {
+      EXPECT_EQ(layout.lsaBase, -1);
+    }
+    EXPECT_EQ(layout.pairBase, cursor);
+    cursor += layout.nParity * 2;
+    if (layout.nFwd > 0) {
+      EXPECT_EQ(layout.fwdBase, cursor);
+      cursor += layout.nFwd;
+    } else {
+      EXPECT_EQ(layout.fwdBase, -1);
+    }
+    EXPECT_EQ(cursor, layout.slotsUsed);
+  }
+}
+
+TEST(HierCeRsRingMicrotest, Layout_RejectsAStagingBufferThatCannotHoldThePairs) {
+  ncclHierCeRsRingLayout layout = {};
+  // 3 nodes need two parities (4 slots) plus two forward buffers, and a
+  // 2-rank buffer only has 4 slots.
+  EXPECT_FALSE(ncclHierCeRsRingPlanLayout(/*nNodes=*/3, /*lsaSize=*/1, /*nRanks=*/2, &layout));
+  EXPECT_GT(layout.slotsUsed, layout.slotsAvail);
+}
+
+class HierCeRsRingSelectMicrotest : public ::testing::Test {
+ protected:
+  int64_t enable_ = -1;
+  ScopedHook<int64_t(const char*, int64_t)> loadParam_{g_loadParam, [this](const char* env, int64_t deftVal) {
+    if (std::strcmp(env, "HIER_CE_COLL_RS_RAIL_RING_ENABLE") == 0) return enable_;
+    return deftVal;
+  }};
+};
+
+TEST_F(HierCeRsRingSelectMicrotest, DefaultAndZero_StayOnDirect) {
+  enable_ = -1;
+  EXPECT_FALSE(ncclHierCeReduceScatterUseRing());
+  enable_ = 0;
+  EXPECT_FALSE(ncclHierCeReduceScatterUseRing());
+}
+
+TEST_F(HierCeRsRingSelectMicrotest, Positive_SelectsRing) {
+  enable_ = 1;
+  EXPECT_TRUE(ncclHierCeReduceScatterUseRing());
+}
+
 }  // namespace

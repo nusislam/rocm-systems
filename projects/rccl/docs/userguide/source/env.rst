@@ -943,6 +943,19 @@ Values accepted
 ^^^^^^^^^^^^^^^
 A positive value selects the ring algorithm. 0 or a negative value keeps the direct algorithm. Default is -1 (direct).
 
+NCCL_HIER_CE_COLL_RS_RAIL_RING_ENABLE
+-------------------------------------
+(since 2.32)
+
+Selects the inter-node rail algorithm of the hierarchical copy-engine ReduceScatter. The direct algorithm exchanges
+every node's partial in one round. The ring moves each half of the chunk one node per step, in opposite directions, and
+reduces this rank's contribution while that transfer is in flight.
+
+Values accepted
+^^^^^^^^^^^^^^^
+A positive value selects the ring algorithm. 0 or a negative value keeps the direct algorithm. Default is -1 (direct).
+All ranks must use the same value.
+
 NCCL_NETDEVS_POLICY
 -------------------
 (since 2.28)

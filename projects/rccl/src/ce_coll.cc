@@ -135,6 +135,13 @@ static constexpr size_t HIER_COLL_AG_RING_MIN_HALF_AWARE_CHUNK = 8 * 1024 * 1024
 // automatic-selection semantics.
 NCCL_PARAM(HierCeCollAgRailRingEnable, "HIER_CE_COLL_AG_RAIL_RING_ENABLE", -1);
 
+// Same contract for hierarchical CE ReduceScatter. A positive value selects
+// the bidirectional rail ring; zero or a negative value keeps the direct
+// (all-to-all) rail. Default -1 keeps direct. Must be set identically on
+// every rank. There is no size threshold: unlike AllGather, the ring and
+// direct crossovers have not been measured, so ring stays opt-in.
+NCCL_PARAM(HierCeCollRsRailRingEnable, "HIER_CE_COLL_RS_RAIL_RING_ENABLE", -1);
+
 // Minimum per-peer transfer size (bytes) for the hierarchical CE collectives to
 // distribute their inter-node rail traffic across multiple internal RMA
 // contexts. Below the threshold the per-context launch/progress overhead
@@ -2704,9 +2711,15 @@ ncclResult_t ncclHierCeAllGather(struct ncclComm* comm, struct ncclKernelPlan* p
   return ncclHierCeAllGatherDirect(comm, plan, stream);
 }
 
-// Hierarchical ReduceScatter: locally reduce every destination rail's shard,
-// exchange the node partials through the RMA rail, then reduce the received
-// partials on the destination rank.
+// Hierarchical ReduceScatter. The direct (all-to-all) rail locally reduces every
+// destination node's shard, exchanges those partials in one round, then reduces
+// the received partials. NCCL_HIER_CE_COLL_RS_RAIL_RING_ENABLE selects the
+// bidirectional ring instead: each half of the chunk circulates one node per
+// step, picking up that rank's contribution along the way.
+//
+// Direct rail: locally reduce every destination rail's shard, exchange the node
+// partials through the RMA rail, then reduce the received partials on the
+// destination rank.
 //
 // For destination rank (node d, local rank l), each rank (node n, local rank
 // l) first reduces the contributions from all LSA peers on node n for d's
@@ -2818,8 +2831,489 @@ fail:
   goto exit;
 }
 
-static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKernelPlan* plan,
-                                            cudaStream_t stream) {
+// Positive NCCL_HIER_CE_COLL_RS_RAIL_RING_ENABLE selects the ring rail.
+// 0 and negative values, including the default -1, keep the direct rail.
+static bool ncclHierCeReduceScatterUseRing() { return ncclParamHierCeCollRsRailRingEnable() > 0; }
+
+// Staging slots inside ceARTmpBuf (2 * nRanks slots). The pair slots are the
+// 2-input reduce: L[p] holds this rank's contribution and R[p] == L[p] + 1
+// is where the rail peer writes the running partial. Both directions share a
+// pair; the clockwise half sits at offset 0 and the counter-clockwise half
+// just after it. nFwd ping-pongs the forwarded partial so a reduce can write
+// one buffer while the NIC is still reading the other.
+struct ncclHierCeRsRingLayout {
+  int nParity;
+  int nFwd;
+  int lsaBase; // -1 when lsaSize == 1 (the contribution is read from sendbuff)
+  int pairBase;
+  int fwdBase; // -1 when the only round sends from sendbuff and writes recvbuff
+  int slotsUsed;
+  int slotsAvail;
+};
+
+static bool ncclHierCeRsRingPlanLayout(int nNodes, int lsaSize, int nRanks, struct ncclHierCeRsRingLayout* out) {
+  if (nNodes < 2 || lsaSize < 1 || nRanks < 1 || out == nullptr) return false;
+  out->nParity = nNodes > 2 ? 2 : 1;
+  // Two nodes exchange once and write recvbuff, so the only fwd slot is the
+  // outbound partial built when more than one GPU shares the node.
+  out->nFwd = nNodes > 2 ? 2 : (lsaSize > 1 ? 1 : 0);
+  int nIn = lsaSize > 1 ? lsaSize : 0;
+  int nPair = out->nParity * 2;
+  int used = nIn + nPair + out->nFwd;
+  int avail = nRanks * 2;
+  out->slotsUsed = used;
+  out->slotsAvail = avail;
+  if (used > avail) return false;
+  int s = 0;
+  out->lsaBase = nIn ? s : -1;
+  s += nIn;
+  out->pairBase = s;
+  s += nPair;
+  out->fwdBase = out->nFwd ? s : -1;
+  return true;
+}
+
+// Split a chunk into two 16-byte-aligned halves for the two ring directions.
+// A chunk too small to split travels clockwise only; both ranks derive the
+// same split, so the put and the wait describe the same bytes.
+static void ncclHierCeRsRingSplit(size_t bytes, size_t* cwBytes, size_t* ccwBytes) {
+  size_t cw = alignDown(bytes / 2, (size_t)16);
+  if (cw == 0 || cw >= bytes) {
+    *cwBytes = bytes;
+    *ccwBytes = 0;
+    return;
+  }
+  *cwBytes = cw;
+  *ccwBytes = bytes - cw;
+}
+
+// One bidirectional ring step. step is 1 .. nNodes-1. Clockwise sends toward
+// myNode+1 and counter-clockwise toward myNode-1. After nNodes-1 steps the
+// received node is myNode: every other node's contribution has been added.
+static void ncclHierCeRsRingStep(int myNode, int nNodes, int step, int* sendCw, int* recvCw, int* sendCcw,
+                                 int* recvCcw) {
+  *sendCw = (myNode - step + nNodes) % nNodes;
+  *recvCw = (myNode - step - 1 + nNodes) % nNodes;
+  *sendCcw = (myNode + step) % nNodes;
+  *recvCcw = (myNode + step + 1) % nNodes;
+}
+
+static bool ncclHierCeRsRangesOverlap(const uint8_t* a, size_t aBytes, const uint8_t* b, size_t bBytes) {
+  if (a == nullptr || b == nullptr || aBytes == 0 || bBytes == 0) return false;
+  return a < b + bBytes && b < a + aBytes;
+}
+
+// Copy or locally reduce one shard slice into dst. lsaSize == 1 is a single
+// device copy from this rank's send buffer. Otherwise every LSA peer's slice
+// is gathered into distinct slots and reduced; one copy per destination, the
+// batch shape the direct path already uses.
+static ncclResult_t ncclHierCeRsWriteLocal(struct ncclComm* comm, struct ncclCeCollArgs* args, uint8_t* dst,
+                                           uint8_t* lsaInputs, int lsaSize, int myLsaRank, int srcRank,
+                                           size_t shardBytes, size_t chunkOff, size_t nbytes, size_t nelems,
+                                           size_t slotChunkBytes, size_t slotChunkElems, size_t sendWinOffset,
+                                           cudaStream_t stream) {
+  ncclResult_t ret = ncclSuccess;
+  struct ncclCeBatchOpsParams copyOps = {};
+
+  if (nbytes == 0) return ncclSuccess;
+  if (lsaSize == 1) {
+    const uint8_t* src = (const uint8_t*)args->sendBuff + (size_t)srcRank * shardBytes + chunkOff;
+    if (src != dst) {
+      CUDACHECKGOTO(cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
+    }
+    return ncclSuccess;
+  }
+
+  NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&copyOps, lsaSize), ret, fail);
+  for (int lsaRank = 0; lsaRank < lsaSize; lsaRank++) {
+    void* src = nullptr;
+    if (lsaRank == myLsaRank) {
+      src = (uint8_t*)args->sendBuff + (size_t)srcRank * shardBytes + chunkOff;
+    } else {
+      size_t srcOffset = sendWinOffset + (size_t)srcRank * shardBytes + chunkOff;
+      NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, args->sendWin, srcOffset, lsaRank, &src), ret, fail);
+    }
+    copyOps.srcs[copyOps.numOps] = src;
+    copyOps.dsts[copyOps.numOps] = lsaInputs + (size_t)lsaRank * slotChunkBytes;
+    copyOps.sizes[copyOps.numOps] = nbytes;
+    copyOps.numOps++;
+  }
+  NCCLCHECKGOTO(ncclCeLaunchBatchOps(comm, &copyOps, stream, args), ret, fail);
+  NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(lsaInputs, dst, lsaSize, nelems, /*tailChunkElems=*/0,
+                                             /*chunksPerShard=*/1, slotChunkElems, comm->ceColl.signalBuffer,
+                                             /*totalSteps=*/1, comm->ceColl.d_barrierSync, args->datatype, args->redOp,
+                                             stream, rcclParamCeCoopLaunch()),
+                ret, fail);
+
+exit:
+  ncclCeFreeBatchOpsParams(&copyOps);
+  return ret;
+fail:
+  goto exit;
+}
+
+// Write the clockwise and counter-clockwise halves. When both halves belong to
+// the same node (always true on two nodes) they are one contiguous slice.
+static ncclResult_t ncclHierCeRsWriteHalves(struct ncclComm* comm, struct ncclCeCollArgs* args, uint8_t* dst,
+                                            uint8_t* lsaInputs, int lsaSize, int myLsaRank, int nodeCw, int nodeCcw,
+                                            size_t shardBytes, size_t chunkOff, size_t cwBytes, size_t ccwBytes,
+                                            size_t cwElems, size_t ccwElems, size_t slotChunkBytes,
+                                            size_t slotChunkElems, size_t sendWinOffset, cudaStream_t stream) {
+  int rankCw = comm->nodeRanks[nodeCw].localRankToRank[comm->localRank];
+  if (ccwBytes > 0 && nodeCw == nodeCcw) {
+    return ncclHierCeRsWriteLocal(comm, args, dst, lsaInputs, lsaSize, myLsaRank, rankCw, shardBytes, chunkOff,
+                                  cwBytes + ccwBytes, cwElems + ccwElems, slotChunkBytes, slotChunkElems, sendWinOffset,
+                                  stream);
+  }
+  NCCLCHECK(ncclHierCeRsWriteLocal(comm, args, dst, lsaInputs, lsaSize, myLsaRank, rankCw, shardBytes, chunkOff, cwBytes,
+                                   cwElems, slotChunkBytes, slotChunkElems, sendWinOffset, stream));
+  if (ccwBytes > 0) {
+    int rankCcw = comm->nodeRanks[nodeCcw].localRankToRank[comm->localRank];
+    NCCLCHECK(ncclHierCeRsWriteLocal(comm, args, dst + cwBytes, lsaInputs, lsaSize, myLsaRank, rankCcw, shardBytes,
+                                     chunkOff + cwBytes, ccwBytes, ccwElems, slotChunkBytes, slotChunkElems,
+                                     sendWinOffset, stream));
+  }
+  return ncclSuccess;
+}
+
+// Bidirectional ring rail for hierarchical CE ReduceScatter.
+//
+// Each chunk is split in half. The first half moves clockwise (toward
+// myNode+1) and the second counter-clockwise. A step sends the running
+// partial and reduces the partial that arrives with this rank's own
+// contribution. After nNodes-1 steps the chunk is fully reduced in recvbuff.
+//
+// The pipeline matches the direct rail. scatterStream (produce) owns the
+// local reduction and the put; the user stream waits for the arrived partial
+// and runs the 2-input combine. Produce posts the put before it reduces the
+// contribution that will be combined, so that reduction overlaps the
+// transfer. The combine writes the other ping-pong buffer, so it overlaps
+// the put-done fence of the buffer the NIC is still reading.
+//
+// DAG, per chunk, for each ring step:
+//   produce: [wait until the previous combine published the send buffer]
+//             reduce one outbound half and post it before reducing the other
+//             (step 1, lsaSize>1); later steps already hold both halves
+//             reduce this rank's contribution of the inbound halves into L
+//             publish localReady, then the put-done fence
+//   user:     wait for the inbound signal(s)          // overlaps the L reduce
+//             wait localReady
+//             reduce L with the peer's R into fwd or recvbuff
+//             publish the combine when another step will send it
+static ncclResult_t ncclHierCeReduceScatterRing(struct ncclComm* comm, struct ncclKernelPlan* plan,
+                                                cudaStream_t stream) {
+  ncclResult_t ret = ncclSuccess;
+  struct ncclCeCollArgs* args = plan->ceCollArgs;
+  struct ncclCeColl* ceColl = &comm->ceColl;
+  struct ncclRmaProxyState* rmaProxyState = &comm->rmaState.rmaProxyState;
+  const int nNodes = comm->nNodes;
+  const int myNode = comm->node;
+  const int localRank = comm->localRank;
+  const int myLsaRank = comm->devrState.lsaSelf;
+  const int lsaSize = comm->devrState.lsaSize;
+  const int nRanks = comm->nRanks;
+  const int nRounds = nNodes - 1;
+  const int railCtx = comm->config.numRmaCtx;
+  const bool persistent = plan->persistent;
+  const size_t eltSize = args->eltSize;
+  const size_t shardElems = args->nElts;
+  const size_t shardBytes = shardElems * eltSize;
+  const size_t slotChunkBytes = ncclCeAllReduceSlotChunkBytes(ceColl->ceArStagingBytes / (size_t)nRanks);
+  const size_t slotChunkElems = slotChunkBytes / eltSize;
+  struct ncclRmaProxyCtx* railProxyCtx = nullptr;
+  struct ncclHierCeRsRingLayout layout = {};
+  CUstreamBatchMemOpParams* doneParams = nullptr;
+  cudaStream_t produce = nullptr;
+  bool produceTouched = false;
+  bool produceJoined = false;
+  const int doneOps = ncclRmaProxyPutGroupDoneNumOps(persistent);
+  const int nextNode = (myNode + 1) % nNodes;
+  const int prevNode = (myNode - 1 + nNodes) % nNodes;
+  const int sendPeerCw = comm->nodeRanks[nextNode].localRankToRank[localRank];
+  const int sendPeerCcw = comm->nodeRanks[prevNode].localRankToRank[localRank];
+  // Clockwise data arrives from the previous node; counter-clockwise from the next.
+  const int recvPeerCw = sendPeerCcw;
+  const int recvPeerCcw = sendPeerCw;
+
+  if (args->redOp != ncclSum && args->redOp != ncclProd && args->redOp != ncclMin && args->redOp != ncclMax) {
+    WARN("Hierarchical CE ReduceScatter: unsupported reduction operation");
+    return ncclInvalidArgument;
+  }
+  if (args->sendWin == nullptr || ceColl->ceARTmpBuf == nullptr || ceColl->ceARTmpWin == nullptr ||
+      ceColl->signalBuffer == nullptr) {
+    WARN("Hierarchical CE ReduceScatter: staging is not available");
+    return ncclInvalidUsage;
+  }
+  if (shardElems == 0 || slotChunkBytes < eltSize || nRounds < 1) {
+    WARN("Hierarchical CE ReduceScatter: no valid chunk layout");
+    return ncclInvalidArgument;
+  }
+  if (!ncclHierCeRsRingPlanLayout(nNodes, lsaSize, nRanks, &layout)) {
+    WARN("Hierarchical CE ReduceScatter: ring staging does not fit (lsaSize %d, nNodes %d, nRanks %d, need %d slots, "
+         "have %d)",
+         lsaSize, nNodes, nRanks, layout.slotsUsed, layout.slotsAvail);
+    return ncclInvalidUsage;
+  }
+
+  const size_t chunkBytes =
+    shardBytes <= slotChunkBytes ? shardBytes : ncclCeAllReduceChooseChunkBytes(shardBytes, slotChunkBytes);
+  if (chunkBytes == 0) return ncclInvalidArgument;
+  const size_t chunks = DIVUP(shardBytes, chunkBytes);
+  const size_t sendWinOffset = (const uint8_t*)args->sendBuff - (const uint8_t*)args->sendWin->userPtr;
+  uint64_t consumeToken = 0;
+  uint8_t* const staging = ceColl->ceARTmpBuf;
+  uint8_t* const lsaInputs = layout.lsaBase < 0 ? nullptr : staging + (size_t)layout.lsaBase * slotChunkBytes;
+
+  railProxyCtx = (struct ncclRmaProxyCtx*)rmaProxyState->rmaProxyCtxs[railCtx];
+  if (railProxyCtx == nullptr || ncclDevrGetRmaWin(ceColl->ceARTmpWin, railProxyCtx->collCommIdx) == nullptr) {
+    WARN("Hierarchical CE ReduceScatter: staging window is not registered with the RMA rail");
+    return ncclInvalidUsage;
+  }
+  if (ceColl->scatterStream == nullptr || ceColl->hierRsEpoch == nullptr) {
+    WARN("Hierarchical CE ReduceScatter: pipeline resources are not available");
+    return ncclInvalidUsage;
+  }
+  produce = ceColl->scatterStream;
+  // Two puts per step (one per direction), retired together.
+  NCCLCHECKGOTO(ncclCalloc(&doneParams, (size_t)2 * (size_t)doneOps), ret, fail);
+
+  // Rail sync establishes the signal epoch. The LSA barrier makes every peer's
+  // send buffer visible to the stage-0 copies on scatterStream.
+  NCCLCHECKGOTO(ncclRailSync(comm, railProxyCtx, plan, railCtx, stream), ret, fail);
+  NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+  {
+    uint64_t prologueToken = 0;
+    NCCLCHECKGOTO(ncclHierCeRsPublishEpoch(&ceColl->hierRsEpoch[1], &ceColl->hierRsUserToken, stream, &prologueToken),
+                  ret, fail);
+    produceTouched = true;
+    NCCLCHECKGOTO(ncclHierCeRsWaitEpoch(&ceColl->hierRsEpoch[1], prologueToken, produce), ret, fail);
+  }
+
+  for (size_t ch = 0; ch < chunks; ch++) {
+    const size_t chunkOff = ch * chunkBytes;
+    const size_t currentBytes = std::min(chunkBytes, shardBytes - chunkOff);
+    const size_t currentElems = currentBytes / eltSize;
+    size_t cwBytes = 0, ccwBytes = 0;
+    ncclHierCeRsRingSplit(currentBytes, &cwBytes, &ccwBytes);
+    const size_t cwElems = cwBytes / eltSize;
+    const size_t ccwElems = ccwBytes / eltSize;
+    uint64_t reducedToken = 0;
+    uint64_t roundPutDone = 0;
+
+    // The previous chunk published consumeToken on the user stream after its
+    // last put-done. Produce waits for that before reusing the staging slots.
+    if (ch > 0) {
+      NCCLCHECKGOTO(ncclHierCeRsWaitEpoch(&ceColl->hierRsEpoch[1], consumeToken, produce), ret, fail);
+    }
+
+    for (int step = 1; step <= nRounds; step++) {
+      int sendNodeCw = 0, recvNodeCw = 0, sendNodeCcw = 0, recvNodeCcw = 0;
+      ncclHierCeRsRingStep(myNode, nNodes, step, &sendNodeCw, &recvNodeCw, &sendNodeCcw, &recvNodeCcw);
+      const int producedBefore = (lsaSize > 1 ? 1 : 0) + (step - 1);
+      const bool sendFromUserBuf = producedBefore == 0;
+      const int sendFwdIdx = sendFromUserBuf ? -1 : (producedBefore - 1) & 1;
+      const bool last = step == nRounds;
+      const int outFwdIdx = last ? -1 : (producedBefore & 1);
+      const int parity = layout.nParity == 1 ? 0 : ((step - 1) & 1);
+      uint8_t* const localIn = staging + (size_t)(layout.pairBase + 2 * parity) * slotChunkBytes;
+      const size_t remoteSlotOff = (size_t)(layout.pairBase + 2 * parity + 1) * slotChunkBytes;
+      uint8_t* const outPtr =
+        last ? (uint8_t*)args->recvBuff + chunkOff : staging + (size_t)(layout.fwdBase + outFwdIdx) * slotChunkBytes;
+      uint8_t* const sendBase =
+        sendFromUserBuf ? nullptr : staging + (size_t)(layout.fwdBase + sendFwdIdx) * slotChunkBytes;
+      const uint8_t* postedSrc[2] = {nullptr, nullptr};
+      size_t postedBytes[2] = {0, 0};
+      int nPosted = 0;
+      int waitPeers[2] = {0, 0};
+      int waitSigs[2] = {0, 0};
+      int nWait = 0;
+      uint64_t localReady = 0;
+      bool outOverlapsSend = false;
+      // Both halves share one peer only on two nodes, where the bytes are contiguous.
+      const bool mergePut = cwBytes > 0 && ccwBytes > 0 && sendPeerCw == sendPeerCcw;
+
+      if ((!sendFromUserBuf && (layout.fwdBase < 0 || sendFwdIdx >= layout.nFwd)) ||
+          (!last && (layout.fwdBase < 0 || outFwdIdx >= layout.nFwd))) {
+        WARN("Hierarchical CE ReduceScatter: ring forward buffer is not allocated");
+        ret = ncclInternalError;
+        goto fail;
+      }
+
+      if (step > 1) {
+        NCCLCHECKGOTO(ncclHierCeRsWaitEpoch(&ceColl->hierRsEpoch[1], reducedToken, produce), ret, fail);
+      }
+
+      // One put when both halves go to the same peer (two nodes: the two
+      // directions collapse onto one neighbour and the bytes are contiguous).
+      // On a larger even ring a later step forwards both halves of one
+      // destination, but to opposite peers, so those stay two puts. Each put
+      // is its own batch: one copy per destination.
+      //
+      // Step 1 with one GPU per node sends from the user buffer. With more
+      // than one, each outbound half is reduced into the forward buffer and
+      // posted before the other half is reduced, so the first put overlaps
+      // that second reduce the way the direct rail posts one destination
+      // before reducing the next. Later steps already hold both halves.
+      if (mergePut) {
+        if (step == 1 && lsaSize > 1) {
+          NCCLCHECKGOTO(ncclHierCeRsWriteHalves(comm, args, sendBase, lsaInputs, lsaSize, myLsaRank, sendNodeCw,
+                                                sendNodeCcw, shardBytes, chunkOff, cwBytes, ccwBytes, cwElems, ccwElems,
+                                                slotChunkBytes, slotChunkElems, sendWinOffset, produce),
+                        ret, fail);
+        }
+        int srcRank = comm->nodeRanks[sendNodeCw].localRankToRank[localRank];
+        struct ncclDevrWindow* srcWin = sendFromUserBuf ? args->sendWin : ceColl->ceARTmpWin;
+        size_t srcOff = sendFromUserBuf ? sendWinOffset + (size_t)srcRank * shardBytes + chunkOff
+                                        : (size_t)(layout.fwdBase + sendFwdIdx) * slotChunkBytes;
+        const uint8_t* srcPtr = sendFromUserBuf ? (const uint8_t*)args->sendBuff + (size_t)srcRank * shardBytes + chunkOff
+                                                : sendBase;
+        NCCLCHECKGOTO(ncclHierCeRsPostRail(comm, plan, railProxyCtx, railCtx, persistent, srcWin, srcOff,
+                                           ceColl->ceARTmpWin, remoteSlotOff, currentBytes, sendPeerCw, produce,
+                                           doneParams + (size_t)nPosted * (size_t)doneOps),
+                      ret, fail);
+        postedSrc[nPosted] = srcPtr;
+        postedBytes[nPosted] = currentBytes;
+        nPosted++;
+      } else {
+        if (cwBytes > 0) {
+          if (step == 1 && lsaSize > 1) {
+            int rankCw = comm->nodeRanks[sendNodeCw].localRankToRank[localRank];
+            NCCLCHECKGOTO(ncclHierCeRsWriteLocal(comm, args, sendBase, lsaInputs, lsaSize, myLsaRank, rankCw, shardBytes,
+                                                 chunkOff, cwBytes, cwElems, slotChunkBytes, slotChunkElems,
+                                                 sendWinOffset, produce),
+                          ret, fail);
+          }
+          int srcRank = comm->nodeRanks[sendNodeCw].localRankToRank[localRank];
+          struct ncclDevrWindow* srcWin = sendFromUserBuf ? args->sendWin : ceColl->ceARTmpWin;
+          size_t srcOff = sendFromUserBuf ? sendWinOffset + (size_t)srcRank * shardBytes + chunkOff
+                                          : (size_t)(layout.fwdBase + sendFwdIdx) * slotChunkBytes;
+          const uint8_t* srcPtr =
+            sendFromUserBuf ? (const uint8_t*)args->sendBuff + (size_t)srcRank * shardBytes + chunkOff : sendBase;
+          NCCLCHECKGOTO(ncclHierCeRsPostRail(comm, plan, railProxyCtx, railCtx, persistent, srcWin, srcOff,
+                                             ceColl->ceARTmpWin, remoteSlotOff, cwBytes, sendPeerCw, produce,
+                                             doneParams + (size_t)nPosted * (size_t)doneOps),
+                        ret, fail);
+          postedSrc[nPosted] = srcPtr;
+          postedBytes[nPosted] = cwBytes;
+          nPosted++;
+        }
+        if (ccwBytes > 0) {
+          if (step == 1 && lsaSize > 1) {
+            int rankCcw = comm->nodeRanks[sendNodeCcw].localRankToRank[localRank];
+            NCCLCHECKGOTO(ncclHierCeRsWriteLocal(comm, args, sendBase + cwBytes, lsaInputs, lsaSize, myLsaRank, rankCcw,
+                                                 shardBytes, chunkOff + cwBytes, ccwBytes, ccwElems, slotChunkBytes,
+                                                 slotChunkElems, sendWinOffset, produce),
+                          ret, fail);
+          }
+          int srcRank = comm->nodeRanks[sendNodeCcw].localRankToRank[localRank];
+          struct ncclDevrWindow* srcWin = sendFromUserBuf ? args->sendWin : ceColl->ceARTmpWin;
+          size_t srcOff = sendFromUserBuf ? sendWinOffset + (size_t)srcRank * shardBytes + chunkOff + cwBytes
+                                          : (size_t)(layout.fwdBase + sendFwdIdx) * slotChunkBytes + cwBytes;
+          const uint8_t* srcPtr = sendFromUserBuf
+                                    ? (const uint8_t*)args->sendBuff + (size_t)srcRank * shardBytes + chunkOff + cwBytes
+                                    : sendBase + cwBytes;
+          NCCLCHECKGOTO(ncclHierCeRsPostRail(comm, plan, railProxyCtx, railCtx, persistent, srcWin, srcOff,
+                                             ceColl->ceARTmpWin, remoteSlotOff + cwBytes, ccwBytes, sendPeerCcw, produce,
+                                             doneParams + (size_t)nPosted * (size_t)doneOps),
+                        ret, fail);
+          postedSrc[nPosted] = srcPtr;
+          postedBytes[nPosted] = ccwBytes;
+          nPosted++;
+        }
+      }
+
+      // Inbound signals mirror the puts: one per direction, and one when the
+      // two halves were a single put to one peer.
+      if (mergePut) {
+        waitPeers[0] = recvPeerCw;
+        waitSigs[0] = 1;
+        nWait = 1;
+      } else {
+        if (cwBytes > 0) {
+          waitPeers[nWait] = recvPeerCw;
+          waitSigs[nWait] = 1;
+          nWait++;
+        }
+        if (ccwBytes > 0) {
+          if (nWait > 0 && waitPeers[0] == recvPeerCcw) {
+            waitSigs[0]++;
+          } else {
+            waitPeers[nWait] = recvPeerCcw;
+            waitSigs[nWait] = 1;
+            nWait++;
+          }
+        }
+      }
+
+      // Queued on the user stream now, so it runs while produce still has the
+      // inbound-side local reduce and the put-done fence ahead of it.
+      NCCLCHECKGOTO(ncclProxyWaitPeers(comm, railProxyCtx, plan, stream, nWait, waitPeers, waitSigs), ret, fail);
+
+      NCCLCHECKGOTO(ncclHierCeRsWriteHalves(comm, args, localIn, lsaInputs, lsaSize, myLsaRank, recvNodeCw, recvNodeCcw,
+                                            shardBytes, chunkOff, cwBytes, ccwBytes, cwElems, ccwElems, slotChunkBytes,
+                                            slotChunkElems, sendWinOffset, produce),
+                    ret, fail);
+      NCCLCHECKGOTO(ncclHierCeRsPublishEpoch(&ceColl->hierRsEpoch[0], &ceColl->hierRsProduceToken, produce, &localReady),
+                    ret, fail);
+      if (nPosted > 0) {
+        NCCLCHECKGOTO(ncclCuStreamBatchMemOp(produce, (unsigned int)(nPosted * doneOps), doneParams), ret, fail);
+      }
+      NCCLCHECKGOTO(
+        ncclHierCeRsPublishEpoch(&ceColl->hierRsEpoch[0], &ceColl->hierRsProduceToken, produce, &roundPutDone), ret,
+        fail);
+
+      NCCLCHECKGOTO(ncclHierCeRsWaitEpoch(&ceColl->hierRsEpoch[0], localReady, stream), ret, fail);
+      for (int i = 0; i < nPosted; i++) {
+        if (ncclHierCeRsRangesOverlap(postedSrc[i], postedBytes[i], outPtr, currentBytes)) outOverlapsSend = true;
+      }
+      // The combine writes a buffer the NIC is not reading, so it overlaps
+      // this step's put-done. The exception is an in-place recvbuff that
+      // aliases the bytes just posted: those have to land before we overwrite
+      // them. localReady is published before put-done, and on produce it is
+      // ordered after the previous step's put-done, so the other ping-pong
+      // slot is already free by the time this wait completes.
+      if (outOverlapsSend) {
+        NCCLCHECKGOTO(ncclHierCeRsWaitEpoch(&ceColl->hierRsEpoch[0], roundPutDone, stream), ret, fail);
+      }
+      NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(localIn, outPtr, /*nRanks=*/2, currentElems, /*tailChunkElems=*/0,
+                                                 /*chunksPerShard=*/1, slotChunkElems, ceColl->signalBuffer,
+                                                 /*totalSteps=*/1, ceColl->d_barrierSync, args->datatype, args->redOp,
+                                                 stream, rcclParamCeCoopLaunch()),
+                    ret, fail);
+      if (!last) {
+        NCCLCHECKGOTO(
+          ncclHierCeRsPublishEpoch(&ceColl->hierRsEpoch[1], &ceColl->hierRsUserToken, stream, &reducedToken), ret,
+          fail);
+      }
+    }
+
+    // Join produce before the next chunk reuses the slots, and before return.
+    NCCLCHECKGOTO(ncclHierCeRsWaitEpoch(&ceColl->hierRsEpoch[0], roundPutDone, stream), ret, fail);
+    if (ch + 1 == chunks) produceJoined = true;
+    if (ch + 1 < chunks) {
+      NCCLCHECKGOTO(ncclHierCeRsPublishEpoch(&ceColl->hierRsEpoch[1], &ceColl->hierRsUserToken, stream, &consumeToken),
+                    ret, fail);
+    }
+  }
+
+  NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+
+exit:
+  free(doneParams);
+  return ret;
+fail:
+  if (produceTouched && !produceJoined && produce != nullptr && ceColl->hierRsEpoch != nullptr) {
+    uint64_t drainToken = 0;
+    if (ncclHierCeRsPublishEpoch(&ceColl->hierRsEpoch[0], &ceColl->hierRsProduceToken, produce, &drainToken) ==
+        ncclSuccess) {
+      (void)ncclHierCeRsWaitEpoch(&ceColl->hierRsEpoch[0], drainToken, stream);
+    }
+  }
+  goto exit;
+}
+
+static ncclResult_t ncclHierCeReduceScatterDirect(struct ncclComm* comm, struct ncclKernelPlan* plan,
+                                                  cudaStream_t stream) {
   ncclResult_t ret = ncclSuccess;
   struct ncclCeCollArgs* args = plan->ceCollArgs;
   struct ncclCeColl* ceColl = &comm->ceColl;
@@ -3012,10 +3506,6 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
 
   // scatterStream has joined the user stream, so peers can reuse send buffers.
   NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
-  if (comm->rank == 0)
-    INFO(NCCL_TUNING,
-         "ReduceScatter [Hierarchical CE]: %zu Bytes -> pipelined local CE reduce + RMA rail + local CE reduce",
-         shardBytes);
 
 exit:
   free(doneParams);
@@ -3033,6 +3523,19 @@ fail:
     }
   }
   goto exit;
+}
+
+static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKernelPlan* plan, cudaStream_t stream) {
+  const bool useRing = ncclHierCeReduceScatterUseRing();
+  const size_t shardBytes = plan->ceCollArgs->nElts * plan->ceCollArgs->eltSize;
+  ncclResult_t ret = useRing ? ncclHierCeReduceScatterRing(comm, plan, stream)
+                             : ncclHierCeReduceScatterDirect(comm, plan, stream);
+  if (ret == ncclSuccess && comm->rank == 0) {
+    INFO(NCCL_TUNING,
+         "ReduceScatter [Hierarchical CE]: %zu Bytes -> Rail %s pipelined local CE reduce + RMA + local CE reduce",
+         shardBytes, useRing ? "Ring" : "Direct");
+  }
+  return ret;
 }
 
 // Hierarchical AlltoAll: alltoall inter-node + intra-node CE alltoall.
