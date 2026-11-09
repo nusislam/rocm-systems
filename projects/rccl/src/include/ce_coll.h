@@ -135,6 +135,14 @@ struct ncclCeColl {
   uint32_t* d_barrierSync;
   cudaStream_t scatterStream;
   cudaEvent_t synceEvent;  // join scatterStream back onto the caller's stream
+  // Monotonic same-GPU fences for the hierarchical CE ReduceScatter pipeline.
+  // [0] is published by scatterStream and waited on the user stream (stage 0
+  // done). [1] is published by the user stream and waited on scatterStream
+  // (stage 1 done, and the prologue). Tokens only increase, so an earlier
+  // chunk cannot satisfy a later wait.
+  uint64_t* hierRsEpoch;
+  uint64_t hierRsProduceToken;
+  uint64_t hierRsUserToken;
   // Latched while this comm has live graph-captured plans. CE 2-shot AllReduce
   // can deadlock on eager calls that share a graph-mode comm, so we disable CE
   // AR during that period and re-enable it after captured plans are reclaimed.

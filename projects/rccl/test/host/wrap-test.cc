@@ -8597,13 +8597,21 @@ TEST(WrapMicrotestIsolated, SelectReduceScatter_HierCePreemptsSymmetricWhenOpted
         EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_SYMMETRIC, symk.algo);
 
         EnableCeReduceScatterForSelectTest();
-        for (bool query : {false, true}) {
-          rcclCollDecision decision{};
-          EXPECT_EQ(ncclSuccess, rcclSelectReduceScatter(comm, nullptr, nullptr, /*recvcount=*/8, ncclFloat32,
-                                                         ncclSum, query, &decision));
-          EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_CE_REGISTERED, decision.algo) << "query=" << query;
-          EXPECT_NE((int)rcclAddonAlgos_t::RCCL_SYMMETRIC, decision.algo) << "query=" << query;
+        // rccl-tests calls the collective inside ncclGroupStart, so depth 1 is the
+        // case that has to beat the symmetric kernel. Depth 0 stays covered too.
+        for (int depth : {0, 1}) {
+          ncclGroupDepth = depth;
+          for (bool query : {false, true}) {
+            rcclCollDecision decision{};
+            EXPECT_EQ(ncclSuccess, rcclSelectReduceScatter(comm, nullptr, nullptr, /*recvcount=*/8, ncclFloat32,
+                                                           ncclSum, query, &decision));
+            EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_CE_REGISTERED, decision.algo)
+                << "query=" << query << " groupDepth=" << depth;
+            EXPECT_NE((int)rcclAddonAlgos_t::RCCL_SYMMETRIC, decision.algo)
+                << "query=" << query << " groupDepth=" << depth;
+          }
         }
+        ncclGroupDepth = 0;
         DeleteCommWithArch(comm);
       });
 }

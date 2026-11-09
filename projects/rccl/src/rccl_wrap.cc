@@ -2346,9 +2346,28 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
     // internal symmetric staging window through RMA. Keep this separate from
     // rcclUseCeReduceScatter(), whose legacy single-node path permits
     // unregistered buffers because it never leaves the LSA domain.
+    // No ncclGroupDepth gate. rccl-tests wraps the collective in
+    // ncclGroupStart/ncclGroupEnd whenever -g is greater than 1 or aggregated
+    // iterations are greater than 1, and this decision enqueues
+    // (RCCL_CE_REGISTERED) the way hierarchical CE AllGather does. The
+    // single-node arm keeps the group gate because its eager 2-shot launches
+    // immediately instead of enqueueing.
+    const bool hierCeReduceScatterPreconditions =
+      ceArGraphAllowed && rcclParamCeReduceScatter() && recvcount != 0 &&
+      (op == ncclSum || op == ncclProd || op == ncclMin || op == ncclMax) && !hasSysmemSegment;
+    // ncclHierCeAvailable names the failing topology/RMA/window check. The
+    // preconditions above return before that, so log them here.
+    if (!query && comm->nNodes > 1 && rcclParamCeReduceScatter() && !hierCeReduceScatterPreconditions) {
+      static bool warnedHierCeRsPreconditions = false;
+      if (!warnedHierCeRsPreconditions) {
+        warnedHierCeRsPreconditions = true;
+        WARN("Hierarchical CE ReduceScatter declined before availability: graphAllowed=%d recvcount=%zu op=%d "
+             "sysmem=%d",
+             (int)ceArGraphAllowed, recvcount, (int)op, (int)hasSysmemSegment);
+      }
+    }
     const bool hierCeReduceScatterAllowed =
-      ncclGroupDepth == 0 && ceArGraphAllowed && rcclParamCeReduceScatter() && recvcount != 0 &&
-      (op == ncclSum || op == ncclProd || op == ncclMin || op == ncclMax) && !hasSysmemSegment &&
+      hierCeReduceScatterPreconditions &&
       ncclHierCeAvailable(comm, ncclFuncReduceScatter, op, datatype, rsWinRegType, rsSendWin, rsRecvWin);
     // The windows hierarchical CE requires are the same windows that make the
     // symmetric kernel eligible, so gating this on !symEligible made
