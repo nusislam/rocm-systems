@@ -458,6 +458,7 @@ ncclResult_t ncclRmaProxyPutStartParams(struct ncclRmaProxyDesc* desc, CUstreamB
   params[0].writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_64;
   params[0].writeValue.address = (CUdeviceptr)desc->readySeqDev;
   params[0].writeValue.value = desc->opSeq;
+  params[0].writeValue.value64 = desc->opSeq;
   params[0].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
   return ncclSuccess;
 }
@@ -477,6 +478,7 @@ ncclResult_t ncclRmaProxyPutDoneParams(struct ncclRmaProxyDesc* desc, CUstreamBa
   params[0].waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;
   params[0].waitValue.address = (CUdeviceptr)desc->doneSeqDev;
   params[0].waitValue.value = desc->opSeq;
+  params[0].waitValue.value64 = desc->opSeq;
   params[0].waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
 
   bool persistent = (desc->persistPlan != nullptr) || desc->captured;
@@ -484,6 +486,7 @@ ncclResult_t ncclRmaProxyPutDoneParams(struct ncclRmaProxyDesc* desc, CUstreamBa
     params[1].writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_64;
     params[1].writeValue.address = (CUdeviceptr)desc->doneSeqDev;
     params[1].writeValue.value = 0;
+    params[1].writeValue.value64 = 0;
     params[1].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
   }
   return ncclSuccess;
@@ -506,6 +509,7 @@ ncclResult_t ncclRmaProxyPutGroupStartParams(struct ncclRmaProxyDesc* desc, CUst
   params[0].writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_64;
   params[0].writeValue.address = (CUdeviceptr)desc->readySeqDev;
   params[0].writeValue.value = desc->opSeq;
+  params[0].writeValue.value64 = desc->opSeq;
   params[0].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
   return ncclSuccess;
 }
@@ -527,6 +531,7 @@ ncclResult_t ncclRmaProxyPutGroupDoneParams(struct ncclRmaProxyDesc* desc, CUstr
   params[0].waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;
   params[0].waitValue.address = (CUdeviceptr)desc->doneSeqDev;
   params[0].waitValue.value = desc->opSeq;
+  params[0].waitValue.value64 = desc->opSeq;
   params[0].waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
 
   bool persistent = (desc->persistPlan != nullptr) || desc->captured;
@@ -534,6 +539,7 @@ ncclResult_t ncclRmaProxyPutGroupDoneParams(struct ncclRmaProxyDesc* desc, CUstr
     params[1].writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_64;
     params[1].writeValue.address = (CUdeviceptr)desc->doneSeqDev;
     params[1].writeValue.value = 0;
+    params[1].writeValue.value64 = 0;
     params[1].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
   }
   return ncclSuccess;
@@ -566,6 +572,7 @@ ncclResult_t ncclRmaProxyWaitParams(struct ncclRmaProxyCtx* rmaProxyCtx, struct 
 
       params[i].waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;
       params[i].waitValue.address = (CUdeviceptr)&rmaProxyCtx->signalsDev[signalSlot];
+      params[i].waitValue.value = waitValue;
       params[i].waitValue.value64 = waitValue;
       params[i].waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
     }
@@ -573,16 +580,19 @@ ncclResult_t ncclRmaProxyWaitParams(struct ncclRmaProxyCtx* rmaProxyCtx, struct 
     params[0].writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_64;
     params[0].writeValue.address = (CUdeviceptr)desc->readySeqDev;
     params[0].writeValue.value = desc->opSeq;
+    params[0].writeValue.value64 = desc->opSeq;
     params[0].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
 
     params[1].waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;
     params[1].waitValue.address = (CUdeviceptr)desc->doneSeqDev;
     params[1].waitValue.value = desc->opSeq;
+    params[1].waitValue.value64 = desc->opSeq;
     params[1].waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
 
     params[2].writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_64;
     params[2].writeValue.address = (CUdeviceptr)desc->doneSeqDev;
     params[2].writeValue.value = 0;
+    params[2].writeValue.value64 = 0;
     params[2].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
   }
 

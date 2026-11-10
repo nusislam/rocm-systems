@@ -495,6 +495,44 @@ static ncclResult_t ncclRmaIbProxyCommitWrs(struct ncclRmaIbProxyCtx* ctx, int n
   return ncclSuccess;
 }
 
+// ibv_sge.length is uint32_t. A transfer of 4 GiB truncates to 0 and the
+// completion (or the following signal) still arrives, so the peer reduces
+// whatever was already in the buffer. Keep every WR under 1 GiB.
+static const size_t kNcclRmaIbMaxWrBytes = size_t(1) << 30;
+
+static ncclResult_t ncclRmaIbProxyPostPlainWrite(struct ncclRmaIbProxyCtx* ctx, struct ibv_qp* qp, uintptr_t srcAddr,
+                                                 uint32_t lkey, uint64_t dstAddr, uint32_t rkey, uint32_t length) {
+  struct ibv_send_wr* wr;
+  struct ibv_sge* sge;
+  NCCLCHECK(ncclRmaIbProxyReserveWrs(ctx, qp, 1, &wr, &sge));
+  wr->opcode = IBV_WR_RDMA_WRITE;
+  wr->send_flags = 0;
+  wr->wr_id = 0;
+  wr->next = NULL;
+  wr->wr.rdma.remote_addr = dstAddr;
+  wr->wr.rdma.rkey = rkey;
+  wr->sg_list = sge;
+  wr->num_sge = 1;
+  sge->addr = srcAddr;
+  sge->length = length;
+  sge->lkey = lkey;
+  return ncclRmaIbProxyCommitWrs(ctx, 1, false);
+}
+
+// Post every full 1 GiB piece ahead of the caller's final WR. Same QP, so the
+// final signaled WR does not complete until these writes have landed.
+static ncclResult_t ncclRmaIbProxyPostWritePrefix(struct ncclRmaIbProxyCtx* ctx, struct ibv_qp* qp, void** srcPtr,
+                                                  void** dstPtr, size_t* size, uint32_t lkey, uint32_t rkey) {
+  while (*size > kNcclRmaIbMaxWrBytes) {
+    NCCLCHECK(ncclRmaIbProxyPostPlainWrite(ctx, qp, (uintptr_t)*srcPtr, lkey, (uint64_t)(uintptr_t)*dstPtr, rkey,
+                                           (uint32_t)kNcclRmaIbMaxWrBytes));
+    *srcPtr = (void*)((uintptr_t)*srcPtr + kNcclRmaIbMaxWrBytes);
+    *dstPtr = (void*)((uintptr_t)*dstPtr + kNcclRmaIbMaxWrBytes);
+    *size -= kNcclRmaIbMaxWrBytes;
+  }
+  return ncclSuccess;
+}
+
 ncclResult_t ncclRmaIbProxyCreateContext(void* collComm, ncclRmaConfig_t* config, void** rmaCtx) {
   ncclResult_t ret = ncclSuccess;
   struct ncclGinIbCollComm* cComm = (struct ncclGinIbCollComm*)collComm;
@@ -696,6 +734,8 @@ ncclResult_t ncclRmaIbProxyIPut(void* rmaCtx, int context, uint64_t srcOff, void
   struct ibv_send_wr* wr;
   struct ibv_sge* sge;
 
+  NCCLCHECK(ncclRmaIbProxyPostWritePrefix(rmaProxyCtx, qp->qp, &srcPtr, &dstPtr, &size, lkey, rkey));
+
   // reserve empty wr and sge
   NCCLCHECK(ncclRmaIbProxyReserveWrs(rmaProxyCtx, qp->qp, 1, &wr, &sge));
 
@@ -708,7 +748,7 @@ ncclResult_t ncclRmaIbProxyIPut(void* rmaCtx, int context, uint64_t srcOff, void
   wr->num_sge = 1;
 
   sge->addr = (uintptr_t)srcPtr;  // Local buffer address
-  sge->length = size;  // Size of the transfer
+  sge->length = (uint32_t)size;  // Size of the transfer, already <= 1 GiB
   sge->lkey = lkey;  // Local key
 
   NCCLCHECK(ncclRmaIbProxyCommitWrs(rmaProxyCtx, 1, optFlags & ncclRmaOptFlagsAggregateRequests));
@@ -802,6 +842,19 @@ ncclResult_t ncclRmaIbProxyIPutSignal(void* rmaCtx, int context, uint64_t srcOff
 
   // If size is 0, we only need to send the signal. srcMrHandle must be non-NULL
   bool hasPut = size > 0 && dstMrHandle;
+  void* srcPtr = nullptr;
+  void* dstPtr = nullptr;
+  uint32_t lkey = 0;
+  uint32_t rkey = 0;
+  if (hasPut) {
+    srcPtr = (void*)(srcMrHandle->base_vas[rmaProxyCtx->rank] + srcOff);
+    dstPtr = (void*)(dstMrHandle->base_vas[rank] + dstOff);
+    lkey = srcMrHandle->mrHandle->mrs[0]->lkey;
+    rkey = dstMrHandle->rkeys[rank];
+    // Prefix pieces carry no signal. The tail reserved below is what the peer
+    // waits on, and QP order keeps it behind the prefix.
+    NCCLCHECK(ncclRmaIbProxyPostWritePrefix(rmaProxyCtx, qp->qp, &srcPtr, &dstPtr, &size, lkey, rkey));
+  }
   int nWrs = hasPut ? 2 : 1;
   struct ibv_send_wr* wr;
   struct ibv_sge* sge;
@@ -811,11 +864,6 @@ ncclResult_t ncclRmaIbProxyIPutSignal(void* rmaCtx, int context, uint64_t srcOff
   struct ibv_sge* signalSge = sge + nWrs - 1;
 
   if (hasPut) {
-    void* srcPtr = (void*)(srcMrHandle->base_vas[rmaProxyCtx->rank] + srcOff);
-    void* dstPtr = (void*)(dstMrHandle->base_vas[rank] + dstOff);
-    uint32_t lkey = srcMrHandle->mrHandle->mrs[0]->lkey;
-    uint32_t rkey = dstMrHandle->rkeys[rank];
-
     // PUT
     wr[0].opcode = IBV_WR_RDMA_WRITE;
     wr[0].send_flags = 0; // We only need the CQE from the signal
@@ -827,7 +875,7 @@ ncclResult_t ncclRmaIbProxyIPutSignal(void* rmaCtx, int context, uint64_t srcOff
     wr[0].num_sge = 1;
 
     sge[0].addr = (uintptr_t)srcPtr;  // Local buffer address
-    sge[0].length = size;  // Size of the transfer
+    sge[0].length = (uint32_t)size;  // Size of the transfer, already <= 1 GiB
     sge[0].lkey = lkey;  // Local key
   }
 

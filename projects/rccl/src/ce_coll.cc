@@ -2747,7 +2747,12 @@ static ncclResult_t ncclHierCeRsPublishEpoch(uint64_t* epoch, uint64_t* token, c
   const uint64_t next = ++(*token);
   op.writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_64;
   op.writeValue.address = (CUdeviceptr)epoch;
+  // HIP's batch-memop union exposes both a 32-bit value and value64. The wait
+  // below reads value64. Writing only the 32-bit member leaves that as 0, so
+  // the wait passes immediately and produce reuses staging the user stream is
+  // still reducing. value64 is stored last so it wins if the two alias.
   op.writeValue.value = next;
+  op.writeValue.value64 = next;
   op.writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
   NCCLCHECK(ncclCuStreamBatchMemOp(stream, 1, &op));
   *published = next;
@@ -2758,6 +2763,7 @@ static ncclResult_t ncclHierCeRsWaitEpoch(uint64_t* epoch, uint64_t token, cudaS
   CUstreamBatchMemOpParams op = {};
   op.waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;
   op.waitValue.address = (CUdeviceptr)epoch;
+  op.waitValue.value = token;
   op.waitValue.value64 = token;
   op.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
   return ncclCuStreamBatchMemOp(stream, 1, &op);
@@ -2794,6 +2800,31 @@ exit:
   return ret;
 fail:
   goto exit;
+}
+
+// ibv_sge.length is 32 bits, and one reduce launch should not cover a
+// multi-gigabyte shard. Cap a chunk at 1 GiB even when it fits in a slot.
+static size_t ncclHierCeRsChunkBytes(size_t shardBytes, size_t slotChunkBytes) {
+  const size_t kMaxChunkBytes = size_t(1) << 30;
+  size_t chunkBytes = shardBytes <= slotChunkBytes ? shardBytes
+                                                   : ncclCeAllReduceChooseChunkBytes(shardBytes, slotChunkBytes);
+  if (chunkBytes > kMaxChunkBytes) chunkBytes = alignDown(kMaxChunkBytes, (size_t)16);
+  return chunkBytes;
+}
+
+// The CPU enqueues every chunk before the GPU runs. A multi-gigabyte shard is
+// thousands of chunks; the RMA queue and the stream then lose track of later
+// puts and those chunks reduce stale bytes. The user stream has already
+// waited for this chunk's produce work, so waiting for it here releases the
+// puts and bounds how much is queued.
+static ncclResult_t ncclHierCeRsDrainLaunchWindow(struct ncclCeColl* ceColl, cudaStream_t stream, size_t chunkIndex,
+                                                  size_t nChunks) {
+  const size_t kWindow = 8;
+  if (nChunks <= kWindow || chunkIndex + 1 >= nChunks || ((chunkIndex + 1) % kWindow) != 0) return ncclSuccess;
+  if (ceColl->synceEvent == nullptr) return ncclInternalError;
+  CUDACHECK(cudaEventRecord(ceColl->synceEvent, stream));
+  CUDACHECK(cudaEventSynchronize(ceColl->synceEvent));
+  return ncclSuccess;
 }
 
 // Reduce this node's contribution to `dstNode`'s shard into its stage slot.
@@ -3064,8 +3095,7 @@ static ncclResult_t ncclHierCeReduceScatterRing(struct ncclComm* comm, struct nc
     return ncclInvalidUsage;
   }
 
-  const size_t chunkBytes =
-    shardBytes <= slotChunkBytes ? shardBytes : ncclCeAllReduceChooseChunkBytes(shardBytes, slotChunkBytes);
+  const size_t chunkBytes = ncclHierCeRsChunkBytes(shardBytes, slotChunkBytes);
   if (chunkBytes == 0) return ncclInvalidArgument;
   const size_t chunks = DIVUP(shardBytes, chunkBytes);
   const size_t sendWinOffset = (const uint8_t*)args->sendBuff - (const uint8_t*)args->sendWin->userPtr;
@@ -3309,6 +3339,7 @@ static ncclResult_t ncclHierCeReduceScatterRing(struct ncclComm* comm, struct nc
       NCCLCHECKGOTO(ncclHierCeRsPublishEpoch(&ceColl->hierRsEpoch[1], &ceColl->hierRsUserToken, stream, &consumeToken),
                     ret, fail);
     }
+    NCCLCHECKGOTO(ncclHierCeRsDrainLaunchWindow(ceColl, stream, ch, chunks), ret, fail);
   }
 
   NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
@@ -3389,8 +3420,7 @@ static ncclResult_t ncclHierCeReduceScatterDirect(struct ncclComm* comm, struct 
     return ncclInvalidUsage;
   }
 
-  const size_t chunkBytes =
-    shardBytes <= slotChunkBytes ? shardBytes : ncclCeAllReduceChooseChunkBytes(shardBytes, slotChunkBytes);
+  const size_t chunkBytes = ncclHierCeRsChunkBytes(shardBytes, slotChunkBytes);
   if (chunkBytes == 0) return ncclInvalidArgument;
   const size_t chunks = DIVUP(shardBytes, chunkBytes);
   const size_t inboundRegionBytes = (size_t)nNodes * slotChunkBytes;
@@ -3522,6 +3552,7 @@ static ncclResult_t ncclHierCeReduceScatterDirect(struct ncclComm* comm, struct 
       NCCLCHECKGOTO(ncclHierCeRsPublishEpoch(&ceColl->hierRsEpoch[1], &ceColl->hierRsUserToken, stream, &consumeToken),
                     ret, fail);
     }
+    NCCLCHECKGOTO(ncclHierCeRsDrainLaunchWindow(ceColl, stream, ch, chunks), ret, fail);
   }
 
   // scatterStream has joined the user stream, so peers can reuse send buffers.
