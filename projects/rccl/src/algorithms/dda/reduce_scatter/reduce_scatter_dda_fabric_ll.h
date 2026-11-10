@@ -53,15 +53,29 @@ constexpr size_t ddaLLRsBankOffsetPkts(uint32_t flag, size_t bankSize) {
 // the temporary values.
 constexpr int kDdaLLRsRecvBatch = 4;
 
-// LL reduce-scatter kernel. 1D grid over packets (8B payload each) of the
-// per-rank shard (recvcount elements).
+// Peer groups inside one block, and the packets one group covers per tile.
+// The launcher's block is kDdaLLRsPeerGroups * kDdaLLRsTile threads: group
+// g = threadIdx.x / kDdaLLRsTile owns remote ranks r = 1+g, 1+g+G, ... and
+// lane threadIdx.x % kDdaLLRsTile owns one packet of the tile. Four groups
+// cut the serial poll depth by four without a second kernel launch.
+constexpr int kDdaLLRsPeerGroups = 4;
+constexpr int kDdaLLRsTile = 64;
+
+// Fabric launch uses one block per CU (ddaFabricMaxBlocks is the CU count).
+// LL reduce-scatter stays within 64 CUs; extra tiles stride across that grid.
+constexpr int kDdaLLRsMaxBlocks = 64;
+
+// LL reduce-scatter kernel. 1D grid over tiles of kDdaLLRsTile packets (8B
+// payload each) of the per-rank shard (recvcount elements).
 //
 // Phase 1 (scatter): rank selfRank writes its chunk-for-peer (sendbuff[peer])
 // into peer's scratch at slot selfRank, as LL lines carrying the epoch flag.
-// Phase 2 (reduce): rank selfRank seeds the accumulator with its own self-chunk
-// (sendbuff[selfRank]), polls its own scratch slot for each other rank (waiting
-// on the flag), and sums those into recvbuff. Flag polling provides cross-rank
-// ordering, so no GPU barrier is used. Scratch is double-buffered: bank = flag & 1.
+// The peer groups of a block send different peers, so those stores overlap.
+// Phase 2 (reduce): each group polls the peers it owns and reduces them to a
+// partial in shared memory. Group 0 seeds with this rank's own chunk
+// (sendbuff[selfRank]) and folds the partials into recvbuff. Flag polling
+// provides cross-rank ordering. A block barrier only folds the peer groups.
+// Scratch is double-buffered: bank = flag & 1. The block is kDdaLLRsPeerGroups * kDdaLLRsTile threads.
 template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
@@ -81,33 +95,52 @@ __launch_bounds__(512)
   const size_t nPk = bytes >> 3; // 8 payload bytes per packet
   const size_t slot = kDdaLLRsSlotStridePkts;
   const size_t chunkWords = nPk * 2; // uint32 words per shard chunk
+  constexpr int kGroups = kDdaLLRsPeerGroups;
+  constexpr int kTile = kDdaLLRsTile;
+  constexpr int kBatch = kDdaLLRsRecvBatch;
+  constexpr int kStep = kGroups * kBatch;
+  const int group = (int)threadIdx.x / kTile;
+  const int lane = (int)threadIdx.x % kTile;
 
 #if (defined(__gfx1250__) || defined(__gfx1250_strict__)) && __has_builtin(__builtin_amdgcn_global_prefetch)
-  // Prefetch the send chunks into L2 before the epoch barrier, one 128B line per 16 lanes; th 1 walks page tables.
-  if ((threadIdx.x & 15) == 0 && (size_t)blockIdx.x * blockDim.x + threadIdx.x < nPk) {
-    const char* base = reinterpret_cast<const char*>(sendbuff) + ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
-    for (int r = 0; r < nRanks; ++r) {
-      __builtin_amdgcn_global_prefetch((const __attribute__((address_space(1))) void*)(base + (size_t)r * bytes), 0x11);
+  // Prefetch the send chunks into L2 before the epoch barrier, one 128B line per 16 lanes of group 0.
+  // th 1 walks page tables. Later tiles of a striding block are not prefetched; the first pass never was.
+  {
+    const size_t firstPk = (size_t)blockIdx.x * (size_t)kTile + (size_t)lane;
+    if (group == 0 && (lane & 15) == 0 && firstPk < nPk) {
+      const char* base = reinterpret_cast<const char*>(sendbuff) + firstPk * 8;
+      for (int r = 0; r < nRanks; ++r) {
+        __builtin_amdgcn_global_prefetch((const __attribute__((address_space(1))) void*)(base + (size_t)r * bytes), 0x11);
+      }
     }
   }
 #endif
   const uint32_t flag = ddaGetLLEpochInc(epochDev, blockIdx.x, 1);
   const size_t bankOffsetPkts = ddaLLRsBankOffsetPkts(flag, bankSize);
 
-  const size_t gtid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t stride = (size_t)gridDim.x * blockDim.x;
-
   const uint32_t* in = reinterpret_cast<const uint32_t*>(sendbuff);
   uint32_t* out = reinterpret_cast<uint32_t*>(recvbuff);
+  // One partial per group per lane. Group 0 folds these after every group has published.
+  __shared__ uint32_t part0[kGroups * kTile];
+  __shared__ uint32_t part1[kGroups * kTile];
+  // volatile: every tile re-reads this after the barrier, including after another lane has aborted.
+  __shared__ volatile int anyAbort;
 
-  // Phase 1: scatter sendbuff[peer] into peer's slot[self]. Gather loads before stores.
-  for (size_t pk = gtid; pk < nPk; pk += stride) {
-    for (int base = 1; base < nRanks; base += kDdaLLPeerBatch) {
-      uint32_t d0[kDdaLLPeerBatch], d1[kDdaLLPeerBatch];
+  const size_t nTiles = (nPk + (size_t)kTile - 1) / (size_t)kTile;
+  const int trips = (nRanks - 1 + kStep - 1) / kStep;
+
+  // Phase 1, every tile, before any poll. A group that is still storing must not lose the CU to a
+  // sibling group that has already started spinning on data this rank has not sent.
+  for (size_t tile = (size_t)blockIdx.x; tile < nTiles; tile += (size_t)gridDim.x) {
+    const size_t pk = tile * (size_t)kTile + (size_t)lane;
+    const bool live = pk < nPk;
+    for (int t = 0; t < trips; ++t) {
+      const int r0 = 1 + group + t * kStep;
+      uint32_t d0[kBatch], d1[kBatch];
 #pragma unroll
-      for (int i = 0; i < kDdaLLPeerBatch; ++i) {
-        const int r = base + i;
-        if (r < nRanks) {
+      for (int i = 0; i < kBatch; ++i) {
+        const int r = r0 + i * kGroups;
+        if (live && r0 < nRanks && r < nRanks) {
           const int peer = (selfRank + r) % nRanks;
           const uint32_t* inPeer = in + (size_t)peer * chunkWords;
           d0[i] = inPeer[2 * pk];
@@ -115,9 +148,9 @@ __launch_bounds__(512)
         }
       }
 #pragma unroll
-      for (int i = 0; i < kDdaLLPeerBatch; ++i) {
-        const int r = base + i;
-        if (r < nRanks) {
+      for (int i = 0; i < kBatch; ++i) {
+        const int r = r0 + i * kGroups;
+        if (live && r0 < nRanks && r < nRanks) {
           const int peer = (selfRank + r) % nRanks;
           LLPacket16* dst = reinterpret_cast<LLPacket16*>(peerScratch[peer]) + bankOffsetPkts + (size_t)selfRank * slot;
           ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(&dst[pk]), d0[i], flag, d1[i], flag);
@@ -126,80 +159,78 @@ __launch_bounds__(512)
     }
   }
 
-  // Phase 2: seed with my self-chunk, poll my slots for the others, reduce.
-  // Each pass issues every read of a peer group before any flag is tested, so
-  // those remote reads stay in flight together. The group is read again until
-  // every line is fresh.
+  if (threadIdx.x == 0) {
+    anyAbort = 0;
+  }
+  __syncthreads();
+
+  // Phase 2. Every thread reaches the barriers below: a finished group waits there while another
+  // group is still polling, and an aborted lane waits there instead of returning.
   const uint32_t* inSelf = in + (size_t)selfRank * chunkWords;
   LLPacket16* myBase = reinterpret_cast<LLPacket16*>(peerScratch[selfRank]) + bankOffsetPkts;
-  for (size_t pk = gtid; pk < nPk; pk += stride) {
-    uint32_t acc0 = inSelf[2 * pk];
-    uint32_t acc1 = inSelf[2 * pk + 1];
-    for (int base = 1; base < nRanks; base += kDdaLLRsRecvBatch) {
-      uint32_t d0[kDdaLLRsRecvBatch], f0[kDdaLLRsRecvBatch];
-      uint32_t d1[kDdaLLRsRecvBatch], f1[kDdaLLRsRecvBatch];
-      // Read the batch until every line is fresh; the first pass is the first read, each pass one abort spin tick.
-      int spins = 0;
-      while (true) {
-        // Each pass reads every line, sharing one wait; a fresh line cannot change before this call ends.
-#if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
-        asm volatile("" ::: "memory");
-        v4u got[kDdaLLRsRecvBatch];
+  for (size_t tile = (size_t)blockIdx.x; tile < nTiles; tile += (size_t)gridDim.x) {
+    const size_t pk = tile * (size_t)kTile + (size_t)lane;
+    const bool live = pk < nPk;
+    // The last tile's idle lanes poll its first packet, which is in range, so they stay in the
+    // same waits as the lanes that own a packet.
+    const size_t pkPoll = live ? pk : tile * (size_t)kTile;
+    uint32_t acc0 = 0;
+    uint32_t acc1 = 0;
+    bool aborted = false;
+    if (anyAbort == 0) {
+      for (int t = 0; t < trips; ++t) {
+        const int r0 = 1 + group + t * kStep;
+        const uint32_t* line[kBatch];
+        uint32_t d0[kBatch], d1[kBatch];
+        uint32_t mask = 0;
 #pragma unroll
-        for (int i = 0; i < kDdaLLRsRecvBatch; ++i) {
-          if (base + i < nRanks) {
-            const int peer = (selfRank + base + i) % nRanks;
-            const uint32_t* src = reinterpret_cast<const uint32_t*>(myBase + (size_t)peer * slot + pk);
-            got[i] = __builtin_amdgcn_global_load_b128((v4u_gptr)src, RCCL_SYSTEM_SYNCSCOPE);
-          }
+        for (int i = 0; i < kBatch; ++i) {
+          const int r = r0 + i * kGroups;
+          const bool on = r0 < nRanks && r < nRanks;
+          line[i] = on ? reinterpret_cast<const uint32_t*>(myBase + (size_t)((selfRank + r) % nRanks) * slot + pkPoll)
+                       : nullptr;
+          mask |= on ? (1u << i) : 0u;
         }
-        // Keep every load above this point so the flag tests cannot sink one between them.
-        asm volatile("" ::: "memory");
-#pragma unroll
-        for (int i = 0; i < kDdaLLRsRecvBatch; ++i) {
-          if (base + i < nRanks) {
-            d0[i] = got[i][0];
-            f0[i] = got[i][1];
-            d1[i] = got[i][2];
-            f1[i] = got[i][3];
-          }
+        if (mask == 0) {
+          continue;
         }
-#else
-#pragma unroll
-        for (int i = 0; i < kDdaLLRsRecvBatch; ++i) {
-          if (base + i < nRanks) {
-            const int peer = (selfRank + base + i) % nRanks;
-            const uint32_t* src = reinterpret_cast<const uint32_t*>(myBase + (size_t)peer * slot + pk);
-            ddaLLLoadLineB128(src, d0[i], f0[i], d1[i], f1[i]);
-          }
-        }
-        // Keep every load above this point so none sinks past the flag tests or out of the loop.
-        asm volatile("" ::: "memory");
-#endif
-        bool fresh = true;
-#pragma unroll
-        for (int i = 0; i < kDdaLLRsRecvBatch; ++i) {
-          if (base + i < nRanks && (f0[i] != flag || f1[i] != flag)) {
-            fresh = false;
-          }
-        }
-        if (fresh) {
+        if (!ddaLLWaitLineFlagsBatched(line, mask, flag, params, d0, d1)) {
+          aborted = true;
           break;
         }
-        if (params.abortSpinTick(spins)) {
-          ddaSetLLEpoch(epochDev, epochLen, blockIdx.x, gridDim.x, flag);
-          return;
-        }
-      }
+        if (live) {
 #pragma unroll
-      for (int i = 0; i < kDdaLLRsRecvBatch; ++i) {
-        if (base + i < nRanks) {
-          ddaLLAddPayload<T>(acc0, acc1, d0[i], d1[i]);
+          for (int i = 0; i < kBatch; ++i) {
+            if ((mask >> i) & 1u) {
+              ddaLLAddPayload<T>(acc0, acc1, d0[i], d1[i]);
+            }
+          }
         }
       }
     }
-    out[2 * pk] = acc0;
-    out[2 * pk + 1] = acc1;
+    part0[group * kTile + lane] = acc0;
+    part1[group * kTile + lane] = acc1;
+    if (aborted) {
+      atomicOr((int*)&anyAbort, 1);
+    }
+    __syncthreads();
+
+    // Self, then group 0's peers, then group 1's, and so on. Groups that own no peer contribute
+    // nothing; their partial stays zero and is not folded. In-place recvbuff aliases this rank's
+    // own shard: phase 1 never reads that shard, and this store is the first write to it.
+    if (live && group == 0 && anyAbort == 0) {
+      uint32_t s0 = inSelf[2 * pk];
+      uint32_t s1 = inSelf[2 * pk + 1];
+#pragma unroll
+      for (int g = 0; g < kGroups; ++g) {
+        if (1 + g < nRanks) {
+          ddaLLAddPayload<T>(s0, s1, part0[g * kTile + lane], part1[g * kTile + lane]);
+        }
+      }
+      out[2 * pk] = s0;
+      out[2 * pk + 1] = s1;
+    }
+    __syncthreads();
   }
 
   ddaSetLLEpoch(epochDev, epochLen, blockIdx.x, gridDim.x, flag);

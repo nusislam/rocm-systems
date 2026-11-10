@@ -28,12 +28,12 @@ namespace {
 using dda::common::DdaKernelParams;
 using dda::common::LLPacket16;
 
-constexpr int kRanks = 6;  // five peers: one full receive batch, then a batch with one lane in range
-constexpr int kSelf = 1;  // peers 2 to 5 fill the first batch and peer 0 wraps into the second
-constexpr size_t kRecvCount = 2050;  // floats per shard; 1025 packets, so the last block is partial
+constexpr int kRanks = 6;  // five peers, striped across the four peer groups
+constexpr int kSelf = 1;  // group 0 owns peers 2 and 0, so the kernel waits until both are fresh
+constexpr size_t kRecvCount = 2050;  // floats per shard; 1025 packets, so the last tile is partial
 constexpr size_t kPackets = kRecvCount * sizeof(float) / 8;
-constexpr unsigned kThreads = 256;  // the production launcher's block size
-constexpr unsigned kBlocks = (kPackets + kThreads - 1) / kThreads;
+constexpr unsigned kThreads = dda::common::kDdaLLRsPeerGroups * dda::common::kDdaLLRsTile;
+constexpr unsigned kBlocks = (kPackets + dda::common::kDdaLLRsTile - 1) / dda::common::kDdaLLRsTile;
 constexpr uint32_t kFlag = 2;  // epoch cells start at 1, so the kernel uses flag 2 and bank 0
 constexpr float kUntouched = -1.0f;
 constexpr auto kWatchdog = std::chrono::seconds(30);
@@ -241,16 +241,16 @@ TEST_F(DdaReduceScatterFabricLL, LateLinesAreReReadUntilFresh) {
   // Every first read has returned stale lines by now, so only a real re-read can see what is published next.
   std::this_thread::sleep_for(kSettle);
   ASSERT_EQ(hipStreamQuery(stream_), hipErrorNotReady) << "kernel finished on stale lines";
-  // The first batch gets three of its four peers, so each pass sees fresh lines next to a stale one.
+  // Group 0 still needs peer 0 (r = 5) and group 3 still needs peer 5 (r = 4).
   for (int r = 1; r < 4; ++r) {
     publishPeer((kSelf + r) % kRanks);
   }
   std::this_thread::sleep_for(kSettle);
-  ASSERT_EQ(hipStreamQuery(stream_), hipErrorNotReady) << "kernel finished with the first batch still stale";
-  // Completing the first batch moves every thread on to re-read the second batch, whose only peer is still stale.
+  ASSERT_EQ(hipStreamQuery(stream_), hipErrorNotReady) << "kernel finished while group 0 and group 3 were stale";
+  // Peer 5 satisfies group 3. Group 0 is still waiting on peer 0.
   publishPeer((kSelf + 4) % kRanks);
   std::this_thread::sleep_for(kSettle);
-  ASSERT_EQ(hipStreamQuery(stream_), hipErrorNotReady) << "kernel finished with the second batch still stale";
+  ASSERT_EQ(hipStreamQuery(stream_), hipErrorNotReady) << "kernel finished while group 0 was still stale";
   publishPeer((kSelf + 5) % kRanks);
   ASSERT_TRUE(finishes()) << "kernel never saw the late lines";
   expectReduced();

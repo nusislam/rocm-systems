@@ -31,12 +31,17 @@ static ncclResult_t ncclReduceScatterDdaFabricLLTyped(const void* sendbuff, void
   const size_t bytes = recvcount * sizeof(T); // per-rank shard bytes
   const size_t nPk = bytes >> 3;              // 8 payload bytes per packet
 
-  const unsigned threads = 256;
+  // One tile of packets per block, four peer groups inside the block.
+  const unsigned threads = (unsigned)dda::common::kDdaLLRsPeerGroups * (unsigned)dda::common::kDdaLLRsTile;
+  const size_t nTiles = nPk == 0 ? 1 : (nPk + (size_t)dda::common::kDdaLLRsTile - 1) / (size_t)dda::common::kDdaLLRsTile;
   int nBlocksMax = comm->ddaFabricMaxBlocks;
   if (nBlocksMax < 1) {
     nBlocksMax = 1;
   }
-  unsigned blocks = (unsigned)std::min<size_t>((nPk + threads - 1) / threads, (size_t)nBlocksMax);
+  if (nBlocksMax > dda::common::kDdaLLRsMaxBlocks) {
+    nBlocksMax = dda::common::kDdaLLRsMaxBlocks;
+  }
+  unsigned blocks = (unsigned)std::min<size_t>(nTiles, (size_t)nBlocksMax);
   if (blocks == 0) {
     blocks = 1;
   }
