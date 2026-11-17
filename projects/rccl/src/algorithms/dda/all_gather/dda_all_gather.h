@@ -79,7 +79,7 @@ bool ncclAllGatherDdaFabricHierEligible(ncclComm* comm, const void* sendbuff, vo
                                         ncclDataType_t datatype);
 
 /**
- * Execute the hierarchical DDA allgather (rail ring across devices, broadcast to the sibling partitions of each
+ * Execute the hierarchical DDA allgather (alltoall across the rail, broadcast to the sibling partitions of each
  * device) using the fabric/VMM path. All transfers go through the peers' scratch buffers.
  */
 ncclResult_t ncclAllGatherDdaFabricHier(const void* sendbuff, void* recvbuff, size_t sendcount,

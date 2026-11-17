@@ -163,6 +163,7 @@ set(SRC_FILES
   algorithms/dda/device/dda_kernel_params.h
   algorithms/dda/all_gather/all_gather_dda.h
   algorithms/dda/all_gather/all_gather_dda_fabric.h
+  algorithms/dda/all_gather/all_gather_dda_fabric_hier.h
   algorithms/dda/all_gather/all_gather_dda_fabric_ll.h
   algorithms/dda/all_gather/all_gather_dda_fabric_ll128.h
   algorithms/dda/all_reduce/all_reduce_dda.h

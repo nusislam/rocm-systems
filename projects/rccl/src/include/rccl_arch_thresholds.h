@@ -150,7 +150,7 @@ struct rcclArchThresholds {
   size_t ddaA2aLL128MaxBlocksMinBytes;
   size_t ddaA2aLL128MaxBlocksMaxBytes;
 
-  // AllGather only: inclusive total-byte window of the hierarchical DDA fabric AllGather (rail ring across devices,
+  // AllGather only: inclusive total-byte window of the hierarchical DDA fabric AllGather (alltoall across the rail,
   // broadcast to the sibling partitions of each device). It runs ahead of the other DDA tiers, on unregistered
   // buffers of comms whose ranks group into two or more devices. A max of 0 turns it off. The fabric scratch is
   // sized to cover the max.

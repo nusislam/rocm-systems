@@ -2,14 +2,15 @@
  * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
  *
  * Hierarchical DDA all-gather for the fabric/VMM path, after the symmetric
- * rail-ring AllGather (agAlgoHier in src/device/symmetric/all_gather_gin.cuh).
+ * hierarchical AllGather (agHierPush in src/device/symmetric/all_gather.cuh).
  *
  * The ranks form nCards groups of scaleIn consecutive ranks, one group per
  * physical device (the two partitions of a GPU in DPX). A rank's rail is the
  * ranks with its partition index on every device; its siblings are the other
- * ranks of its own device. Each chunk travels its rail as a ring, and every rank
- * that owns or receives a chunk forwards it to the next rail peer and broadcasts
- * it to its siblings, so a chunk crosses into each device once.
+ * ranks of its own device. Each rank pushes its own chunk directly to every
+ * other rank on its rail (one hop, not a ring) and to its siblings. A chunk
+ * that arrives on the rail is forwarded to the siblings, so it crosses into
+ * each device once.
  *
  * User buffers are not registered, so no peer touches recvbuff: every remote
  * write lands in the receiver's scratch at the slot of the chunk's owner, and
@@ -32,11 +33,11 @@ constexpr int kDdaAgHierMaxScaleIn = 4;
 // 16 B loads each thread keeps in flight.
 constexpr int kDdaAgHierUnroll = 8;
 
-// Copies 16 B lines lo, lo + stride, ... < hi of src into recv and into every non-null dst.
-// SysLoad: src is scratch written by other GPUs, read with system-scope loads.
-template <bool SysLoad>
-__device__ __forceinline__ void ddaAgHierCopy(uint4* recv, uint4* const (&dst)[kDdaAgHierMaxScaleIn],
-                                              const uint4* src, size_t lo, size_t hi, size_t stride) {
+// Loads 16 B lines lo, lo + stride, ... < hi of src, then hands each line to store.
+// Groups of kDdaAgHierUnroll lines are loaded before any of them is stored. SysLoad: src is scratch written by
+// another GPU, read with system-scope loads.
+template <bool SysLoad, typename Store>
+__device__ __forceinline__ void ddaAgHierScatter(const uint4* src, size_t lo, size_t hi, size_t stride, Store store) {
   constexpr int kUnroll = kDdaAgHierUnroll;
   auto load = [&](size_t line, uint4& v) {
     if constexpr (SysLoad) {
@@ -51,35 +52,25 @@ __device__ __forceinline__ void ddaAgHierCopy(uint4* recv, uint4* const (&dst)[k
 #pragma unroll
     for (int u = 0; u < kUnroll; ++u) load(i + u * stride, v[u]);
 #pragma unroll
-    for (int u = 0; u < kUnroll; ++u) recv[i + u * stride] = v[u];
-#pragma unroll
-    for (int d = 0; d < kDdaAgHierMaxScaleIn; ++d) {
-      if (dst[d] != nullptr) {
-#pragma unroll
-        for (int u = 0; u < kUnroll; ++u) dst[d][i + u * stride] = v[u];
-      }
-    }
+    for (int u = 0; u < kUnroll; ++u) store(i + u * stride, v[u]);
   }
   for (; i < hi; i += stride) {
     uint4 v;
     load(i, v);
-    recv[i] = v;
-#pragma unroll
-    for (int d = 0; d < kDdaAgHierMaxScaleIn; ++d) {
-      if (dst[d] != nullptr) dst[d][i] = v;
-    }
+    store(i, v);
   }
 }
 
-// count is the per-rank chunk in elements, a multiple of 16 B. Scratch holds nRanks chunk slots.
+// count is the per-rank chunk in elements, a multiple of 16 B. Scratch holds nRanks chunk slots, and each slot is
+// written by one rank: a rank pushes its own slot to every rail peer and every sibling, and forwards each rail slot
+// it receives to its siblings. The rank's own slot is never written.
 //
 // Block b of every rank moves the same lines of each chunk: first + k * stride for k < nRows, with
 // first = b * blockDim.x + threadIdx.x and stride the grid width, so the flags pair blocks of equal index. The rows
-// are cut into nPieces pieces. Ring step s carries the chunk of the rail peer on device (card - s): step 0 reads
-// sendbuff, later steps read the scratch slot the previous rail peer filled. Each piece goes to recvbuff, to the
-// next rail peer (all but the last step) and to every sibling, and is posted as piece s * nPieces + p, so the posts
-// a receiver sees from one sender only grow. Sibling pieces are drained one iteration behind, by which time they are
-// usually there. Every wait is for a post made in an earlier iteration, so the ring cannot deadlock.
+// are cut into nPieces pieces. Piece p is posted to a rail peer as p, and to a sibling as p * nCards + g. g = 0 is
+// this rank's own chunk; g >= 1 is the chunk just received from the rail peer g cards behind, so the posts one
+// sender makes to one receiver only grow. Sibling piece p - 1 is drained while piece p is in flight. Every wait is
+// for a post the sender made before it waited for this rank, so the exchange cannot deadlock.
 template <typename T>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
@@ -104,8 +95,13 @@ __launch_bounds__(512)
   const int nCards = nRanks / scaleIn;
   const int card = selfRank / scaleIn;
   const int local = selfRank - card * scaleIn;
-  const int railNext = (card + 1 == nCards ? 0 : card + 1) * scaleIn + local;
-  const int railPrev = (card == 0 ? nCards - 1 : card - 1) * scaleIn + local;
+  // Card `delta` steps from this one, wrapped. +g is the rail peer we push to; -g is the one we receive from.
+  auto cardAt = [&](int delta) {
+    int c = card + delta;
+    if (c >= nCards) c -= nCards;
+    else if (c < 0) c += nCards;
+    return c;
+  };
   // Sibling d (1 <= d < scaleIn) is the rank d partitions after this one on its device.
   auto sibling = [&](int d) {
     int l = local + d;
@@ -116,67 +112,108 @@ __launch_bounds__(512)
   uint4* const recvLines = reinterpret_cast<uint4*>(recvbuff);
   const uint4* const sendLines = reinterpret_cast<const uint4*>(sendbuff);
   const uint4* const selfScratch = reinterpret_cast<const uint4*>(ipcbuffs[selfRank]);
-  uint4* const noDst[kDdaAgHierMaxScaleIn] = {};
+  const size_t ownSlot = static_cast<size_t>(selfRank) * nLines;
+  const unsigned nCardPieces = nPieces * static_cast<unsigned>(nCards);
 
   // The previous collective's readers must be done with this rank's scratch before peers overwrite it.
   barrier.syncOnSameBlockIdx<false /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
 
   const FlagType epoch = barrier.epochBegin();
-  const FlagType* const railFlag = barrier.epochFlagFrom(railPrev);
 
-  // Copies piece q of every sibling, which carries the chunk of that sibling's rail peer on device (card - s).
-  auto drainSiblings = [&](unsigned q) {
-    const int s = static_cast<int>(q / nPieces);
-    int dataCard = card - s;
-    if (dataCard < 0) dataCard += nCards;
-    auto [lo, hi] = pieceOf(q % nPieces);
+  // Stores one loaded line of `slot` into recvbuff and into every sibling's scratch.
+  auto storeRecvAndSiblings = [&](size_t slot, size_t line, uint4 v) {
+    recvLines[slot + line] = v;
 #pragma unroll
     for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
       if (d < scaleIn) {
-        const int sib = sibling(d);
-        barrier.epochWaitPiece(barrier.epochFlagFrom(sib), epoch, q);
-        const size_t slot = static_cast<size_t>(dataCard * scaleIn + (sib - card * scaleIn)) * nLines;
-        ddaAgHierCopy<true>(recvLines + slot, noDst, selfScratch + slot, lo, hi, stride);
+        uint4* dst = reinterpret_cast<uint4*>(ipcbuffs[sibling(d)]) + slot;
+        dst[line] = v;
       }
     }
   };
 
-  for (int s = 0; s < nCards; ++s) {
-    int dataCard = card - s;
-    if (dataCard < 0) dataCard += nCards;
-    const size_t slot = static_cast<size_t>(dataCard * scaleIn + local) * nLines;
-    uint4* dst[kDdaAgHierMaxScaleIn];
-    dst[0] = s + 1 < nCards ? reinterpret_cast<uint4*>(ipcbuffs[railNext]) + slot : nullptr;
+  // Copies piece p of every sibling. g = 0 is that sibling's own chunk; g >= 1 is the chunk it forwarded from the
+  // rail peer g cards behind.
+  auto drainSiblings = [&](unsigned p) {
 #pragma unroll
     for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
-      dst[d] = d < scaleIn ? reinterpret_cast<uint4*>(ipcbuffs[sibling(d)]) + slot : nullptr;
-    }
-
-    for (unsigned p = 0; p < nPieces; ++p) {
-      const unsigned q = static_cast<unsigned>(s) * nPieces + p;
-      auto [lo, hi] = pieceOf(p);
-      if (s == 0) {
-        ddaAgHierCopy<false>(recvLines + slot, dst, sendLines, lo, hi, stride);
-      } else {
-        barrier.epochWaitPiece(railFlag, epoch, q - nPieces);
-        ddaAgHierCopy<true>(recvLines + slot, dst, selfScratch + slot, lo, hi, stride);
+      if (d < scaleIn) {
+        const int sib = sibling(d);
+        const int sibLocal = sib - card * scaleIn;
+        const FlagType* const flag = barrier.epochFlagFrom(sib);
+        for (int g = 0; g < nCards; ++g) {
+          barrier.epochWaitPiece(flag, epoch, p * static_cast<unsigned>(nCards) + static_cast<unsigned>(g));
+          int dataCard = card - g;
+          if (dataCard < 0) dataCard += nCards;
+          const size_t slot = static_cast<size_t>(dataCard * scaleIn + sibLocal) * nLines;
+          auto [lo, hi] = pieceOf(p);
+          ddaAgHierScatter<true>(selfScratch + slot, lo, hi, stride, [&](size_t line, uint4 v) {
+            recvLines[slot + line] = v;
+          });
+        }
       }
+    }
+  };
 
+  for (unsigned p = 0; p <= nPieces; ++p) {
+    if (p < nPieces) {
+      auto [lo, hi] = pieceOf(p);
+      // Own chunk: local recv, every other rail peer, and every sibling. Issued before the drain so the stores
+      // travel while the previous sibling piece is copied out.
+      ddaAgHierScatter<false>(sendLines, lo, hi, stride, [&](size_t line, uint4 v) {
+        recvLines[ownSlot + line] = v;
+        for (int g = 1; g < nCards; ++g) {
+          const int peer = cardAt(g) * scaleIn + local;
+          uint4* dst = reinterpret_cast<uint4*>(ipcbuffs[peer]) + ownSlot;
+          dst[line] = v;
+        }
+#pragma unroll
+        for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
+          if (d < scaleIn) {
+            uint4* dst = reinterpret_cast<uint4*>(ipcbuffs[sibling(d)]) + ownSlot;
+            dst[line] = v;
+          }
+        }
+      });
+    }
+    if (p > 0) drainSiblings(p - 1);
+    if (p < nPieces) {
       barrier.orderDestWrites();
-      if (s + 1 < nCards) barrier.epochPostPieceDrained(railNext, epoch, q);
+      for (int g = 1; g < nCards; ++g) {
+        barrier.epochPostPieceDrained(cardAt(g) * scaleIn + local, epoch, p);
+      }
 #pragma unroll
       for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
-        if (d < scaleIn) barrier.epochPostPieceDrained(sibling(d), epoch, q);
+        if (d < scaleIn) barrier.epochPostPieceDrained(sibling(d), epoch, p * static_cast<unsigned>(nCards));
       }
 
-      if (q > 0) drainSiblings(q - 1);
+      // Rail alltoall: the peer g cards behind has pushed its own chunk here. Copy it out and forward it to the
+      // siblings. That peer's post of piece p is its own-chunk post above, which runs before this wait.
+      for (int g = 1; g < nCards; ++g) {
+        const int src = cardAt(-g) * scaleIn + local;
+        const size_t slot = static_cast<size_t>(src) * nLines;
+        barrier.epochWaitPiece(barrier.epochFlagFrom(src), epoch, p);
+        auto [lo, hi] = pieceOf(p);
+        ddaAgHierScatter<true>(selfScratch + slot, lo, hi, stride, [&](size_t line, uint4 v) {
+          storeRecvAndSiblings(slot, line, v);
+        });
+      }
+      barrier.orderDestWrites();
+#pragma unroll
+      for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
+        if (d < scaleIn) {
+          const int sib = sibling(d);
+          for (int g = 1; g < nCards; ++g) {
+            barrier.epochPostPieceDrained(sib, epoch, p * static_cast<unsigned>(nCards) + static_cast<unsigned>(g));
+          }
+        }
+      }
     }
   }
-  drainSiblings(static_cast<unsigned>(nCards) * nPieces - 1);
 
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
-  // One past the largest piece, so no flag this launch posted reaches the next launch's epoch.
-  barrier.epochEnd(epoch, static_cast<unsigned>(nCards) * nPieces + 1);
+  // One past the largest sibling piece (p * nCards + g), so no flag this launch posted reaches the next launch.
+  barrier.epochEnd(epoch, nCardPieces + 1);
 }
 
 } // namespace dda::common

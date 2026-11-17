@@ -29,7 +29,7 @@ RCCL_PARAM(DdaAgHier, "DDA_AG_HIER", 1);
 // RCCL_DDA_AG_HIER_BLOCKS: grid size, at most the init block cap. 0 (default) = kDdaAgHierDefaultBlocks.
 // Must be the same on every rank.
 RCCL_PARAM(DdaAgHierBlocks, "DDA_AG_HIER_BLOCKS", 0);
-// RCCL_DDA_AG_HIER_PIECES: pieces each chunk is cut into to pipeline the ring. 0 (default) = one per 512 KiB of the
+// RCCL_DDA_AG_HIER_PIECES: pieces each chunk is cut into to pipeline the rail alltoall. 0 (default) = one per 512 KiB of the
 // chunk, 1 to 16; > 0 requests that many, capped at 64 and at the rows each thread copies. Must be the same on every
 // rank.
 RCCL_PARAM(DdaAgHierPieces, "DDA_AG_HIER_PIECES", 0);
