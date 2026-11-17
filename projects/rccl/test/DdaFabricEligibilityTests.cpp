@@ -286,6 +286,10 @@ TEST(DdaFabricScratchSizingTest, PayloadCapTakesMaxAcrossDdaAndCeScratchTables)
 
     table.ddaVmmMaxGraph[ncclFuncAllReduce] = 0;
     EXPECT_EQ(rcclDdaScratchPayloadCap(mock.get()), 32ULL * 1024 * 1024);
+
+    // The hierarchical AllGather stages every chunk in scratch, so its ceiling counts too.
+    table.ddaAgHierMaxBytes = 64ULL * 1024 * 1024;
+    EXPECT_EQ(rcclDdaScratchPayloadCap(mock.get()), 64ULL * 1024 * 1024);
 }
 
 TEST(DdaFabricScratchSizingTest, PayloadCapUsesPreTableDefaultsWhenNoArchTable)

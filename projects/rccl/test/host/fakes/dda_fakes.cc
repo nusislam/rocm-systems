@@ -67,10 +67,12 @@ DEFINE_DDA_ALLGATHER_ELIGIBLE(allGatherDdaIpcEligible, ncclAllGatherDdaIpcEligib
 DEFINE_DDA_ALLGATHER_ELIGIBLE(allGatherDdaFabricEligible, ncclAllGatherDdaFabricEligible)
 DEFINE_DDA_ALLGATHER_ELIGIBLE(allGatherDdaFabricLLEligible, ncclAllGatherDdaFabricLLEligible)
 DEFINE_DDA_ALLGATHER_ELIGIBLE(allGatherDdaFabricLL128Eligible, ncclAllGatherDdaFabricLL128Eligible)
+DEFINE_DDA_ALLGATHER_ELIGIBLE(allGatherDdaFabricHierEligible, ncclAllGatherDdaFabricHierEligible)
 DEFINE_DDA_BLOCKS(allGatherDdaIpcBlocks, ncclAllGatherDdaIpcBlocks, 121)
 DEFINE_DDA_BLOCKS(allGatherDdaFabricBlocks, ncclAllGatherDdaFabricBlocks, 122)
 DEFINE_DDA_BLOCKS(allGatherDdaFabricLLBlocks, ncclAllGatherDdaFabricLLBlocks, 123)
 DEFINE_DDA_BLOCKS(allGatherDdaFabricLL128Blocks, ncclAllGatherDdaFabricLL128Blocks, 124)
+DEFINE_DDA_BLOCKS(allGatherDdaFabricHierBlocks, ncclAllGatherDdaFabricHierBlocks, 125)
 
 // AlltoAll takes the same operand shape as AllGather (no reduction op), so it
 // reuses that macro.
@@ -140,6 +142,7 @@ DEFINE_DDA_LAUNCH(allGatherDdaIpc, ncclAllGatherDdaIpc)
 DEFINE_DDA_LAUNCH(allGatherDdaFabric, ncclAllGatherDdaFabric)
 DEFINE_DDA_LAUNCH(allGatherDdaFabricLL, ncclAllGatherDdaFabricLL)
 DEFINE_DDA_LAUNCH(allGatherDdaFabricLL128, ncclAllGatherDdaFabricLL128)
+DEFINE_DDA_LAUNCH(allGatherDdaFabricHier, ncclAllGatherDdaFabricHier)
 DEFINE_DDA_LAUNCH(allToAllDdaIpc, ncclAllToAllDdaIpc)
 DEFINE_DDA_LAUNCH(allToAllDdaFabric, ncclAllToAllDdaFabric)
 DEFINE_DDA_LAUNCH(allToAllDdaFabricLL, ncclAllToAllDdaFabricLL)

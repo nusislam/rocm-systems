@@ -520,6 +520,8 @@ TEST(WrapMicrotest, GetAlgoName_DdaFabricVariantsAllAliasToDda) {
   EXPECT_STREQ("DDA", name);
   ASSERT_EQ(ncclSuccess, rcclGetAlgoName(rcclAddonAlgos_t::RCCL_DDA_IPC, &name));
   EXPECT_STREQ("DDA-IPC", name);  // NOT aliased with the fabric variants above.
+  ASSERT_EQ(ncclSuccess, rcclGetAlgoName(rcclAddonAlgos_t::RCCL_DDA_FABRIC_HIER, &name));
+  EXPECT_STREQ("DDA-Hier", name);  // Its own label: the protocol column alone would read as fabric Simple.
 }
 
 // Dead code, not a coverage gap: the inner switch's `default:` (rccl_wrap.cc

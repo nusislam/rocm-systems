@@ -34,10 +34,12 @@ extern std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t)
 extern std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t)> g_allGatherDdaFabricLLEligible;
 extern std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t)>
     g_allGatherDdaFabricLL128Eligible;
+extern std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t)> g_allGatherDdaFabricHierEligible;
 extern std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allGatherDdaIpcBlocks;
 extern std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allGatherDdaFabricBlocks;
 extern std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allGatherDdaFabricLLBlocks;
 extern std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allGatherDdaFabricLL128Blocks;
+extern std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_allGatherDdaFabricHierBlocks;
 
 extern std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t)> g_allToAllDdaIpcEligible;
 extern std::function<bool(ncclComm*, const void*, void*, size_t, ncclDataType_t)> g_allToAllDdaFabricEligible;
@@ -70,7 +72,8 @@ extern std::function<uint32_t(ncclComm*, size_t, ncclDataType_t)> g_broadcastDda
 using DdaLaunchHook = std::function<ncclResult_t(const void*, void*, size_t, ncclDataType_t, ncclComm*, hipStream_t)>;
 using DdaReduceLaunchHook =
     std::function<ncclResult_t(const void*, void*, size_t, ncclDataType_t, ncclRedOp_t, ncclComm*, hipStream_t)>;
-extern DdaLaunchHook g_allGatherDdaIpc, g_allGatherDdaFabric, g_allGatherDdaFabricLL, g_allGatherDdaFabricLL128;
+extern DdaLaunchHook g_allGatherDdaIpc, g_allGatherDdaFabric, g_allGatherDdaFabricLL, g_allGatherDdaFabricLL128,
+    g_allGatherDdaFabricHier;
 extern DdaLaunchHook g_allToAllDdaIpc, g_allToAllDdaFabric, g_allToAllDdaFabricLL, g_allToAllDdaFabricLL128;
 using DdaCappedReduceLaunchHook = std::function<ncclResult_t(const void*, void*, size_t, ncclDataType_t, ncclRedOp_t,
                                                              ncclComm*, hipStream_t, rcclDdaLaunchCap)>;

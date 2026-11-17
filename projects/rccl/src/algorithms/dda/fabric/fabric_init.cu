@@ -36,6 +36,24 @@ RCCL_PARAM(DdaFabricBufferSizeForScratch, "DDA_FABRIC_BUFFER_SIZE", -1);
 // With 0 the pushes run without drain blocks (RCCL_DDA_A2A_PUSH_PEER_DRAIN is ignored).
 RCCL_PARAM(DdaA2APushPeerEpoch, "DDA_A2A_PUSH_PEER_EPOCH", 1);
 
+// Ranks per physical device when the ranks form two or more equal groups of consecutive ranks per device (the
+// partitions of a GPU in DPX), else 0. Same rule as the symmetric kernels' computeHierScaleInSize.
+static int ddaFabricHierScaleIn(const ncclComm* comm) {
+  const ncclPeerInfo* peerInfo = comm->peerInfo;
+  const int nRanks = comm->nRanks;
+  if (peerInfo == nullptr || nRanks < 4) return 0;
+  auto sameCard = [&](int a, int b) {
+    return peerInfo[a].hostHash == peerInfo[b].hostHash && (peerInfo[a].busId & ~0xfLL) == (peerInfo[b].busId & ~0xfLL);
+  };
+  int size = 1;
+  while (size < nRanks && sameCard(size, 0)) size++;
+  if (size < 2 || size == nRanks || nRanks % size != 0) return 0;
+  for (int r = 1; r < nRanks; r++) {
+    if (sameCard(r, r - 1) != (r % size != 0)) return 0;
+  }
+  return size;
+}
+
 bool ncclDdaUseFabricPath(ncclComm* comm) {
   if (comm == nullptr) {
     return false;
@@ -231,6 +249,7 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
   comm->ddaPeerPtrsHost = peerHost;
   comm->ddaFabricBarrierState = barrierState;
   comm->ddaFabricMaxBlocks = nBlocksMax;
+  comm->ddaHierScaleIn = ddaFabricHierScaleIn(comm);
   comm->ddaLLEpochDev = epochDev;
   comm->ddaLLEpochLen = (int)epochLen;
   INFO(NCCL_INIT,
@@ -240,8 +259,8 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
        nRanks, bytes, (long long)fabricScratchOverride, (long long)llEnabled, (long long)llThresh,
        (long long)ll128Enabled, (long long)ll128Thresh, (long long)simpleThresh, nBlocksMax);
   INFO(NCCL_INIT,
-       "ncclDdaFabricCommInit: CU count=%d, local max blocks=%d, communicator max blocks=%d",
-       comm->cuCount, localBlocksMax, nBlocksMax);
+       "ncclDdaFabricCommInit: CU count=%d, local max blocks=%d, communicator max blocks=%d, ranks per device=%d",
+       comm->cuCount, localBlocksMax, nBlocksMax, comm->ddaHierScaleIn);
   return ncclSuccess;
 
 fail:
@@ -279,6 +298,7 @@ ncclResult_t ncclDdaFabricCommFini(ncclComm* comm) {
   CUDACHECKIGNORE(cudaFree(comm->ddaLLEpochDev));
   comm->ddaLLEpochDev = nullptr;
   comm->ddaLLEpochLen = 0;
+  comm->ddaHierScaleIn = 0;
   free(comm->ddaPeerPtrsHost);
   comm->ddaPeerPtrsHost = nullptr;
   // Destroying the fabric handler unmaps/frees the imported peer scratch buffers.

@@ -207,6 +207,15 @@ public:
   __device__ __forceinline__ void epochPostPiece(int to, FlagType epoch, unsigned piece) {
     epochPost(to, epoch + 2 + piece);
   }
+  // epochPostPiece without the store drain, for a block posting one piece to several ranks: call orderDestWrites()
+  // once, then this for each rank.
+  __device__ __forceinline__ void epochPostPieceDrained(int to, FlagType epoch, unsigned piece) {
+    if (threadIdx.x == 0) {
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      __scoped_atomic_store_n(peerFlags_[to] + getEpochFlagIdx(selfRank_, blockIdx.x), epoch + 2 + piece,
+                              __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    }
+  }
 
   __device__ __forceinline__ void epochWaitPiece(const FlagType* ready, FlagType epoch, unsigned piece) {
     if (threadIdx.x == 0) {

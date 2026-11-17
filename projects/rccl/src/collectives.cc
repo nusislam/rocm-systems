@@ -472,6 +472,14 @@ ncclResult_t ncclAllGather_impl(const void* sendbuff, void* recvbuff, size_t sen
     return rcclAddonLaunch(info, [&] {
       return ncclAllGatherDdaFabric(sendbuff, recvbuff, sendcount, datatype, comm, stream);
     });
+  case RCCL_DDA_FABRIC_HIER:
+    INFO(NCCL_COLL,
+         "AllGather: taking DDA fabric hierarchical path: nRanks=%d nNodes=%d sendcount=%zu datatype=%d "
+         "totalBytes=%zu",
+         comm->nRanks, comm->nNodes, sendcount, (int)datatype, msgSize);
+    return rcclAddonLaunch(info, [&] {
+      return ncclAllGatherDdaFabricHier(sendbuff, recvbuff, sendcount, datatype, comm, stream);
+    });
   case RCCL_DDA_IPC:
     return rcclAddonLaunch(info, [&] {
       return ncclAllGatherDdaIpc(sendbuff, recvbuff, sendcount, datatype, comm, stream);

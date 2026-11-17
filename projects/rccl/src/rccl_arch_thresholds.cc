@@ -491,6 +491,10 @@ static const rcclArchThresholds rcclArchThresholds_gfx1250_dpx = {
   .ddaA2aLL128MaxBlocks = 72,
   .ddaA2aLL128MaxBlocksMinBytes = 256ULL*1024,
   .ddaA2aLL128MaxBlocksMaxBytes = 16ULL*1024*1024,
+  // Hierarchical AllGather from 16 MiB on unregistered buffers, ahead of LL128. The 256 MiB ceiling is the scratch
+  // the AlltoAll VMM tier already needs, so it adds none.
+  .ddaAgHierMinBytes = 16ULL*1024*1024,
+  .ddaAgHierMaxBytes = 256ULL*1024*1024,
   // Ring / Tree crossovers, same sweep (AllReduce LL128: AICOMRCCL-2874/2875).
   .arRingLL128MaxPerRank = 16ULL*1024*1024,       // Ring Simple beats LL128 1.1-1.3x from 256M/512M/1G
                                                   // at 8/16/32 (DPX)

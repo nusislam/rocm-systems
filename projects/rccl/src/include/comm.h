@@ -736,6 +736,9 @@ struct ncclComm {
   nccl_dda_detail::DdaIpcBarrierState* ddaIpcBarrierState; /* IPC path only */
   nccl_dda_detail::DdaFabricBarrierState* ddaFabricBarrierState; /* fabric path only */
   int ddaFabricMaxBlocks;
+  // Consecutive ranks per physical device for the hierarchical fabric AllGather (2 in DPX); 0 when the comm does not
+  // split into two or more equal per-device groups.
+  int ddaHierScaleIn;
   // True when ddaScratch is VMM (cuMem) backed (fabric path); selects the
   // matching deallocator at teardown.
   bool ddaScratchIsVmm;

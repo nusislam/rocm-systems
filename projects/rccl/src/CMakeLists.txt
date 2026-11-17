@@ -30,6 +30,7 @@ set(SRC_FILES
   config/algorithm_registry.cc
   config/collconfig.cc
   algorithms/dda/all_gather/dda_all_gather_fabric.cu
+  algorithms/dda/all_gather/dda_all_gather_fabric_hier.cu
   algorithms/dda/all_gather/dda_all_gather_fabric_ll.cu
   algorithms/dda/all_gather/dda_all_gather_fabric_ll128.cu
   algorithms/dda/all_gather/dda_all_gather_ipc.cu
@@ -1065,6 +1066,7 @@ if(ENABLE_DEVICE_LINKER)
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_all_reduce_fabric_ll128\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_reduce_scatter_fabric\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_all_gather_fabric\\.cu\\.cpp$")
+  list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_all_gather_fabric_hier\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_all_gather_fabric_ll\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_all_gather_fabric_ll128\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_alltoall_fabric\\.cu\\.cpp$")

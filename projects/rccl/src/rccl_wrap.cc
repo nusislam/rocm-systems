@@ -1019,6 +1019,9 @@ ncclResult_t rcclGetAlgoName(int algo, const char** algoName) {
     case rcclAddonAlgos_t::RCCL_DDA_IPC:
       *algoName = "DDA-IPC";
       break;
+    case rcclAddonAlgos_t::RCCL_DDA_FABRIC_HIER:
+      *algoName = "DDA-Hier";
+      break;
     case rcclAddonAlgos_t::RCCL_GIN_SDMA:
       *algoName = "GIN-SDMA";
       break;
@@ -1424,6 +1427,11 @@ int rcclDdaFabricA2aLL128Blocks(const ncclComm* comm, size_t totalBytes) {
   return std::min(cap, table->ddaA2aLL128MaxBlocks);
 }
 
+static bool rcclDdaFabricAgHierInWindow(const ncclComm* comm, size_t totalBytes) {
+  const rcclArchThresholds* table = extAlgoArchTable(comm);
+  return table != nullptr && rcclWindowFits(totalBytes, table->ddaAgHierMinBytes, table->ddaAgHierMaxBytes);
+}
+
 // Widest window any enabled DDA tier can serve for this collective. The entry
 // gate only decides whether the per-tier checks run, so a tier tuned off (0)
 // must not hide the tiers that are still on: gfx1250 ReduceScatter has
@@ -1434,12 +1442,14 @@ int rcclDdaFabricA2aLL128Blocks(const ncclComm* comm, size_t totalBytes) {
 // branch, which checks rcclDdaVmmThreshold() there.
 // ddaVmmMaxGraph is also folded in: it is 0 for all collectives except AR
 // (256 MiB on gfx1250), so it only widens the gate for graph-mode AR calls
-// and is a no-op for all other collectives.
+// and is a no-op for all other collectives. The AllGather hierarchical window
+// is folded in the same way.
 inline size_t rcclDdaEntryThresholdTab(const rcclArchThresholds* table, ncclFunc_t func, int nRanks) {
   size_t cap = rcclDdaVmmThresholdTab(table, func, nRanks);
   cap = std::max(cap, rcclDdaLLThresholdTab(table, func, nRanks));
   cap = std::max(cap, rcclDdaLL128ThresholdTab(table, func, nRanks));
   if (table != nullptr)    cap = std::max(cap, funcThresholdFromTable(table->ddaVmmMaxGraph, func));
+  if (table != nullptr && func == ncclFuncAllGather) cap = std::max(cap, table->ddaAgHierMaxBytes);
   return cap;
 }
 size_t rcclDdaEntryThreshold(const ncclComm* comm, ncclFunc_t func) {
@@ -1484,6 +1494,8 @@ size_t rcclDdaScratchPayloadCap(const ncclComm* comm) {
     // ddaScratch, so that window must fit. AR 2-shot uses ceARTmpBuf.
     if (i != (int)ncclFuncAllReduce) bump(table->ceNonRegMax[i]);
   }
+  // The hierarchical AllGather stages every chunk in scratch.
+  bump(table->ddaAgHierMaxBytes);
   return cap;
 }
 
@@ -2343,6 +2355,15 @@ ncclResult_t rcclSelectAllGather(struct ncclComm* comm, const void* sendbuff, vo
       if (agFabricArch) {
         const size_t agDdaLLMax    = rcclDdaLLThresholdTab(archTable, ncclFuncAllGather, comm->nRanks);
         const size_t agDdaLL128Max = rcclDdaLL128ThresholdTab(archTable, ncclFuncAllGather, comm->nRanks);
+        // Hierarchical tier (only the DPX table opens its window). Unregistered buffers only: every chunk goes
+        // through the peers' scratch.
+        if (winRegType == ncclSymSendNonregRecvNonreg && rcclDdaFabricAgHierInWindow(comm, totalBytes) &&
+            ncclAllGatherDdaFabricHierEligible(comm, sendbuff, recvbuff, sendcount, datatype)) {
+          decision->algo = RCCL_DDA_FABRIC_HIER;
+          decision->protocol = NCCL_PROTO_SIMPLE;
+          decision->nMaxChannels = ncclAllGatherDdaFabricHierBlocks(comm, sendcount, datatype);
+          return rcclSelectDone("AG", query, decision);
+        }
         if (agDdaLLMax > 0 && msgSize <= agDdaLLMax &&
             ncclAllGatherDdaFabricLLEligible(comm, sendbuff, recvbuff, sendcount, datatype)) {
           decision->algo = RCCL_DDA_FABRIC_LL;

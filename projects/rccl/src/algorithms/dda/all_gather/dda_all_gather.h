@@ -32,6 +32,7 @@ uint32_t ncclAllGatherDdaIpcBlocks(ncclComm* comm, size_t sendcount, ncclDataTyp
 uint32_t ncclAllGatherDdaFabricBlocks(ncclComm* comm, size_t sendcount, ncclDataType_t datatype);
 uint32_t ncclAllGatherDdaFabricLLBlocks(ncclComm* comm, size_t sendcount, ncclDataType_t datatype);
 uint32_t ncclAllGatherDdaFabricLL128Blocks(ncclComm* comm, size_t sendcount, ncclDataType_t datatype);
+uint32_t ncclAllGatherDdaFabricHierBlocks(ncclComm* comm, size_t sendcount, ncclDataType_t datatype);
 
 /**
  * Check if DDA allgather is eligible for the fabric/VMM path (runtime nRanks
@@ -69,5 +70,19 @@ bool ncclAllGatherDdaFabricLL128Eligible(ncclComm* comm, const void* sendbuff, v
  */
 ncclResult_t ncclAllGatherDdaFabricLL128(const void* sendbuff, void* recvbuff, size_t sendcount,
                                          ncclDataType_t datatype, ncclComm* comm, cudaStream_t stream);
+
+/**
+ * Check if the hierarchical DDA allgather is eligible for the fabric/VMM path: the comm splits into two or more
+ * physical devices of consecutive ranks (DPX partitions), and every chunk fits a scratch slot.
+ */
+bool ncclAllGatherDdaFabricHierEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t sendcount,
+                                        ncclDataType_t datatype);
+
+/**
+ * Execute the hierarchical DDA allgather (rail ring across devices, broadcast to the sibling partitions of each
+ * device) using the fabric/VMM path. All transfers go through the peers' scratch buffers.
+ */
+ncclResult_t ncclAllGatherDdaFabricHier(const void* sendbuff, void* recvbuff, size_t sendcount,
+                                        ncclDataType_t datatype, ncclComm* comm, cudaStream_t stream);
 
 #endif
