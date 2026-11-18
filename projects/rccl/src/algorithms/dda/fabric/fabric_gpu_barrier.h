@@ -198,6 +198,26 @@ public:
     __syncthreads();
   }
 
+  // Entry handshake with a set of nPeers ranks, peerOf(i) for i < nPeers, closed under the relation (each of them
+  // handshakes with this rank too): posts epoch to every one of them, then waits for each to post at least epoch.
+  // Peers are spread over the threads and every post precedes every wait, so the handshakes cannot deadlock.
+  template <typename PeerOf>
+  __device__ __forceinline__ void epochSignalWaitPeers(int nPeers, PeerOf peerOf, FlagType epoch) {
+    for (int i = threadIdx.x; i < nPeers; i += blockDim.x) {
+      __scoped_atomic_store_n(peerFlags_[peerOf(i)] + getEpochFlagIdx(selfRank_, blockIdx.x), epoch, __ATOMIC_RELEASE,
+                              __MEMORY_SCOPE_SYSTEM);
+    }
+    for (int i = threadIdx.x; i < nPeers; i += blockDim.x) {
+      const FlagType* flag = epochFlagFrom(peerOf(i));
+      int spins = 0;
+      while (static_cast<int32_t>(__scoped_atomic_load_n(flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - epoch) < 0) {
+        if (params_.abortSpinTick(spins)) break;
+      }
+    }
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    __syncthreads();
+  }
+
   // Posts value to rank `to` once every store of the block has completed.
   __device__ __forceinline__ void epochPost(int to, FlagType value) {
     orderDestWrites();

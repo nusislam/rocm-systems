@@ -196,11 +196,15 @@ __launch_bounds__(512)
     halfArrivals[0] = 0;
     halfArrivals[1] = 0;
   }
-  // The previous collective's readers must be done with this rank's scratch before peers overwrite it. Its closing
-  // __syncthreads also publishes the counters above.
-  barrier.syncOnSameBlockIdx<false /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
-
   const FlagType epoch = barrier.epochBegin();
+  // This rank's reads of its scratch in the previous collective must be done before a peer overwrites it. Only the
+  // rail peers and the siblings write here, and this rank writes only to theirs, so the handshake is with them
+  // alone rather than with every rank. Other ranks' reads of this scratch in a previous collective are done once
+  // that kernel has finished here: every DDA kernel that reads a peer's scratch ends with an all-rank exit barrier.
+  // The closing __syncthreads also publishes the counters above.
+  barrier.epochSignalWaitPeers(
+    nGroups - 1 + scaleIn - 1,
+    [&](int i) { return i < nGroups - 1 ? cardAt(i + 1) * scaleIn + local : sibling(i - (nGroups - 1) + 1); }, epoch);
   DdaAgHierHalf half{&halfArrivals[pusher ? 0 : 1], static_cast<uint32_t>(nHalfWarps), 0};
   unsigned seq = 0;
 
