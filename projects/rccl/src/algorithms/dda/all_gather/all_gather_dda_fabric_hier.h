@@ -23,7 +23,10 @@
  * write lands in the receiver's scratch at the slot of the chunk's owner, and
  * the receiver copies it from there into recvbuff. Own chunks pushed by a
  * sibling are drained from this rank's scratch, rail chunks received by a
- * sibling from that sibling's scratch, one chunk behind this rank's own posts.
+ * sibling from that sibling's scratch. That drain runs while the next chunk is
+ * in flight: a group-0 block drains between issuing a chunk's stores and
+ * waiting for them, and the forwarders drain before waiting for the next rail
+ * chunk.
  *
  * A receive larger than the scratch goes through it in rounds, each a window of
  * every rank's slot, alternating between the two halves of the scratch. A rank
@@ -125,11 +128,12 @@ struct DdaAgHierHalf {
 //   group 0:  the block copies its chunk i to recvbuff and the siblings and posts seq + i to each sibling;
 //   group g:  the pushers write chunk i to rail peer g ahead and post seq + i to it; the forwarders wait for seq + i
 //             from rail peer g behind, post seq + i to each sibling, and copy the chunk to recvbuff.
-// The group-0 block drains the siblings' pushed chunk i - 1 from this rank's scratch, the forwarders the rail chunk
-// i - 1 the siblings received, from the siblings' scratch. A flag slot has one writer: pushers post only to rail
-// peers, the rest only to siblings. Pushers never wait, forwarders wait on pushers, and sibling drains wait on
-// group-0 copies or forwarders of the same unit, and a release wait of round r only on rounds up to r - 2, which
-// never wait on round r, so nothing can deadlock.
+// The group-0 block drains the siblings' pushed chunk i - 1 from this rank's scratch after issuing chunk i's stores
+// and before posting chunk i; the forwarders pull the siblings' rail chunk i - 1, from the siblings' scratch, before
+// waiting for rail chunk i. A flag slot has one writer: pushers post only to rail peers, the rest only to siblings.
+// A post of chunk i waits only on a sibling post of chunk i - 1 (group 0) or on the rail pusher's post of chunk i
+// (forwarders), a forwarder's pull of chunk i - 1 waits on the sibling's post of that same chunk, and a release wait
+// of round r only on rounds up to r - 2. Each of those is an earlier post, so the waits cannot form a cycle.
 template <typename T>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
@@ -285,21 +289,25 @@ __launch_bounds__(512)
           const size_t lo = (static_cast<size_t>(i) * nG0Blocks + groupBlock) * g0ChunkLines;
           return {lo, lo + g0ChunkLines < roundLines ? lo + g0ChunkLines : roundLines};
         };
+        // Chunk i's stores go out first. The siblings' chunk i - 1 is copied out of scratch while they are in flight,
+        // and only then does the block wait for its stores and post chunk i.
         for (unsigned i = 0; i <= n; ++i) {
           if (i < n) {
             auto [lo, hi] = range(i);
             ddaAgHierScatter<false>(sendLines, lo + t, hi, tn,
                                     [&](size_t line, uint4 v) { storeRecvAndSiblings(ownRecv, ownScratch, line, v); });
-            barrier.orderDestWrites();
-#pragma unroll
-            for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
-              if (d < scaleIn) barrier.epochPostPieceDrained(sibling(d), epoch, seq + i);
-            }
           }
           if (i > 0) {
             auto [lo, hi] = range(i - 1);
             drainSiblings(seq + i - 1, lo, hi, t, tn, /*wave=*/false, /*inSibling=*/false,
                           [&](int sibLocal) { return card * scaleIn + sibLocal; });
+          }
+          if (i < n) {
+            barrier.orderDestWrites();
+#pragma unroll
+            for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
+              if (d < scaleIn) barrier.epochPostPieceDrained(sibling(d), epoch, seq + i);
+            }
           }
         }
         seq += n;
@@ -327,7 +335,14 @@ __launch_bounds__(512)
         const int from = fromCard * scaleIn + local;
         uint4* const fromDst = recvLines + recvSlot(from);
         const uint4* const fromSrc = selfScratch + scratchSlot(from);
+        // The siblings' chunk i - 1 is pulled while the rail peer is still storing chunk i, and the wait for chunk i
+        // starts when that pull is done.
         for (unsigned i = 0; i <= n; ++i) {
+          if (i > 0) {
+            auto [lo, hi] = range(i - 1);
+            drainSiblings(seq + i - 1, lo, hi, ht, htn, /*wave=*/true, /*inSibling=*/true,
+                          [&](int sibLocal) { return fromCard * scaleIn + sibLocal; });
+          }
           if (i < n) {
             auto [lo, hi] = range(i);
             barrier.epochWaitPieceWave(barrier.epochFlagFrom(from), epoch, seq + i);
@@ -340,12 +355,6 @@ __launch_bounds__(512)
               }
             }
             ddaAgHierScatter<true>(fromSrc, lo + ht, hi, htn, [&](size_t line, uint4 v) { fromDst[line] = v; });
-          }
-          // The siblings' forwarders of this unit received the chunk of their own rail peer on fromCard.
-          if (i > 0) {
-            auto [lo, hi] = range(i - 1);
-            drainSiblings(seq + i - 1, lo, hi, ht, htn, /*wave=*/true, /*inSibling=*/true,
-                          [&](int sibLocal) { return fromCard * scaleIn + sibLocal; });
           }
         }
       }

@@ -244,15 +244,21 @@ public:
     __scoped_atomic_store_n(peerFlags_[to] + getEpochFlagIdx(selfRank_, blockIdx.x), epoch + 2 + piece,
                             __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
   }
-  // epochWaitPiece for one wave: every lane polls the slot (one load per wave) and the wave goes on alone, so the
-  // other waves of the block need not take part.
+  // epochWaitPiece for one wave: lane 0 polls the slot and the wave goes on alone, so the other waves of the block
+  // need not take part. Every lane of the wave must call it. The system acquire is on the lane that observed the
+  // flag; the wavefront fence publishes that observation to the other lanes before they load the data.
   __device__ __forceinline__ void epochWaitPieceWave(const FlagType* ready, FlagType epoch, unsigned piece) const {
-    const FlagType want = epoch + 2 + piece;
-    int spins = 0;
-    while (static_cast<int32_t>(__scoped_atomic_load_n(ready, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - want) < 0) {
-      if (params_.abortSpinTick(spins)) break;
+    if (threadIdx.x % warpSize == 0) {
+      const FlagType want = epoch + 2 + piece;
+      int spins = 0;
+      while (static_cast<int32_t>(__scoped_atomic_load_n(ready, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - want) < 0) {
+        if (params_.abortSpinTick(spins)) break;
+      }
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
     }
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
   }
 
   __device__ __forceinline__ void epochWaitPiece(const FlagType* ready, FlagType epoch, unsigned piece) {
