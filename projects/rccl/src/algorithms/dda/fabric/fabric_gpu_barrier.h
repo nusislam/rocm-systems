@@ -267,6 +267,36 @@ public:
     __syncthreads();
   }
 
+  // Release flags, for kernels that reuse a scratch region within a launch: a reader posts epoch + round once its
+  // block is done reading round `round`, and a writer waits for that before overwriting the region. They have their
+  // own slots, so they never mix with the piece posts to the same rank. Values grow within a launch, and the next
+  // launch's epoch is above them as long as the launch has fewer rounds than pieces plus two.
+  //
+  // Every wave drains its loads and stores, then the block posts epoch + round to peerOf(i), i < nPeers.
+  template <typename PeerOf>
+  __device__ __forceinline__ void epochPostReleased(int nPeers, PeerOf peerOf, FlagType epoch, unsigned round) {
+    orderDestWrites();
+    for (int i = threadIdx.x; i < nPeers; i += blockDim.x) {
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      __scoped_atomic_store_n(peerFlags_[peerOf(i)] + getReleaseFlagIdx(selfRank_, blockIdx.x), epoch + round,
+                              __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    }
+  }
+  // Waits until every peerOf(i), i < nPeers, has posted at least epoch + round to this block.
+  template <typename PeerOf>
+  __device__ __forceinline__ void epochWaitReleased(int nPeers, PeerOf peerOf, FlagType epoch, unsigned round) {
+    const FlagType want = epoch + round;
+    for (int i = threadIdx.x; i < nPeers; i += blockDim.x) {
+      const FlagType* flag = peerFlags_[selfRank_] + getReleaseFlagIdx(peerOf(i), blockIdx.x);
+      int spins = 0;
+      while (static_cast<int32_t>(__scoped_atomic_load_n(flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - want) < 0) {
+        if (params_.abortSpinTick(spins)) break;
+      }
+    }
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    __syncthreads();
+  }
+
   // The slot rank `from` posts to from this block index, in this rank's buffer. Every wave polls it.
   __device__ __forceinline__ const FlagType* epochFlagFrom(int from) const {
     return epochFlagFrom(from, static_cast<int>(blockIdx.x));
@@ -330,12 +360,16 @@ private:
     return block * nRanks_ + rank;
   }
 
-  // Buffer layout: [0, n * b) toggle flags, [n * b, 2 * n * b) epoch flags, then b epoch cells (n ranks, b blocks).
+  // Buffer layout: [0, n * b) toggle flags, [n * b, 2 * n * b) epoch flags, then b epoch cells, then n * b release
+  // flags (n ranks, b blocks).
   __device__ inline int getEpochFlagIdx(int rank, int block) const {
     return nBlocks_ * nRanks_ + block * nRanks_ + rank;
   }
   __device__ inline FlagType* epochCell() const {
     return peerFlags_[selfRank_] + 2 * nBlocks_ * nRanks_;
+  }
+  __device__ inline int getReleaseFlagIdx(int rank, int block) const {
+    return 2 * nBlocks_ * nRanks_ + nBlocks_ + block * nRanks_ + rank;
   }
 };
 

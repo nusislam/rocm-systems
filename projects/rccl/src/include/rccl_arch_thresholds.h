@@ -152,10 +152,12 @@ struct rcclArchThresholds {
 
   // AllGather only: inclusive total-byte window of the hierarchical DDA fabric AllGather (alltoall across the rail,
   // broadcast to the sibling partitions of each device). It runs ahead of the other DDA tiers, on unregistered
-  // buffers of comms whose ranks group into two or more devices. A max of 0 turns it off. The fabric scratch is
-  // sized to cover the max.
+  // buffers of comms whose ranks group into two or more devices. A max of 0 turns it off. A message whose receive
+  // does not fit the fabric scratch goes through it in rounds, half of the scratch per round.
   size_t ddaAgHierMinBytes;
   size_t ddaAgHierMaxBytes;
+  // Fabric scratch the hierarchical AllGather asks for; the scratch is sized to cover it.
+  size_t ddaAgHierScratchBytes;
 
   // Ring / Tree crossovers that replace the tuning model's ranges on single-node
   // comms (nNodes == 1). Sizes are per rank as rcclGetSizePerRank() reports them

@@ -1494,8 +1494,8 @@ size_t rcclDdaScratchPayloadCap(const ncclComm* comm) {
     // ddaScratch, so that window must fit. AR 2-shot uses ceARTmpBuf.
     if (i != (int)ncclFuncAllReduce) bump(table->ceNonRegMax[i]);
   }
-  // The hierarchical AllGather stages every chunk in scratch.
-  bump(table->ddaAgHierMaxBytes);
+  // The hierarchical AllGather stages every chunk in scratch, in rounds once a receive outgrows it.
+  bump(table->ddaAgHierScratchBytes);
   return cap;
 }
 

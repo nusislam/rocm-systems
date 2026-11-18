@@ -60,6 +60,16 @@ static inline size_t ddaAllGatherFabricHierChunkLines() {
   return std::max<size_t>(1, bytes / sizeof(uint4));
 }
 
+// Lines of each rank's slot per round: the whole chunk when every rank's chunk fits the scratch (one round), else
+// what fits half of it (double-buffered rounds). 0 when the scratch cannot hold one line per rank per half.
+static inline size_t ddaAllGatherFabricHierWindowLines(const ncclComm* comm, size_t bytes) {
+  const size_t nLines = bytes / sizeof(uint4);
+  const size_t nRanks = static_cast<size_t>(comm->nRanks);
+  const size_t scratchLines = comm->ddaScratchBytes / sizeof(uint4);
+  if (nLines <= scratchLines / nRanks) return nLines;
+  return std::min(nLines, scratchLines / (2 * nRanks));
+}
+
 // The comm splits into two or more devices of scaleIn consecutive ranks each, and the kernel handles scaleIn.
 static bool ddaAllGatherFabricHierTopologyOk(const ncclComm* comm) {
   const int scaleIn = comm->ddaHierScaleIn;
@@ -75,9 +85,10 @@ static ncclResult_t ncclAllGatherDdaFabricHierBytes(const void* sendbuff, void* 
   }
 
   const int nRanks = comm->nRanks;
-  if (bytes * nRanks > comm->ddaScratchBytes) {
-    WARN("DDA fabric hierarchical allgather: %zu bytes per rank need %zu bytes; comm scratch is %zu bytes", bytes,
-         bytes * nRanks, comm->ddaScratchBytes);
+  const size_t windowLines = ddaAllGatherFabricHierWindowLines(comm, bytes);
+  if (windowLines == 0) {
+    WARN("DDA fabric hierarchical allgather: comm scratch of %zu bytes cannot hold two 16-byte lines per rank",
+         comm->ddaScratchBytes);
     return ncclInvalidArgument;
   }
 
@@ -86,6 +97,8 @@ static ncclResult_t ncclAllGatherDdaFabricHierBytes(const void* sendbuff, void* 
   const auto& block = gridBlock.second;
   const size_t chunkLines = ddaAllGatherFabricHierChunkLines();
   const int scaleIn = comm->ddaHierScaleIn;
+  const size_t nLines = bytes / sizeof(uint4);
+  const size_t nRounds = (nLines + windowLines - 1) / windowLines;
 
   auto* barrierState = static_cast<DdaFabricBarrierState*>(comm->ddaFabricBarrierState);
   dda::common::FabricGpuBarrier barrierHost = barrierState->barrierHost;
@@ -93,16 +106,17 @@ static ncclResult_t ncclAllGatherDdaFabricHierBytes(const void* sendbuff, void* 
 
   INFO(NCCL_COLL,
        "DDA fabric hierarchical AllGather: launching kernel: nRanks=%d devices=%d ranksPerDevice=%d bytes=%zu "
-       "grid=%u block=%u group0Blocks=%d groupBlocks=%d maxChunkBytes=%zu",
+       "grid=%u block=%u group0Blocks=%d groupBlocks=%d maxChunkBytes=%zu rounds=%zu windowBytes=%zu",
        nRanks, nRanks / scaleIn, scaleIn, bytes, grid.x, block.x,
        dda::common::ddaAgHierG0Blocks(static_cast<int>(grid.x), nRanks / scaleIn),
-       dda::common::ddaAgHierGroupBlocks(static_cast<int>(grid.x), nRanks / scaleIn), chunkLines * sizeof(uint4));
+       dda::common::ddaAgHierGroupBlocks(static_cast<int>(grid.x), nRanks / scaleIn), chunkLines * sizeof(uint4),
+       nRounds, windowLines * sizeof(uint4));
 
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
   hipExtLaunchKernelGGL((dda::common::ddaAllGatherFabricHier<int8_t>), grid, block, 0, stream,
                         /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<int8_t*>(recvbuff),
                         static_cast<const int8_t*>(sendbuff), bytes, comm->rank, nRanks, scaleIn, chunkLines,
-                        barrierHost);
+                        windowLines, barrierHost);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }
@@ -134,8 +148,9 @@ bool ncclAllGatherDdaFabricHierEligible(ncclComm* comm, const void* sendbuff, vo
   }
 
   const size_t bytes = sendcount * ncclTypeSize(datatype);
-  // Every chunk has a scratch slot, since no peer can write recvbuff.
-  if (bytes * comm->nRanks > comm->ddaScratchBytes) {
+  // Every chunk goes through a scratch slot, since no peer can write recvbuff; a chunk too large for the scratch
+  // goes in rounds, so only a scratch without room for one line per rank per half is too small.
+  if (ddaAllGatherFabricHierWindowLines(comm, bytes) == 0) {
     return false;
   }
   // The kernel moves 16-byte lines of both user buffers.
