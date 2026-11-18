@@ -29,10 +29,9 @@ RCCL_PARAM(DdaAgHier, "DDA_AG_HIER", 1);
 // RCCL_DDA_AG_HIER_BLOCKS: grid size, at most the init block cap. 0 (default) = kDdaAgHierDefaultBlocks.
 // Must be the same on every rank.
 RCCL_PARAM(DdaAgHierBlocks, "DDA_AG_HIER_BLOCKS", 0);
-// RCCL_DDA_AG_HIER_PIECES: pieces each chunk is cut into to pipeline the rail alltoall. 0 (default) = one per 512 KiB of the
-// chunk, 1 to 16; > 0 requests that many, capped at 64 and at the rows each thread copies. Must be the same on every
-// rank.
-RCCL_PARAM(DdaAgHierPieces, "DDA_AG_HIER_PIECES", 0);
+// RCCL_DDA_AG_HIER_CHUNK_BYTES: largest chunk a block moves between flags. 0 (default) = kDdaAgHierDefaultChunkBytes;
+// otherwise rounded down to 16 B, at least 16 B. Must be the same on every rank.
+RCCL_PARAM(DdaAgHierChunkBytes, "DDA_AG_HIER_CHUNK_BYTES", 0);
 
 namespace {
 
@@ -41,7 +40,8 @@ using nccl_dda_detail::DdaFabricBarrierState;
 
 constexpr uint32_t kDdaAgHierThreads = 512;
 constexpr size_t kDdaAgHierDefaultBlocks = 64;
-constexpr unsigned kDdaAgHierMaxAutoPieces = 16;
+// Matches ncclSymkAgHierMaxChunkBytes of the symmetric hierarchical AllGather.
+constexpr size_t kDdaAgHierDefaultChunkBytes = 256 << 10;
 
 // Every rank gets the same grid: it depends only on the chunk size, the env and the init-time block cap.
 static inline std::pair<dim3, dim3> ddaAllGatherFabricHierGeom(ncclComm* comm, size_t bytes) {
@@ -53,10 +53,11 @@ static inline std::pair<dim3, dim3> ddaAllGatherFabricHierGeom(ncclComm* comm, s
   return {dim3(static_cast<unsigned>(blocks)), dim3(kDdaAgHierThreads)};
 }
 
-static inline unsigned ddaAllGatherFabricHierPieces(size_t bytes) {
-  const int64_t forced = rcclParamDdaAgHierPieces();
-  if (forced > 0) return static_cast<unsigned>(std::min<int64_t>(forced, 64));
-  return static_cast<unsigned>(std::clamp<size_t>(bytes >> 19, 1, kDdaAgHierMaxAutoPieces));
+// Largest chunk in 16 B lines.
+static inline size_t ddaAllGatherFabricHierChunkLines() {
+  const int64_t forced = rcclParamDdaAgHierChunkBytes();
+  const size_t bytes = forced > 0 ? static_cast<size_t>(forced) : kDdaAgHierDefaultChunkBytes;
+  return std::max<size_t>(1, bytes / sizeof(uint4));
 }
 
 // The comm splits into two or more devices of scaleIn consecutive ranks each, and the kernel handles scaleIn.
@@ -83,7 +84,7 @@ static ncclResult_t ncclAllGatherDdaFabricHierBytes(const void* sendbuff, void* 
   const auto gridBlock = ddaAllGatherFabricHierGeom(comm, bytes);
   const auto& grid = gridBlock.first;
   const auto& block = gridBlock.second;
-  const unsigned pieces = ddaAllGatherFabricHierPieces(bytes);
+  const size_t chunkLines = ddaAllGatherFabricHierChunkLines();
   const int scaleIn = comm->ddaHierScaleIn;
 
   auto* barrierState = static_cast<DdaFabricBarrierState*>(comm->ddaFabricBarrierState);
@@ -92,13 +93,15 @@ static ncclResult_t ncclAllGatherDdaFabricHierBytes(const void* sendbuff, void* 
 
   INFO(NCCL_COLL,
        "DDA fabric hierarchical AllGather: launching kernel: nRanks=%d devices=%d ranksPerDevice=%d bytes=%zu "
-       "grid=%u block=%u pieces=%u",
-       nRanks, nRanks / scaleIn, scaleIn, bytes, grid.x, block.x, pieces);
+       "grid=%u block=%u group0Blocks=%d groupBlocks=%d maxChunkBytes=%zu",
+       nRanks, nRanks / scaleIn, scaleIn, bytes, grid.x, block.x,
+       dda::common::ddaAgHierG0Blocks(static_cast<int>(grid.x), nRanks / scaleIn),
+       dda::common::ddaAgHierGroupBlocks(static_cast<int>(grid.x), nRanks / scaleIn), chunkLines * sizeof(uint4));
 
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
   hipExtLaunchKernelGGL((dda::common::ddaAllGatherFabricHier<int8_t>), grid, block, 0, stream,
                         /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<int8_t*>(recvbuff),
-                        static_cast<const int8_t*>(sendbuff), bytes, comm->rank, nRanks, scaleIn, pieces,
+                        static_cast<const int8_t*>(sendbuff), bytes, comm->rank, nRanks, scaleIn, chunkLines,
                         barrierHost);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;

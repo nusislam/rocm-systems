@@ -115,9 +115,9 @@ public:
     }
   }
 
-  // Waits until every store this wave has issued has completed, so a system-scope store has reached its
-  // destination and then syncs the block so every wave's stores are done.
-  __device__ __forceinline__ void orderDestWrites() {
+  // Waits until every store this wave has issued has completed, so a system-scope store has reached its destination.
+  // No block sync: a warp group that posts on its own pairs this with a sync of its own waves.
+  static __device__ __forceinline__ void drainWaveWrites() {
 #if defined(__gfx1250__)
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     asm volatile("s_wait_loadcnt 0x0\n\ts_wait_storecnt 0x0" ::: "memory");
@@ -125,6 +125,11 @@ public:
 #else
     __threadfence_system();
 #endif
+  }
+
+  // drainWaveWrites, then syncs the block so every wave's stores are done.
+  __device__ __forceinline__ void orderDestWrites() {
+    drainWaveWrites();
     __builtin_amdgcn_s_barrier();
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
   }
@@ -210,11 +215,24 @@ public:
   // epochPostPiece without the store drain, for a block posting one piece to several ranks: call orderDestWrites()
   // once, then this for each rank.
   __device__ __forceinline__ void epochPostPieceDrained(int to, FlagType epoch, unsigned piece) {
-    if (threadIdx.x == 0) {
-      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
-      __scoped_atomic_store_n(peerFlags_[to] + getEpochFlagIdx(selfRank_, blockIdx.x), epoch + 2 + piece,
-                              __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    if (threadIdx.x == 0) epochStorePiece(to, epoch, piece);
+  }
+  // The store of epochPostPieceDrained from whichever single thread calls it, for a warp group that drains its own
+  // stores (drainWaveWrites plus a sync of its waves) and posts from its leader.
+  __device__ __forceinline__ void epochStorePiece(int to, FlagType epoch, unsigned piece) {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+    __scoped_atomic_store_n(peerFlags_[to] + getEpochFlagIdx(selfRank_, blockIdx.x), epoch + 2 + piece,
+                            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+  }
+  // epochWaitPiece for one wave: every lane polls the slot (one load per wave) and the wave goes on alone, so the
+  // other waves of the block need not take part.
+  __device__ __forceinline__ void epochWaitPieceWave(const FlagType* ready, FlagType epoch, unsigned piece) const {
+    const FlagType want = epoch + 2 + piece;
+    int spins = 0;
+    while (static_cast<int32_t>(__scoped_atomic_load_n(ready, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - want) < 0) {
+      if (params_.abortSpinTick(spins)) break;
     }
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
   }
 
   __device__ __forceinline__ void epochWaitPiece(const FlagType* ready, FlagType epoch, unsigned piece) {
