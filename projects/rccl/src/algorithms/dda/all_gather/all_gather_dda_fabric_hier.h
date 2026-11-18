@@ -91,8 +91,8 @@ struct DdaAgHierHalf {
   __device__ __forceinline__ void sync() {
     ++gen;
     if (threadIdx.x % warpSize == 0) {
-      __hip_atomic_fetch_add(counter, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_WORKGROUP);
-      while (__hip_atomic_load(counter, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_WORKGROUP) < gen * nWaves) {
+      __scoped_atomic_fetch_add(counter, 1u, __ATOMIC_RELEASE, __MEMORY_SCOPE_WRKGRP);
+      while (__scoped_atomic_load_n(counter, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_WRKGRP) < gen * nWaves) {
         __builtin_amdgcn_s_sleep(1);
       }
     }
