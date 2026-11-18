@@ -9,25 +9,27 @@
  * ranks with its partition index on every device; its siblings are the other
  * ranks of its own device. Each rank pushes its own chunk directly to every
  * other rank on its rail (one hop, not a ring) and to its siblings. A chunk
- * that arrives on the rail is forwarded to the siblings, so it crosses into
- * each device once.
+ * that arrives on the rail is read by the siblings straight out of the
+ * receiver's scratch, so it crosses into each device once.
  *
  * As in agHierPush, the blocks are dealt out as units. A group-0 unit copies
  * the own chunk to recvbuff and the siblings with the whole block. A group-g
  * unit splits its block in halves: the pusher warps push the own chunk to the
  * rail peer g devices ahead, while the forwarder warps wait for the chunk of
- * the rail peer g devices behind and broadcast it within the device.
+ * the rail peer g devices behind, tell the siblings it is there and copy it to
+ * recvbuff.
  *
  * User buffers are not registered, so no peer touches recvbuff: every remote
  * write lands in the receiver's scratch at the slot of the chunk's owner, and
- * the receiver copies it from there into recvbuff. The siblings' writes are
- * drained by the warps that wrote the same lines to the siblings, one chunk
- * behind their own posts.
+ * the receiver copies it from there into recvbuff. Own chunks pushed by a
+ * sibling are drained from this rank's scratch, rail chunks received by a
+ * sibling from that sibling's scratch, one chunk behind this rank's own posts.
  *
  * A receive larger than the scratch goes through it in rounds, each a window of
  * every rank's slot, alternating between the two halves of the scratch. A rank
- * overwrites a peer's half only once that peer has released the round that used
- * it two rounds before, so one round's sends overlap the previous round's drain.
+ * overwrites a peer's half only once every rank that reads it has released the
+ * round that used it two rounds before, so one round's sends overlap the
+ * previous round's drain.
  *
  * See LICENSE.txt for license information.
  ************************************************************************/
@@ -107,21 +109,24 @@ struct DdaAgHierHalf {
 
 // count is the per-rank chunk in elements, a multiple of 16 B. A rank's chunk goes in rounds of windowLines 16 B
 // lines (the last may be shorter). Round r uses scratch bank r % 2, nRanks slots of windowLines lines each written by
-// one rank: a rank pushes its own slot to every rail peer and every sibling, and forwards each rail slot it receives
-// to its siblings. The rank's own slot is never written. With a single round only bank 0 is used, so the host may pass
-// windowLines = count lines whenever nRanks slots of it fit the scratch, and half the scratch per slot set otherwise.
+// one rank: a rank pushes its own slot to every rail peer and every sibling. A rail slot it receives is read by its
+// siblings in place. The rank's own slot is never written. With a single round only bank 0 is used, so the host may
+// pass windowLines = count lines whenever nRanks slots of it fit the scratch, and half the scratch per slot set
+// otherwise.
 //
 // Units and chunks depend only on windowLines, the grid and maxChunkLines, so block b of every rank runs the same
 // units in the same order in every round, and the flags pair blocks of equal index. A unit's window is cut into
 // chunks of at most maxChunkLines lines; the block's chunk i is chunk i * nUnitBlocks + groupBlock, clipped to the
-// round. Block b of a rank therefore reads only the scratch lines block b of its rail peers and siblings write, so
-// bank reuse is per block: after round r a block posts release r to the ranks that write to it, and before round r it
-// waits for release r - 2 from the ranks it writes to (the same ranks). Flag values run on across the block's units
-// and rounds (seq), so the posts one block makes to one rank only grow:
+// round. Block b of a rank therefore reads only scratch lines that block b of other ranks write, so bank reuse is per
+// block. A rank's scratch is read by the rank and by its siblings, so the ranks reading what a rank writes (its rail
+// peers and their siblings, and its own siblings) are every other rank: after round r a block posts release r to
+// every other rank, and before round r it waits for release r - 2 from every other rank. Flag values run on across
+// the block's units and rounds (seq), so the posts one block makes to one rank only grow:
 //   group 0:  the block copies its chunk i to recvbuff and the siblings and posts seq + i to each sibling;
 //   group g:  the pushers write chunk i to rail peer g ahead and post seq + i to it; the forwarders wait for seq + i
-//             from rail peer g behind, copy the chunk to recvbuff and the siblings, and post seq + i to each sibling.
-// Each also drains the siblings' chunk i - 1 of the same unit. A flag slot has one writer: pushers post only to rail
+//             from rail peer g behind, post seq + i to each sibling, and copy the chunk to recvbuff.
+// The group-0 block drains the siblings' pushed chunk i - 1 from this rank's scratch, the forwarders the rail chunk
+// i - 1 the siblings received, from the siblings' scratch. A flag slot has one writer: pushers post only to rail
 // peers, the rest only to siblings. Pushers never wait, forwarders wait on pushers, and sibling drains wait on
 // group-0 copies or forwarders of the same unit, and a release wait of round r only on rounds up to r - 2, which
 // never wait on round r, so nothing can deadlock.
@@ -219,12 +224,14 @@ __launch_bounds__(512)
   // that kernel has finished here: every DDA kernel that reads a peer's scratch ends with an all-rank exit barrier.
   // The closing __syncthreads also publishes the counters above.
   barrier.epochSignalWaitPeers(nPeers, peerOf, epoch);
+  // Every other rank: the readers of what this rank writes within a launch, and the writers of what it reads.
+  auto otherRank = [&](int i) { return i < selfRank ? i : i + 1; };
   DdaAgHierHalf half{&halfArrivals[pusher ? 0 : 1], static_cast<uint32_t>(nHalfWarps), 0};
   unsigned seq = 0;
 
   for (size_t round = 0; round < nRounds; ++round) {
-    // The bank this round writes was read in round - 2; every rank written here must have released it.
-    if (round >= 2) barrier.epochWaitReleased(nPeers, peerOf, epoch, static_cast<unsigned>(round - 2));
+    // The bank this round writes was read in round - 2; every rank reading it must have released it.
+    if (round >= 2) barrier.epochWaitReleased(nRanks - 1, otherRank, epoch, static_cast<unsigned>(round - 2));
 
     const size_t roundLo = round * windowLines;
     const size_t roundLines = nLines - roundLo < windowLines ? nLines - roundLo : windowLines;
@@ -244,9 +251,11 @@ __launch_bounds__(512)
         if (d < scaleIn) scratchOf(sibling(d))[scratchOff + line] = v;
       }
     };
-    // Copies lines [lo, hi) of rank ownerOf(sibLocal)'s slot, for every sibling, from this rank's scratch into
-    // recvbuff, once that sibling has posted `piece`. Wave: the calling threads are one half, which waits per wave.
-    auto drainSiblings = [&](unsigned piece, size_t lo, size_t hi, int t, int tn, bool wave, auto&& ownerOf) {
+    // Copies lines [lo, hi) of rank ownerOf(sibLocal)'s slot, for every sibling, into recvbuff once that sibling has
+    // posted `piece`: from this rank's scratch, or from the sibling's (inSibling). Wave: the calling threads are one
+    // half, which waits per wave.
+    auto drainSiblings = [&](unsigned piece, size_t lo, size_t hi, int t, int tn, bool wave, bool inSibling,
+                             auto&& ownerOf) {
 #pragma unroll
       for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
         if (d < scaleIn) {
@@ -257,9 +266,9 @@ __launch_bounds__(512)
             barrier.epochWaitPiece(barrier.epochFlagFrom(sib), epoch, piece);
           }
           const int owner = ownerOf(sib - card * scaleIn);
+          const uint4* const src = (inSibling ? scratchOf(sib) : selfScratch) + scratchSlot(owner);
           uint4* const dst = recvLines + recvSlot(owner);
-          ddaAgHierScatter<true>(selfScratch + scratchSlot(owner), lo + t, hi, tn,
-                                 [&](size_t line, uint4 v) { dst[line] = v; });
+          ddaAgHierScatter<true>(src, lo + t, hi, tn, [&](size_t line, uint4 v) { dst[line] = v; });
         }
       }
     };
@@ -289,7 +298,7 @@ __launch_bounds__(512)
           }
           if (i > 0) {
             auto [lo, hi] = range(i - 1);
-            drainSiblings(seq + i - 1, lo, hi, t, tn, /*wave=*/false,
+            drainSiblings(seq + i - 1, lo, hi, t, tn, /*wave=*/false, /*inSibling=*/false,
                           [&](int sibLocal) { return card * scaleIn + sibLocal; });
           }
         }
@@ -316,28 +325,26 @@ __launch_bounds__(512)
       } else if (forwarder) {
         const int fromCard = cardAt(-group);
         const int from = fromCard * scaleIn + local;
-        const size_t fromScratch = scratchSlot(from);
-        const size_t fromRecv = recvSlot(from);
+        uint4* const fromDst = recvLines + recvSlot(from);
+        const uint4* const fromSrc = selfScratch + scratchSlot(from);
         for (unsigned i = 0; i <= n; ++i) {
           if (i < n) {
             auto [lo, hi] = range(i);
             barrier.epochWaitPieceWave(barrier.epochFlagFrom(from), epoch, seq + i);
-            ddaAgHierScatter<true>(selfScratch + fromScratch, lo + ht, hi, htn, [&](size_t line, uint4 v) {
-              storeRecvAndSiblings(fromRecv, fromScratch, line, v);
-            });
-            FabricGpuBarrier::drainWaveWrites();
-            half.sync();
+            // The chunk is in this rank's scratch, where the siblings read it, so the leader posts as soon as its
+            // own wave has seen it arrive.
             if (ht == 0) {
 #pragma unroll
               for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
                 if (d < scaleIn) barrier.epochStorePiece(sibling(d), epoch, seq + i);
               }
             }
+            ddaAgHierScatter<true>(fromSrc, lo + ht, hi, htn, [&](size_t line, uint4 v) { fromDst[line] = v; });
           }
-          // The siblings' forwarders of this unit forwarded the chunk of their own rail peer on fromCard.
+          // The siblings' forwarders of this unit received the chunk of their own rail peer on fromCard.
           if (i > 0) {
             auto [lo, hi] = range(i - 1);
-            drainSiblings(seq + i - 1, lo, hi, ht, htn, /*wave=*/true,
+            drainSiblings(seq + i - 1, lo, hi, ht, htn, /*wave=*/true, /*inSibling=*/true,
                           [&](int sibLocal) { return fromCard * scaleIn + sibLocal; });
           }
         }
@@ -346,8 +353,10 @@ __launch_bounds__(512)
       __syncthreads();
     }
 
-    // Done reading this round's bank: the ranks that write here may reuse it two rounds on.
-    if (round + 2 < nRounds) barrier.epochPostReleased(nPeers, peerOf, epoch, static_cast<unsigned>(round));
+    // Done reading this round's bank, here and in the siblings: the writers may reuse it two rounds on.
+    if (round + 2 < nRounds) {
+      barrier.epochPostReleased(nRanks - 1, otherRank, epoch, static_cast<unsigned>(round));
+    }
   }
 
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
