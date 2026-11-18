@@ -38,7 +38,7 @@ namespace {
 using dda::common::kDdaAgHierMaxScaleIn;
 using nccl_dda_detail::DdaFabricBarrierState;
 
-constexpr uint32_t kDdaAgHierThreads = 512;
+constexpr uint32_t kDdaAgHierThreads = 256;
 constexpr size_t kDdaAgHierDefaultBlocks = 64;
 // Matches ncclSymkAgHierMaxChunkBytes of the symmetric hierarchical AllGather.
 constexpr size_t kDdaAgHierDefaultChunkBytes = 256 << 10;

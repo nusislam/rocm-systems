@@ -135,9 +135,7 @@ struct DdaAgHierHalf {
 // (forwarders), a forwarder's pull of chunk i - 1 waits on the sibling's post of that same chunk, and a release wait
 // of round r only on rounds up to r - 2. Each of those is an earlier post, so the waits cannot form a cycle.
 template <typename T>
-#if defined(USE_ROCM)
 __launch_bounds__(512)
-#endif
   __global__ void ddaAllGatherFabricHier(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff,
                                          const T* __restrict__ sendbuff, size_t count, int selfRank, int nRanks,
                                          int scaleIn, size_t maxChunkLines, size_t windowLines,
