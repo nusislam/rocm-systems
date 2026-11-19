@@ -14,20 +14,21 @@
  *
  * As in agHierPush, the blocks are dealt out as units. A group-0 unit copies
  * the own chunk to recvbuff and the siblings with the whole block. A group-g
- * unit splits its block's warps between pushers and forwarders (about 1 : scaleIn,
- * since a forwarder moves the rail chunk and the siblings' too): the pusher warps push the own chunk to the
- * rail peer g devices ahead, while the forwarder warps wait for the chunk of
- * the rail peer g devices behind, tell the siblings it is there and copy it to
- * recvbuff.
+ * unit splits its warps three ways, about 1 : 1 : (scaleIn - 1). The pusher
+ * warps push the own chunk to the rail peer g devices ahead. The forwarder
+ * warps wait for the chunk of the rail peer g devices behind, tell the
+ * siblings it is there and copy it to recvbuff. The puller warps copy each
+ * sibling's rail chunk out of that sibling's scratch. Push, forward and pull
+ * of one chunk run together.
  *
  * User buffers are not registered, so no peer touches recvbuff: every remote
  * write lands in the receiver's scratch at the slot of the chunk's owner, and
  * the receiver copies it from there into recvbuff. Own chunks pushed by a
- * sibling are drained from this rank's scratch, rail chunks received by a
- * sibling from that sibling's scratch. That drain runs while the next chunk is
- * in flight: a group-0 block drains between issuing a chunk's stores and
- * waiting for them, and the forwarders drain before waiting for the next rail
- * chunk.
+ * sibling are drained from this rank's scratch by the whole block, rail chunks
+ * received by a sibling from that sibling's scratch by the puller warps. The
+ * group-0 drain runs while the next chunk is in flight: the block drains
+ * between issuing a chunk's stores and waiting for them. The pullers drain a
+ * rail chunk while the forwarders copy their own.
  *
  * A receive larger than the scratch goes through it in rounds, each a window of
  * every rank's slot, alternating between the two halves of the scratch. A rank
@@ -58,15 +59,55 @@ constexpr int kDdaAgHierUnroll = 16;
 // Batch the tail of a range falls back to before it goes one line at a time.
 constexpr int kDdaAgHierMidUnroll = 4;
 
-// Warps of a block that push in a group-g unit (the rest forward), for a block of nBlockWarps warps over ranks of
-// scaleIn partitions per device, or forced when forcedPushWarps > 0. A forwarder moves the chunk it receives on the
-// rail and pulls the same-size chunk each of the scaleIn - 1 siblings received, so it has scaleIn times the bytes of
-// a pusher: the warps split 1 : scaleIn instead of evenly. The split only decides which thread copies which line, so
-// it needs not agree between ranks.
-__host__ __device__ constexpr int ddaAgHierPushWarps(int nBlockWarps, int scaleIn, int forcedPushWarps) {
-  int n = forcedPushWarps > 0 ? forcedPushWarps : (nBlockWarps + scaleIn) / (scaleIn + 1);
-  if (n > nBlockWarps - 1) n = nBlockWarps - 1;
-  return n > 1 ? n : 1;
+// Warps of a group-g unit: push the rail chunk, forward the chunk that arrived here, pull the chunks that arrived
+// at the siblings. Bytes move 1 : 1 : (scaleIn - 1), and the warps follow; a remainder warp goes to the pull, then
+// the push, since both cross to another GPU. forcedPush or forcedPull above 0 replaces that role's share.
+// Each role keeps at least one warp. The split only decides which thread copies which line, so it needs not agree
+// between ranks.
+struct DdaAgHierRoles {
+  int push;
+  int forward;
+  int pull;
+};
+
+__host__ __device__ constexpr int ddaAgHierClampWarps(int n, int lo, int hi) {
+  return n < lo ? lo : (n > hi ? hi : n);
+}
+
+__host__ __device__ constexpr DdaAgHierRoles ddaAgHierRoleWarps(int nBlockWarps, int scaleIn, int forcedPush,
+                                                               int forcedPull) {
+  const int warps = nBlockWarps < 3 ? 3 : nBlockWarps;
+  const int sibs = scaleIn > 1 ? scaleIn - 1 : 1;
+  int nPush;
+  int nPull;
+  if (forcedPush > 0 && forcedPull > 0) {
+    nPush = ddaAgHierClampWarps(forcedPush, 1, warps - 2);
+    nPull = ddaAgHierClampWarps(forcedPull, 1, warps - nPush - 1);
+  } else if (forcedPush > 0) {
+    nPush = ddaAgHierClampWarps(forcedPush, 1, warps - 2);
+    const int rest = warps - nPush;
+    const int sub = sibs + 1;
+    nPull = (rest / sub) * sibs + rest % sub;
+    if (nPull > rest - 1) nPull = rest - 1;
+    if (nPull < 1) nPull = 1;
+  } else if (forcedPull > 0) {
+    nPull = ddaAgHierClampWarps(forcedPull, 1, warps - 2);
+    const int rest = warps - nPull;
+    nPush = rest - rest / 2;
+    if (nPush > rest - 1) nPush = rest - 1;
+    if (nPush < 1) nPush = 1;
+  } else {
+    const int parts = sibs + 2;
+    const int base = warps / parts;
+    int rem = warps % parts;
+    nPull = base * sibs + (rem > 0 ? 1 : 0);
+    if (rem > 0) rem -= 1;
+    nPush = base + (rem > 0 ? 1 : 0);
+  }
+  if (nPush < 1) nPush = 1;
+  if (nPull < 1) nPull = 1;
+  if (nPush + nPull > warps - 1) nPull = warps - 1 - nPush;
+  return {nPush, warps - nPush - nPull, nPull};
 }
 
 // How the blocks split over the nGroups devices, as ncclSymkAgHierG0Blocks / ncclSymkAgHierGroupBlocks: group 0
@@ -150,22 +191,24 @@ struct DdaAgHierHalf {
 // the block's units and rounds (seq), so the posts one block makes to one rank only grow:
 //   group 0:  the block copies its chunk i to recvbuff and the siblings and posts seq + i to each sibling;
 //   group g:  the pushers write chunk i to rail peer g ahead and post seq + i to it; the forwarders wait for seq + i
-//             from rail peer g behind, post seq + i to each sibling, and copy the chunk to recvbuff.
+//             from rail peer g behind, post seq + i to each sibling, and copy the chunk to recvbuff; the pullers
+//             wait for that post from each sibling and copy the sibling's rail chunk out of the sibling's scratch.
 // The group-0 block drains the siblings' pushed chunk i - 1 from this rank's scratch after issuing chunk i's stores
-// and before posting chunk i; the forwarders pull the siblings' rail chunk i - 1, from the siblings' scratch, before
-// waiting for rail chunk i. A flag slot has one writer: pushers post only to rail peers, the rest only to siblings.
+// and before posting chunk i. A flag slot has one writer: pushers post only to rail peers, group 0 and the
+// forwarders only to siblings, and the pullers only wait.
 // A post of chunk i waits only on a sibling post of chunk i - 1 (group 0) or on the rail pusher's post of chunk i
-// (forwarders), a forwarder's pull of chunk i - 1 waits on the sibling's post of that same chunk, and a release wait
-// of round r only on rounds up to r - 2. Each of those is an earlier post, so the waits cannot form a cycle.
+// (forwarders). A puller waits on the sibling forwarder's post of the same chunk, and that post waits on the
+// sibling's rail pusher, not on this rank. A release wait of round r waits only on rounds up to r - 2. Each of
+// those is an earlier post, so the waits cannot form a cycle.
 //
-// nPushWarps: warps of a block that push in a group-g unit, the rest forward (ddaAgHierPushWarps). Only the thread
-// numbering within a chunk depends on it; chunk boundaries do not, so ranks may differ.
+// nPushWarps, nPullWarps: warps that push and pull in a group-g unit; the rest forward (ddaAgHierRoleWarps). Only
+// the thread numbering within a chunk depends on them; chunk boundaries do not, so ranks may differ.
 template <typename T>
 __launch_bounds__(kDdaAgHierThreads)
   __global__ void ddaAllGatherFabricHier(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff,
                                          const T* __restrict__ sendbuff, size_t count, int selfRank, int nRanks,
                                          int scaleIn, size_t maxChunkLines, size_t windowLines, int nPushWarps,
-                                         FabricGpuBarrier barrier) {
+                                         int nPullWarps, FabricGpuBarrier barrier) {
   using FlagType = FabricGpuBarrier::FlagType;
   __shared__ uint32_t halfArrivals[2];
 
@@ -196,17 +239,22 @@ __launch_bounds__(kDdaAgHierThreads)
   const int nUnitRows = nGroups * nG0Blocks;
   const int nUnits = nG0Blocks + (nGroups - 1) * nGroupBlocks;
 
-  // In a group-g unit the first nPush warps push and the rest forward, threads numbered over their own part. The
-  // forwarders have scaleIn times the bytes of the pushers, so the host gives them more of the block.
+  // In a group-g unit the warps are pushers, then forwarders, then pullers, threads numbered over their own part.
   const int lane = static_cast<int>(threadIdx.x) % warpSize;
   const int warp = static_cast<int>(threadIdx.x) / warpSize;
   const int nBlockWarps = static_cast<int>(blockDim.x) / warpSize;
-  const int nPush = nPushWarps < 1 ? 1 : (nPushWarps > nBlockWarps - 1 ? nBlockWarps - 1 : nPushWarps);
-  const int nFwd = nBlockWarps - nPush;
+  int nPush = nPushWarps < 1 ? 1 : nPushWarps;
+  int nPull = nPullWarps < 1 ? 1 : nPullWarps;
+  if (nPush > nBlockWarps - 2) nPush = nBlockWarps - 2;
+  if (nPull > nBlockWarps - nPush - 1) nPull = nBlockWarps - nPush - 1;
+  const int nFwd = nBlockWarps - nPush - nPull;
   const bool pusher = warp < nPush;
-  const bool forwarder = !pusher;
-  const int ht = (pusher ? warp : warp - nPush) * warpSize + lane;
-  const int htn = (pusher ? nPush : nFwd) * warpSize;
+  const bool forwarder = warp >= nPush && warp < nPush + nFwd;
+  const bool puller = warp >= nPush + nFwd;
+  const int roleWarp = puller ? warp - nPush - nFwd : (forwarder ? warp - nPush : warp);
+  const int nRole = puller ? nPull : (forwarder ? nFwd : nPush);
+  const int ht = roleWarp * warpSize + lane;
+  const int htn = nRole * warpSize;
   // Chunks are aligned to half a block's threads whatever the split, so chunk boundaries (which the ranks must agree
   // on) do not depend on it.
   const int nAlignThreads = (nBlockWarps / 2) * warpSize;
@@ -260,7 +308,8 @@ __launch_bounds__(kDdaAgHierThreads)
   barrier.epochSignalWaitPeers(nPeers, peerOf, epoch);
   // Every other rank: the readers of what this rank writes within a launch, and the writers of what it reads.
   auto otherRank = [&](int i) { return i < selfRank ? i : i + 1; };
-  DdaAgHierHalf half{&halfArrivals[pusher ? 0 : 1], static_cast<uint32_t>(pusher ? nPush : nFwd), 0};
+  // Only the pushers sync here, so every pusher warp's stores are done before the leader posts.
+  DdaAgHierHalf half{&halfArrivals[0], static_cast<uint32_t>(nPush), 0};
   unsigned seq = 0;
 
   for (size_t round = 0; round < nRounds; ++round) {
@@ -287,7 +336,7 @@ __launch_bounds__(kDdaAgHierThreads)
     };
     // Copies lines [lo, hi) of rank ownerOf(sibLocal)'s slot, for every sibling, into recvbuff once that sibling has
     // posted `piece`: from this rank's scratch, or from the sibling's (inSibling). Wave: the calling threads are one
-    // half, which waits per wave.
+    // role, which waits per wave.
     auto drainSiblings = [&](unsigned piece, size_t lo, size_t hi, int t, int tn, bool wave, bool inSibling,
                              auto&& ownerOf) {
 #pragma unroll
@@ -365,27 +414,25 @@ __launch_bounds__(kDdaAgHierThreads)
         const int from = fromCard * scaleIn + local;
         uint4* const fromDst = recvLines + recvSlot(from);
         const uint4* const fromSrc = selfScratch + scratchSlot(from);
-        // The siblings' chunk i - 1 is pulled while the rail peer is still storing chunk i, and the wait for chunk i
-        // starts when that pull is done.
-        for (unsigned i = 0; i <= n; ++i) {
-          if (i > 0) {
-            auto [lo, hi] = range(i - 1);
-            drainSiblings(seq + i - 1, lo, hi, ht, htn, /*wave=*/true, /*inSibling=*/true,
-                          [&](int sibLocal) { return fromCard * scaleIn + sibLocal; });
-          }
-          if (i < n) {
-            auto [lo, hi] = range(i);
-            barrier.epochWaitPieceWave(barrier.epochFlagFrom(from), epoch, seq + i);
-            // The chunk is in this rank's scratch, where the siblings read it, so the leader posts as soon as its
-            // own wave has seen it arrive.
-            if (ht == 0) {
+        for (unsigned i = 0; i < n; ++i) {
+          auto [lo, hi] = range(i);
+          barrier.epochWaitPieceWave(barrier.epochFlagFrom(from), epoch, seq + i);
+          // The chunk is in this rank's scratch, where the siblings' pullers read it, so the leader posts as soon
+          // as its own wave has seen it arrive. The pullers of this block wait on the siblings, not on this post.
+          if (ht == 0) {
 #pragma unroll
-              for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
-                if (d < scaleIn) barrier.epochStorePiece(sibling(d), epoch, seq + i);
-              }
+            for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
+              if (d < scaleIn) barrier.epochStorePiece(sibling(d), epoch, seq + i);
             }
-            ddaAgHierScatter<true>(fromSrc, lo + ht, hi, htn, [&](size_t line, uint4 v) { fromDst[line] = v; });
           }
+          ddaAgHierScatter<true>(fromSrc, lo + ht, hi, htn, [&](size_t line, uint4 v) { fromDst[line] = v; });
+        }
+      } else if (puller) {
+        const int fromCard = cardAt(-group);
+        for (unsigned i = 0; i < n; ++i) {
+          auto [lo, hi] = range(i);
+          drainSiblings(seq + i, lo, hi, ht, htn, /*wave=*/true, /*inSibling=*/true,
+                        [&](int sibLocal) { return fromCard * scaleIn + sibLocal; });
         }
       }
       seq += n;
