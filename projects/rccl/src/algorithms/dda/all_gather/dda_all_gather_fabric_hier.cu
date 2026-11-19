@@ -32,13 +32,17 @@ RCCL_PARAM(DdaAgHierBlocks, "DDA_AG_HIER_BLOCKS", 0);
 // RCCL_DDA_AG_HIER_CHUNK_BYTES: largest chunk a block moves between flags. 0 (default) = kDdaAgHierDefaultChunkBytes;
 // otherwise rounded down to 16 B, at least 16 B. Must be the same on every rank.
 RCCL_PARAM(DdaAgHierChunkBytes, "DDA_AG_HIER_CHUNK_BYTES", 0);
+// RCCL_DDA_AG_HIER_PUSH_WARPS: warps of a block that push in a rail unit, the rest forward. 0 (default) splits them
+// 1 : ranksPerDevice, as a forwarder moves ranksPerDevice times the bytes of a pusher; N in [1, warps - 1] forces N
+// (4 of the 8 warps is the even split). Clamped to that range.
+RCCL_PARAM(DdaAgHierPushWarps, "DDA_AG_HIER_PUSH_WARPS", 0);
 
 namespace {
 
 using dda::common::kDdaAgHierMaxScaleIn;
+using dda::common::kDdaAgHierThreads;
 using nccl_dda_detail::DdaFabricBarrierState;
 
-constexpr uint32_t kDdaAgHierThreads = 256;
 constexpr size_t kDdaAgHierDefaultBlocks = 64;
 // Matches ncclSymkAgHierMaxChunkBytes of the symmetric hierarchical AllGather.
 constexpr size_t kDdaAgHierDefaultChunkBytes = 256 << 10;
@@ -99,6 +103,10 @@ static ncclResult_t ncclAllGatherDdaFabricHierBytes(const void* sendbuff, void* 
   const int scaleIn = comm->ddaHierScaleIn;
   const size_t nLines = bytes / sizeof(uint4);
   const size_t nRounds = (nLines + windowLines - 1) / windowLines;
+  const int64_t forcedPushWarps = rcclParamDdaAgHierPushWarps();
+  const int nPushWarps = dda::common::ddaAgHierPushWarps(
+      static_cast<int>(block.x / 32), scaleIn,
+      forcedPushWarps > 0 ? static_cast<int>(std::min<int64_t>(forcedPushWarps, 1024)) : 0);
 
   auto* barrierState = static_cast<DdaFabricBarrierState*>(comm->ddaFabricBarrierState);
   dda::common::FabricGpuBarrier barrierHost = barrierState->barrierHost;
@@ -106,17 +114,17 @@ static ncclResult_t ncclAllGatherDdaFabricHierBytes(const void* sendbuff, void* 
 
   INFO(NCCL_COLL,
        "DDA fabric hierarchical AllGather: launching kernel: nRanks=%d devices=%d ranksPerDevice=%d bytes=%zu "
-       "grid=%u block=%u group0Blocks=%d groupBlocks=%d maxChunkBytes=%zu rounds=%zu windowBytes=%zu",
+       "grid=%u block=%u group0Blocks=%d groupBlocks=%d pushWarps=%d maxChunkBytes=%zu rounds=%zu windowBytes=%zu",
        nRanks, nRanks / scaleIn, scaleIn, bytes, grid.x, block.x,
        dda::common::ddaAgHierG0Blocks(static_cast<int>(grid.x), nRanks / scaleIn),
-       dda::common::ddaAgHierGroupBlocks(static_cast<int>(grid.x), nRanks / scaleIn), chunkLines * sizeof(uint4),
-       nRounds, windowLines * sizeof(uint4));
+       dda::common::ddaAgHierGroupBlocks(static_cast<int>(grid.x), nRanks / scaleIn), nPushWarps,
+       chunkLines * sizeof(uint4), nRounds, windowLines * sizeof(uint4));
 
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
   hipExtLaunchKernelGGL((dda::common::ddaAllGatherFabricHier<int8_t>), grid, block, 0, stream,
                         /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<int8_t*>(recvbuff),
                         static_cast<const int8_t*>(sendbuff), bytes, comm->rank, nRanks, scaleIn, chunkLines,
-                        windowLines, barrierHost);
+                        windowLines, nPushWarps, barrierHost);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }

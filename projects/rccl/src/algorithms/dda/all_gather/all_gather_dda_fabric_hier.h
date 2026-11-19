@@ -14,7 +14,8 @@
  *
  * As in agHierPush, the blocks are dealt out as units. A group-0 unit copies
  * the own chunk to recvbuff and the siblings with the whole block. A group-g
- * unit splits its block in halves: the pusher warps push the own chunk to the
+ * unit splits its block's warps between pushers and forwarders (about 1 : scaleIn,
+ * since a forwarder moves the rail chunk and the siblings' too): the pusher warps push the own chunk to the
  * rail peer g devices ahead, while the forwarder warps wait for the chunk of
  * the rail peer g devices behind, tell the siblings it is there and copy it to
  * recvbuff.
@@ -48,8 +49,25 @@ namespace dda::common {
 
 // Most ranks per physical device the kernel handles; DPX has two.
 constexpr int kDdaAgHierMaxScaleIn = 4;
-// 16 B loads each thread keeps in flight.
-constexpr int kDdaAgHierUnroll = 8;
+// Threads per block the kernel is launched with (and bounded to).
+constexpr uint32_t kDdaAgHierThreads = 256;
+// 16 B loads each thread keeps in flight, as many as the symmetric hierarchical AllGather's deep tier
+// (4 * ncclSymkUnrollPacks). A rail chunk is read from a peer's scratch, so the loads are long-latency and the
+// bytes in flight set the copy rate.
+constexpr int kDdaAgHierUnroll = 16;
+// Batch the tail of a range falls back to before it goes one line at a time.
+constexpr int kDdaAgHierMidUnroll = 4;
+
+// Warps of a block that push in a group-g unit (the rest forward), for a block of nBlockWarps warps over ranks of
+// scaleIn partitions per device, or forced when forcedPushWarps > 0. A forwarder moves the chunk it receives on the
+// rail and pulls the same-size chunk each of the scaleIn - 1 siblings received, so it has scaleIn times the bytes of
+// a pusher: the warps split 1 : scaleIn instead of evenly. The split only decides which thread copies which line, so
+// it needs not agree between ranks.
+__host__ __device__ constexpr int ddaAgHierPushWarps(int nBlockWarps, int scaleIn, int forcedPushWarps) {
+  int n = forcedPushWarps > 0 ? forcedPushWarps : (nBlockWarps + scaleIn) / (scaleIn + 1);
+  if (n > nBlockWarps - 1) n = nBlockWarps - 1;
+  return n > 1 ? n : 1;
+}
 
 // How the blocks split over the nGroups devices, as ncclSymkAgHierG0Blocks / ncclSymkAgHierGroupBlocks: group 0
 // copies with whole blocks where a pushing group forwards with half of each, so it gets about half as many blocks
@@ -63,32 +81,37 @@ __host__ __device__ constexpr int ddaAgHierGroupBlocks(int nBlocks, int nGroups)
   return n > 1 ? n : 1;
 }
 
-// Loads 16 B lines lo, lo + stride, ... < hi of src, then hands each line to store.
-// Groups of kDdaAgHierUnroll lines are loaded before any of them is stored. SysLoad: src is scratch written by
-// another GPU, read with system-scope loads.
+// Loads the lines i, i + stride, ... of src that make whole batches of kBatch lines below hi, kBatch of them before
+// any is stored, and returns where the next batch would start. SysLoad: src is scratch written by another GPU, read
+// with system-scope loads.
+template <int kBatch, bool SysLoad, typename Store>
+__device__ __forceinline__ size_t ddaAgHierScatterBatches(const uint4* src, size_t i, size_t hi, size_t stride,
+                                                          Store& store) {
+  for (; i + (kBatch - 1) * stride < hi; i += kBatch * stride) {
+    uint4 v[kBatch];
+#pragma unroll
+    for (int u = 0; u < kBatch; ++u) {
+      const uint4* p = src + (i + u * stride);
+      if constexpr (SysLoad) {
+        ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(p), v[u].x, v[u].y, v[u].z, v[u].w);
+      } else {
+        v[u] = *p;
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kBatch; ++u) store(i + u * stride, v[u]);
+  }
+  return i;
+}
+
+// Loads 16 B lines lo, lo + stride, ... < hi of src, then hands each line to store. Batches of kDdaAgHierUnroll
+// lines are loaded before any of them is stored; what is left of a thread's share goes in batches of
+// kDdaAgHierMidUnroll and then singly, so a chunk that is not a multiple of the big batch still keeps loads in flight.
 template <bool SysLoad, typename Store>
 __device__ __forceinline__ void ddaAgHierScatter(const uint4* src, size_t lo, size_t hi, size_t stride, Store store) {
-  constexpr int kUnroll = kDdaAgHierUnroll;
-  auto load = [&](size_t line, uint4& v) {
-    if constexpr (SysLoad) {
-      ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(src + line), v.x, v.y, v.z, v.w);
-    } else {
-      v = src[line];
-    }
-  };
-  size_t i = lo;
-  for (; i + (kUnroll - 1) * stride < hi; i += kUnroll * stride) {
-    uint4 v[kUnroll];
-#pragma unroll
-    for (int u = 0; u < kUnroll; ++u) load(i + u * stride, v[u]);
-#pragma unroll
-    for (int u = 0; u < kUnroll; ++u) store(i + u * stride, v[u]);
-  }
-  for (; i < hi; i += stride) {
-    uint4 v;
-    load(i, v);
-    store(i, v);
-  }
+  size_t i = ddaAgHierScatterBatches<kDdaAgHierUnroll, SysLoad>(src, lo, hi, stride, store);
+  i = ddaAgHierScatterBatches<kDdaAgHierMidUnroll, SysLoad>(src, i, hi, stride, store);
+  ddaAgHierScatterBatches<1, SysLoad>(src, i, hi, stride, store);
 }
 
 // Software barrier over the waves of one half of a block, on a counter in LDS that starts at 0. Each wave adds one per
@@ -134,11 +157,14 @@ struct DdaAgHierHalf {
 // A post of chunk i waits only on a sibling post of chunk i - 1 (group 0) or on the rail pusher's post of chunk i
 // (forwarders), a forwarder's pull of chunk i - 1 waits on the sibling's post of that same chunk, and a release wait
 // of round r only on rounds up to r - 2. Each of those is an earlier post, so the waits cannot form a cycle.
+//
+// nPushWarps: warps of a block that push in a group-g unit, the rest forward (ddaAgHierPushWarps). Only the thread
+// numbering within a chunk depends on it; chunk boundaries do not, so ranks may differ.
 template <typename T>
-__launch_bounds__(512)
+__launch_bounds__(kDdaAgHierThreads)
   __global__ void ddaAllGatherFabricHier(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff,
                                          const T* __restrict__ sendbuff, size_t count, int selfRank, int nRanks,
-                                         int scaleIn, size_t maxChunkLines, size_t windowLines,
+                                         int scaleIn, size_t maxChunkLines, size_t windowLines, int nPushWarps,
                                          FabricGpuBarrier barrier) {
   using FlagType = FabricGpuBarrier::FlagType;
   __shared__ uint32_t halfArrivals[2];
@@ -170,14 +196,20 @@ __launch_bounds__(512)
   const int nUnitRows = nGroups * nG0Blocks;
   const int nUnits = nG0Blocks + (nGroups - 1) * nGroupBlocks;
 
-  // Half of each block pushes and half forwards in a group-g unit, threads numbered over the half.
+  // In a group-g unit the first nPush warps push and the rest forward, threads numbered over their own part. The
+  // forwarders have scaleIn times the bytes of the pushers, so the host gives them more of the block.
   const int lane = static_cast<int>(threadIdx.x) % warpSize;
   const int warp = static_cast<int>(threadIdx.x) / warpSize;
-  const int nHalfWarps = static_cast<int>(blockDim.x) / warpSize / 2;
-  const bool pusher = warp < nHalfWarps;
-  const bool forwarder = !pusher && warp < 2 * nHalfWarps;
-  const int ht = (pusher ? warp : warp - nHalfWarps) * warpSize + lane;
-  const int htn = nHalfWarps * warpSize;
+  const int nBlockWarps = static_cast<int>(blockDim.x) / warpSize;
+  const int nPush = nPushWarps < 1 ? 1 : (nPushWarps > nBlockWarps - 1 ? nBlockWarps - 1 : nPushWarps);
+  const int nFwd = nBlockWarps - nPush;
+  const bool pusher = warp < nPush;
+  const bool forwarder = !pusher;
+  const int ht = (pusher ? warp : warp - nPush) * warpSize + lane;
+  const int htn = (pusher ? nPush : nFwd) * warpSize;
+  // Chunks are aligned to half a block's threads whatever the split, so chunk boundaries (which the ranks must agree
+  // on) do not depend on it.
+  const int nAlignThreads = (nBlockWarps / 2) * warpSize;
 
   // Chunk size and count of a window for units of nUnitBlocks blocks, chunks a multiple of align lines so the
   // threads split them evenly.
@@ -190,7 +222,7 @@ __launch_bounds__(512)
     return {chunkLines, (windowLines + chunkLines - 1) / chunkLines};
   };
   const std::pair<size_t, size_t> g0Chunking = chunking(nG0Blocks, blockDim.x);
-  const std::pair<size_t, size_t> gChunking = chunking(nGroupBlocks, static_cast<size_t>(htn));
+  const std::pair<size_t, size_t> gChunking = chunking(nGroupBlocks, static_cast<size_t>(nAlignThreads));
   const size_t g0ChunkLines = g0Chunking.first;
   const size_t g0Chunks = g0Chunking.second;
   const size_t gChunkLines = gChunking.first;
@@ -228,7 +260,7 @@ __launch_bounds__(512)
   barrier.epochSignalWaitPeers(nPeers, peerOf, epoch);
   // Every other rank: the readers of what this rank writes within a launch, and the writers of what it reads.
   auto otherRank = [&](int i) { return i < selfRank ? i : i + 1; };
-  DdaAgHierHalf half{&halfArrivals[pusher ? 0 : 1], static_cast<uint32_t>(nHalfWarps), 0};
+  DdaAgHierHalf half{&halfArrivals[pusher ? 0 : 1], static_cast<uint32_t>(pusher ? nPush : nFwd), 0};
   unsigned seq = 0;
 
   for (size_t round = 0; round < nRounds; ++round) {
