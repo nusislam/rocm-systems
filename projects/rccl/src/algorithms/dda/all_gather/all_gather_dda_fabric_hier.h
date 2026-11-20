@@ -266,7 +266,7 @@ __launch_bounds__(512)
           return {lo, lo + g0ChunkLines < roundLines ? lo + g0ChunkLines : roundLines};
         };
         // Chunk i's stores go out first. The siblings' chunk i - 1 is copied out of scratch while they are in flight,
-        // and only then does the block wait for its stores and post chunk i.
+        // and only then does the block sync and post chunk i.
         for (unsigned i = 0; i <= n; ++i) {
           if (i < n) {
             auto [lo, hi] = range(i);
@@ -288,7 +288,8 @@ __launch_bounds__(512)
             }
           }
           if (i < n) {
-            barrier.orderDestWrites();
+            // Orders every warp's stores before thread 0's system-scope release fence and flag store.
+            __syncthreads();
 #pragma unroll
             for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
               if (d < scaleIn) barrier.epochPostPieceDrained(sibling(d), epoch, seq + i);
