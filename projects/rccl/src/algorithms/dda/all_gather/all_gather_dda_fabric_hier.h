@@ -224,8 +224,7 @@ __launch_bounds__(512)
   };
   // This rank's reads of its scratch in the previous collective must be done before a peer overwrites it. Only the
   // rail peers and the siblings write here, and this rank writes only to theirs, so the handshake is with them
-  // alone rather than with every rank. Other ranks' reads of this scratch in a previous collective are done once
-  // that kernel has finished here: every DDA kernel that reads a peer's scratch ends with an all-rank exit barrier.
+  // alone rather than with every rank. This kernel closes with its package only.
   barrier.epochSignalWaitPeers(nPeers, peerOf, epoch);
   // Every other rank: the readers of what this rank writes within a launch, and the writers of what it reads.
   auto otherRank = [&](int i) { return i < selfRank ? i : i + 1; };
@@ -368,8 +367,21 @@ __launch_bounds__(512)
     }
   }
 
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
-  barrier.epochEnd(epoch, seqBound);
+  // Piece flags already published the remote scratch. The copies into recvbuff stay in this package, so close with
+  // those ranks the way agHierPush closes on closeWord: one system release, then wait for the package.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    // Above every piece post (epoch + 2 + piece, piece < seqBound) and, with epochEnd's extra step, below the
+    // next launch's epoch.
+    const unsigned closePiece = seqBound;
+#pragma unroll
+    for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
+      if (d < scaleIn) barrier.epochStorePiece(sibling(d), epoch, closePiece);
+    }
+    agHierWaitPackage(barrier.abortFlag(), barrier, scaleIn, local, card, epoch + 2 + closePiece);
+  }
+  __syncthreads();
+  barrier.epochEnd(epoch, seqBound + 1);
 }
 
 } // namespace dda::common
