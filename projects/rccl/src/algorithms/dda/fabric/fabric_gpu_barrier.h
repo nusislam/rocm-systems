@@ -200,6 +200,16 @@ public:
     __syncthreads();
   }
 
+  // The post half of epochSignalWaitPeers: posts epoch to every peerOf(i), i < nPeers, and does not wait. A caller
+  // waits for a peer's epoch before it first writes to that peer.
+  template <typename PeerOf>
+  __device__ __forceinline__ void epochSignalPeers(int nPeers, PeerOf peerOf, FlagType epoch) {
+    for (int i = threadIdx.x; i < nPeers; i += blockDim.x) {
+      __scoped_atomic_store_n(peerFlags_[peerOf(i)] + getEpochFlagIdx(selfRank_, blockIdx.x), epoch, __ATOMIC_RELEASE,
+                              __MEMORY_SCOPE_SYSTEM);
+    }
+  }
+
   // Entry handshake with a set of nPeers ranks, peerOf(i) for i < nPeers, closed under the relation (each of them
   // handshakes with this rank too): posts epoch to every one of them, then waits for each to post at least epoch.
   // Peers are spread over the threads and every post precedes every wait, so the handshakes cannot deadlock.
@@ -243,6 +253,11 @@ public:
   // stores (drainWaveWrites plus a sync of its waves) and posts from its leader.
   __device__ __forceinline__ void epochStorePiece(int to, FlagType epoch, unsigned piece) {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+    epochStorePieceRelaxed(to, epoch, piece);
+  }
+  // epochStorePiece without the fence, for a thread posting one piece to several ranks: one system-scope release
+  // fence, then this for each rank.
+  __device__ __forceinline__ void epochStorePieceRelaxed(int to, FlagType epoch, unsigned piece) {
     __scoped_atomic_store_n(peerFlags_[to] + getEpochFlagIdx(selfRank_, blockIdx.x), epoch + 2 + piece,
                             __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
   }

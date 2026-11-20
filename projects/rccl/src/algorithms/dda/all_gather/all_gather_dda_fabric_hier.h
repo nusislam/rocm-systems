@@ -214,18 +214,18 @@ __launch_bounds__(512)
   const uint4* const selfScratch = reinterpret_cast<const uint4*>(ipcbuffs[selfRank]);
   auto scratchOf = [&](int rank) { return reinterpret_cast<uint4*>(ipcbuffs[rank]); };
 
-  // Zeros the LDS slots ncclCoopWarpSpan::sync uses. Every thread must take part.
-  ncclCoopNamedBarrierInit();
   const FlagType epoch = barrier.epochBegin();
   // The rail peers and the siblings: the ranks this rank writes to, and the only ranks that write to it.
   const int nPeers = nGroups - 1 + scaleIn - 1;
   auto peerOf = [&](int i) {
     return i < nGroups - 1 ? cardAt(i + 1) * scaleIn + local : sibling(i - (nGroups - 1) + 1);
   };
-  // This rank's reads of its scratch in the previous collective must be done before a peer overwrites it. Only the
-  // rail peers and the siblings write here, and this rank writes only to theirs, so the handshake is with them
-  // alone rather than with every rank. This kernel closes with its package only.
-  barrier.epochSignalWaitPeers(nPeers, peerOf, epoch);
+  // This rank's reads of its scratch in the previous collective must be done before a peer overwrites it. Entering
+  // is posted to the writers here; as in agHierPush, each unit waits for the ranks it writes to only when it first
+  // writes them. Piece posts reuse the same slots, so the posts land before any piece post of this block.
+  barrier.epochSignalPeers(nPeers, peerOf, epoch);
+  // Zeros the LDS slots ncclCoopWarpSpan::sync uses, and its __syncthreads orders the entry posts above.
+  ncclCoopNamedBarrierInit();
   // Every other rank: the readers of what this rank writes within a launch, and the writers of what it reads.
   auto otherRank = [&](int i) { return i < selfRank ? i : i + 1; };
   unsigned seq = 0;
@@ -264,6 +264,11 @@ __launch_bounds__(512)
           const size_t lo = (static_cast<size_t>(i) * nG0Blocks + groupBlock) * g0ChunkLines;
           return {lo, lo + g0ChunkLines < roundLines ? lo + g0ChunkLines : roundLines};
         };
+        // The unit writes only into the siblings, so it waits for those to enter the launch.
+        if (round == 0) {
+          if (t == 0) agHierWaitPackage(barrier.abortFlag(), barrier, scaleIn, local, card, epoch);
+          __syncthreads();
+        }
         // Chunk i's stores go out first. The siblings' chunk i - 1 is copied out of scratch while they are in flight,
         // and only then does the block sync and post chunk i.
         for (unsigned i = 0; i <= n; ++i) {
@@ -287,11 +292,14 @@ __launch_bounds__(512)
             }
           }
           if (i < n) {
-            // Orders every warp's stores before thread 0's system-scope release fence and flag store.
+            // Orders every warp's stores before thread 0's system-scope release fence and flag stores.
             __syncthreads();
+            if (t == 0) {
+              cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
 #pragma unroll
-            for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
-              if (d < scaleIn) barrier.epochPostPieceDrained(sibling(d), epoch, seq + i);
+              for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
+                if (d < scaleIn) barrier.epochStorePieceRelaxed(sibling(d), epoch, seq + i);
+              }
             }
           }
         }
@@ -308,6 +316,13 @@ __launch_bounds__(512)
       if (pusher) {
         const int to = cardAt(group) * scaleIn + local;
         uint4* const toSlot = scratchOf(to) + ownScratch;
+        // The pushers write only into `to`, so they wait for that rank alone to enter the launch.
+        if (round == 0) {
+          if (ht == 0 && n > 0) {
+            agHierWait(barrier.abortFlag(), const_cast<FlagType*>(barrier.epochFlagFrom(to)), epoch);
+          }
+          half.sync();
+        }
         for (unsigned i = 0; i < n; ++i) {
           auto [lo, hi] = range(i);
           ddaAgHierScatter<false>(sendLines, lo + ht, hi, htn, [&](size_t line, uint4 v) { toSlot[line] = v; });
@@ -348,9 +363,10 @@ __launch_bounds__(512)
             half.sync();
             // The chunk is in this rank's scratch, where the siblings read it.
             if (ht == 0) {
+              cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
 #pragma unroll
               for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
-                if (d < scaleIn) barrier.epochStorePiece(sibling(d), epoch, seq + i);
+                if (d < scaleIn) barrier.epochStorePieceRelaxed(sibling(d), epoch, seq + i);
               }
             }
             ddaAgHierScatter<true>(fromSrc, lo + ht, hi, htn, [&](size_t line, uint4 v) { fromDst[line] = v; });
@@ -374,9 +390,10 @@ __launch_bounds__(512)
     // Above every piece post (epoch + 2 + piece, piece < seqBound) and, with epochEnd's extra step, below the
     // next launch's epoch.
     const unsigned closePiece = seqBound;
+    cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
 #pragma unroll
     for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
-      if (d < scaleIn) barrier.epochStorePiece(sibling(d), epoch, closePiece);
+      if (d < scaleIn) barrier.epochStorePieceRelaxed(sibling(d), epoch, closePiece);
     }
     agHierWaitPackage(barrier.abortFlag(), barrier, scaleIn, local, card, epoch + 2 + closePiece);
   }
