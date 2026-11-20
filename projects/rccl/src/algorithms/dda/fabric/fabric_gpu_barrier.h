@@ -171,6 +171,8 @@ public:
   // epochEnd, so it survives CUDA graph replays. Scratch accesses are system-scope: no fence besides orderDestWrites().
   __device__ __forceinline__ FlagType epochBegin() const { return epochCell()[blockIdx.x] + 1; }
 
+  __device__ __forceinline__ uint32_t* abortFlag() const { return const_cast<uint32_t*>(params_.flag); }
+
   // Must be called by every thread of the block after its last use of the epoch flags. Every launch advances all the
   // cells (cell e is written by block e % gridDim.x), so the cells stay equal across block indices, which a drain block
   // needs: it waits on flags posted by other block indices.

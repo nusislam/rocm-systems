@@ -64,6 +64,26 @@ __host__ __device__ constexpr int ddaAgHierGroupBlocks(int nBlocks, int nGroups)
   return n > 1 ? n : 1;
 }
 
+// Spins until `word` reaches `value`. One thread calls it.
+__device__ __forceinline__ void agHierWait(uint32_t* abortFlag, FabricGpuBarrier::FlagType* word,
+                                           FabricGpuBarrier::FlagType value) {
+  cuda::atomic_ref<FabricGpuBarrier::FlagType> ref(*word);
+  uint32_t steps = 0;
+  while (ref.load(cuda::memory_order_relaxed) < value) {
+    if (nccl::utility::testAbort(abortFlag, steps)) break;
+  }
+  cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
+}
+
+// Spins until this block's flag reaches `value` on every other rank of the package. One thread calls it.
+__device__ __forceinline__ void agHierWaitPackage(uint32_t* abortFlag, const FabricGpuBarrier& barrier, int scaleIn,
+                                                 int local, int card, FabricGpuBarrier::FlagType value) {
+  for (int r = 0; r < scaleIn; r++) {
+    if (r == local) continue;
+    agHierWait(abortFlag, const_cast<FabricGpuBarrier::FlagType*>(barrier.epochFlagFrom(card * scaleIn + r)), value);
+  }
+}
+
 // Loads 16 B lines lo, lo + stride, ... < hi of src, then hands each line to store.
 // Groups of kDdaAgHierUnroll lines are loaded before any of them is stored. SysLoad: src is scratch written by
 // another GPU, read with system-scope loads.
@@ -233,28 +253,6 @@ __launch_bounds__(512)
         if (d < scaleIn) scratchOf(sibling(d))[scratchOff + line] = v;
       }
     };
-    // Copies lines [lo, hi) of rank ownerOf(sibLocal)'s slot, for every sibling, into recvbuff once that sibling has
-    // posted `piece`: from this rank's scratch, or from the sibling's (inSibling). Wave: the calling threads are one
-    // half, which waits per wave.
-    auto drainSiblings = [&](unsigned piece, size_t lo, size_t hi, int t, int tn, bool wave, bool inSibling,
-                             auto&& ownerOf) {
-#pragma unroll
-      for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
-        if (d < scaleIn) {
-          const int sib = sibling(d);
-          if (wave) {
-            barrier.epochWaitPieceWave(barrier.epochFlagFrom(sib), epoch, piece);
-          } else {
-            barrier.epochWaitPiece(barrier.epochFlagFrom(sib), epoch, piece);
-          }
-          const int owner = ownerOf(sib - card * scaleIn);
-          const uint4* const src = (inSibling ? scratchOf(sib) : selfScratch) + scratchSlot(owner);
-          uint4* const dst = recvLines + recvSlot(owner);
-          ddaAgHierScatter<true>(src, lo + t, hi, tn, [&](size_t line, uint4 v) { dst[line] = v; });
-        }
-      }
-    };
-
     for (int unit = block; unit < nUnits; unit += nBlocks) {
       const int group = unit < nUnitRows ? unit % nGroups : 1 + (unit - nUnitRows) % (nGroups - 1);
       const int groupBlock = unit < nUnitRows ? unit / nGroups : nG0Blocks + (unit - nUnitRows) / (nGroups - 1);
@@ -277,8 +275,17 @@ __launch_bounds__(512)
           }
           if (i > 0) {
             auto [lo, hi] = range(i - 1);
-            drainSiblings(seq + i - 1, lo, hi, t, tn, /*wave=*/false, /*inSibling=*/false,
-                          [&](int sibLocal) { return card * scaleIn + sibLocal; });
+            if (t == 0) agHierWaitPackage(barrier.abortFlag(), barrier, scaleIn, local, card, epoch + 2 + (seq + i - 1));
+            __syncthreads();
+#pragma unroll
+            for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
+              if (d < scaleIn) {
+                const int sib = sibling(d);
+                const uint4* const src = selfScratch + scratchSlot(sib);
+                uint4* const dst = recvLines + recvSlot(sib);
+                ddaAgHierScatter<true>(src, lo + t, hi, tn, [&](size_t line, uint4 v) { dst[line] = v; });
+              }
+            }
           }
           if (i < n) {
             barrier.orderDestWrites();
@@ -318,14 +325,28 @@ __launch_bounds__(512)
         for (unsigned i = 0; i <= n; ++i) {
           if (i > 0) {
             auto [lo, hi] = range(i - 1);
-            drainSiblings(seq + i - 1, lo, hi, ht, htn, /*wave=*/true, /*inSibling=*/true,
-                          [&](int sibLocal) { return fromCard * scaleIn + sibLocal; });
+            if (ht == 0) {
+              agHierWaitPackage(barrier.abortFlag(), barrier, scaleIn, local, card, epoch + 2 + (seq + i - 1));
+            }
+            half.sync();
+#pragma unroll
+            for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
+              if (d < scaleIn) {
+                const int sib = sibling(d);
+                const int owner = fromCard * scaleIn + (sib - card * scaleIn);
+                const uint4* const src = scratchOf(sib) + scratchSlot(owner);
+                uint4* const dst = recvLines + recvSlot(owner);
+                ddaAgHierScatter<true>(src, lo + ht, hi, htn, [&](size_t line, uint4 v) { dst[line] = v; });
+              }
+            }
           }
           if (i < n) {
             auto [lo, hi] = range(i);
-            barrier.epochWaitPieceWave(barrier.epochFlagFrom(from), epoch, seq + i);
-            // The chunk is in this rank's scratch, where the siblings read it, so the leader posts as soon as its
-            // own wave has seen it arrive.
+            if (ht == 0) {
+              agHierWait(barrier.abortFlag(), const_cast<FlagType*>(barrier.epochFlagFrom(from)), epoch + 2 + (seq + i));
+            }
+            half.sync();
+            // The chunk is in this rank's scratch, where the siblings read it.
             if (ht == 0) {
 #pragma unroll
               for (int d = 1; d < kDdaAgHierMaxScaleIn; ++d) {
