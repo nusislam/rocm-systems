@@ -3,6 +3,9 @@
 # ---------------------------------------------------------------------------
 set(_MICRO_GRAPH_SIBLINGS
   ${RCCL_HOST_HIPIFY_DIR}/src/graph/connect.cc
+  ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery.cc
+  ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_dev.cc
+  ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_net.cc
   ${RCCL_HOST_HIPIFY_DIR}/src/graph/paths.cc
   ${RCCL_HOST_HIPIFY_DIR}/src/graph/rings.cc
   ${RCCL_HOST_HIPIFY_DIR}/src/graph/rome_models.cc
@@ -31,6 +34,9 @@ set(_MICRO_GRAPH_DEFS
   ROME_MODELS_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/graph/rome_models.cc"
   SEARCH_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/graph/search.cc"
   TOPO_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/graph/topo.cc"
+  TOPO_DISCOVERY_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery.cc"
+  TOPO_DISCOVERY_DEV_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_dev.cc"
+  TOPO_DISCOVERY_NET_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_net.cc"
   TREES_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/graph/trees.cc"
   XML_CC_PATH="${RCCL_HOST_HIPIFY_DIR}/src/graph/xml.cc"
   TOPO_EXPL_MODELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../tools/topo_expl/models")
@@ -64,6 +70,9 @@ rccl_add_graph_micro_binary(rccl-UnitTestsMicroGraphDev graph-dev-test.cc
     fakes/rccl_wrap_fakes.cc
     fakes/transport_stubs.cc
     fakes/tuning_fakes.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_dev.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_net.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/paths.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/rome_models.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/search.cc
@@ -93,6 +102,9 @@ rccl_add_graph_fakes_micro_binary(rccl-UnitTestsMicroGraphConnect graph-connect-
     fakes/amdsmi_fakes.cc
     fakes/graph_fakes.cc
     fakes/hip_fakes.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_dev.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_net.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/paths.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/rings.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/topo.cc
@@ -107,6 +119,9 @@ rccl_add_graph_fakes_micro_binary(rccl-UnitTestsMicroGraphPaths paths-test.cc
     fakes/graph_fakes.cc
     fakes/hip_fakes.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/connect.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_dev.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_net.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/search.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/topo.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/xml.cc
@@ -124,6 +139,9 @@ rccl_add_graph_fakes_micro_binary(rccl-UnitTestsMicroGraphRomeModels rome-models
     fakes/amdsmi_fakes.cc
     fakes/graph_fakes.cc
     fakes/hip_fakes.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_dev.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_net.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/paths.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/topo.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/xml.cc
@@ -136,6 +154,7 @@ rccl_add_graph_fakes_micro_binary(rccl-UnitTestsMicroGraphSearch search-test.cc
     fakes/graph_fakes.cc
     fakes/hip_fakes.cc
     graph/topo_include.cc  # topo.cc, included (not compiled) for TopoSetNetDevsPolicy
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_dev.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/paths.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/rome_models.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/xml.cc
@@ -147,6 +166,7 @@ rccl_add_graph_fakes_micro_binary(rccl-UnitTestsMicroGraphTopo topo-test.cc
     fakes/amdsmi_fakes.cc
     fakes/graph_fakes.cc
     fakes/hip_fakes.cc
+    ${RCCL_HOST_HIPIFY_DIR}/src/graph/discovery/topo_discovery_dev.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/paths.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/graph/xml.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/misc/archinfo.cc

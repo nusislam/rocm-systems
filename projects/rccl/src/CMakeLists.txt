@@ -139,6 +139,10 @@ set(SRC_FILES
   gin/proxy_gpucontext/gpucontext_v2.cc
   gin/proxy_gpucontext/gpucontext_v2.h
   graph/connect.cc
+  graph/discovery/topo_discovery.cc
+  graph/discovery/topo_discovery.h
+  graph/discovery/topo_discovery_dev.cc
+  graph/discovery/topo_discovery_net.cc
   graph/rccl_graph_gen.cc
   graph/paths.cc
   graph/rings.cc

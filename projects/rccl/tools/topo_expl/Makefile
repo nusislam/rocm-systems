@@ -119,6 +119,9 @@ RCCL_FILES = hipify_rccl/graph/topo.cc \
 			hipify_rccl/graph/connect.cc \
 			hipify_rccl/graph/tuning.cc \
 			hipify_rccl/graph/xml.cc \
+			hipify_rccl/graph/discovery/topo_discovery.cc \
+			hipify_rccl/graph/discovery/topo_discovery_dev.cc \
+			hipify_rccl/graph/discovery/topo_discovery_net.cc \
 			hipify_rccl/graph/rome_models.cc \
 			hipify_rccl/graph/archinfo.cc \
 			hipify_rccl/graph/rccl_graph_gen.cc \
@@ -186,7 +189,7 @@ hipify:
 	cp hipify_rccl/include/nvtx_stub.h hipify_rccl/include/nvtx.h
 	bash ../../cmake/scripts/add_unroll.sh "hipify_rccl/src/device/include/common.h"
 	@echo ">>> Hipifying RCCL source files..."
-	$(HIPIFY_PL_EXE) $(HIPIFY_PL_FLAGS) hipify_rccl/graph/*
+	find hipify_rccl/graph -type f -exec $(HIPIFY_PL_EXE) $(HIPIFY_PL_FLAGS) {} +
 	$(HIPIFY_PL_EXE) $(HIPIFY_PL_FLAGS) hipify_rccl/include/network/unpack/*
 	$(HIPIFY_PL_EXE) $(HIPIFY_PL_FLAGS) hipify_rccl/*.cc
 	# PATCH 3: Generate *_tmp.h files - these are build-time generated headers in rccl

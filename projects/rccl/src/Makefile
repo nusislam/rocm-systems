@@ -17,6 +17,7 @@ LIBSRCFILES := \
 	init.cc proxy.cc transport.cc mnnvl.cc allocator.cc dev_runtime.cc cft_dev_runtime.cc dev_runtime_segments.cc sym_kernels.cc genk_runtime.cc ce_coll.cc mem_manager.cc \
 	$(wildcard config/*.cc) \
 	$(wildcard graph/*.cc) \
+	$(wildcard graph/discovery/*.cc) \
 	$(wildcard enqueue/*.cc) \
 	$(wildcard enqueue/task_prep/*.cc) \
 	$(wildcard enqueue/task_sched/*.cc) \

@@ -5,7 +5,7 @@
  ************************************************************************/
 
 // Unit tests for NIC fusion input validation in ncclTopoForceMerge()
-// (src/graph/topo.cc), driven with a hand-built propsList (no real NICs, GPUs,
+// (src/graph/discovery/topo_discovery_net.cc), driven with a hand-built propsList (no real NICs, GPUs,
 // or net plugin).
 //
 // Two ways a NCCL_NET_FORCE_MERGE group can ask for more devices than
@@ -38,7 +38,8 @@
 #include <cstring>
 #include <string>
 
-#include "graph/topo.h"  // struct ncclTopoNetInfo, ncclTopoForceMerge()
+#include "graph/discovery/topo_discovery.h"  // struct ncclTopoNetInfo, ncclTopoForceMerge()
+#include "graph/topo.h"
 #include "graph/xml.h"   // struct ncclXml, xmlAlloc(), xmlAddNode()
 #include "nccl_net.h"    // ncclNetProperties_t, NCCL_NET_MAX_DEVS_PER_NIC
 

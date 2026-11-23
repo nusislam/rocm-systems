@@ -4,8 +4,9 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
-// Host-only microtests for src/graph/topo.cc: building the topology system from XML, NIC fusion,
-// local NIC/GPU queries and ncclTopoGetSystem, on topologies written as XML by TopoScene.h.
+// Host-only microtests for src/graph/topo.cc and the NIC fusion and XML fusion units of src/graph/discovery/:
+// building the topology system from XML, NIC fusion, local NIC/GPU queries and ncclTopoGetSystem, on topologies
+// written as XML by TopoScene.h.
 
 #include <gtest/gtest.h>
 
@@ -31,7 +32,7 @@
 
 using namespace topo_scene;
 
-ncclResult_t ncclTopoGetXmlFromCpu(struct ncclXmlNode* cpuNode, struct ncclXml* xml);  // src/graph/xml.cc
+ncclResult_t ncclTopoGetXmlFromCpu(struct ncclXmlNode* cpuNode, struct ncclXml* xml);  // src/graph/discovery/topo_discovery_dev.cc
 
 namespace {
 

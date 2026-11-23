@@ -4,8 +4,9 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
-// Host-only microtests for src/graph/xml.cc and xml.h: the topology/graph XML parser and writer, and the
-// XML autodetection from sysfs, HIP and amd-smi, all served by fakes/graph_fakes.cc.
+// Host-only microtests for src/graph/xml.cc and xml.h (the topology/graph XML parser and writer) and
+// src/graph/discovery/topo_discovery_dev.cc (the XML autodetection from sysfs, HIP and amd-smi), all served by
+// fakes/graph_fakes.cc.
 
 #include <gtest/gtest.h>
 
@@ -21,6 +22,7 @@
 #include "fakes/param_redirect.h"
 
 #include XML_CC_PATH
+#include TOPO_DISCOVERY_DEV_CC_PATH
 
 #include "TopoScene.h"
 

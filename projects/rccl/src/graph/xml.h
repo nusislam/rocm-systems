@@ -17,6 +17,7 @@
 #include "archinfo.h"
 #include <cinttypes>
 
+#define PCI_BRIDGE_DEVICE_CLASS "0x060400"
 #define PCI_NVSWITCH_CLASS "0x068000"
 #define PCI_GPU_CLASS "0x03"
 #define PCI_IBMNPU_CLASS "0x068001"
@@ -60,11 +61,6 @@ ncclResult_t ncclTopoGetXmlFromFile(const char* xmlTopoFile, struct ncclXml* xml
 ncclResult_t ncclTopoDumpXmlToFile(const char* xmlTopoFile, struct ncclXml* xml);
 #define NCCL_GRAPH_XML_VERSION 1
 ncclResult_t ncclTopoGetXmlGraphFromFile(const char* xmlGraphFile, struct ncclXml* xml);
-
-/* Auto-detect functions */
-ncclResult_t ncclTopoFillGpu(struct ncclXml* xml, const char* busId, struct ncclXmlNode** gpuNode);
-ncclResult_t ncclTopoFillNet(struct ncclXml* xml, const char* tagName, const char* pciPath, const char* netName,
-                             struct ncclXmlNode** netNode, struct ncclXmlNode* forceParent = NULL);
 
 /* Remove unneeded parts */
 ncclResult_t ncclTopoTrimXml(struct ncclXml* xml);
@@ -292,6 +288,30 @@ static ncclResult_t xmlSetAttrIfUnset(struct ncclXmlNode* node, const char* attr
   node->attrs[index].key[MAX_STR_LEN] = '\0';
   strncpy(node->attrs[index].value, value, MAX_STR_LEN);
   node->attrs[index].value[MAX_STR_LEN] = '\0';
+  return ncclSuccess;
+}
+
+// Only set values if not already set
+static ncclResult_t xmlInitAttrInt(struct ncclXmlNode* node, const char* attrName, const int value) {
+  int index;
+  NCCLCHECK(xmlGetAttrIndex(node, attrName, &index));
+  if (index == -1) {
+    NCCLCHECK(xmlGetNextAttrIndex(node, &index));
+    strncpy(node->attrs[index].key, attrName, MAX_STR_LEN);
+    node->attrs[index].key[MAX_STR_LEN] = '\0';
+    snprintf(node->attrs[index].value, MAX_STR_LEN, "%d", value);
+  }
+  return ncclSuccess;
+}
+static ncclResult_t xmlInitAttrFloat(struct ncclXmlNode* node, const char* attrName, const float value) {
+  int index;
+  NCCLCHECK(xmlGetAttrIndex(node, attrName, &index));
+  if (index == -1) {
+    NCCLCHECK(xmlGetNextAttrIndex(node, &index));
+    strncpy(node->attrs[index].key, attrName, MAX_STR_LEN);
+    node->attrs[index].key[MAX_STR_LEN] = '\0';
+    snprintf(node->attrs[index].value, MAX_STR_LEN, "%f", value);
+  }
   return ncclSuccess;
 }
 

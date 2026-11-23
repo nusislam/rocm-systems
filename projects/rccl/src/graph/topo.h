@@ -245,10 +245,6 @@ struct ncclTopoNodeSet {
   struct ncclTopoNode nodes[NCCL_TOPO_MAX_NODES];
 };
 
-struct ncclTopoNetRailKeyList {
-  std::map<uint64_t, int> keys;
-};
-
 struct ncclTopoSystem {
   int systemId;
   uint64_t hostHashes[NCCL_TOPO_MAX_NODES];
@@ -299,43 +295,6 @@ ncclResult_t ncclTopoGetGpuMinPath(struct ncclTopoSystem* system, int type, int*
 ncclResult_t ncclTopoGetGpuMaxPath(struct ncclTopoSystem* system, int type, int* max);
 ncclResult_t ncclTopoGetGpuMaxLocalNetPath(struct ncclTopoSystem* system, int* max);
 ncclResult_t ncclTopoSplitNvLink(struct ncclTopoSystem* system, int* splitNvLink);
-
-enum {
-  NCCL_NET_MERGE_POLICY_ALL = 0,
-  NCCL_NET_MERGE_POLICY_RAIL = 1
-};
-
-struct ncclTopoNetInfo {
-  bool coll;
-  bool gin;
-  bool rma;
-  bool net;
-  // communicator-specific information
-  int netPluginIndex;
-  int maxDevsPerNic;
-  bool dmaBufSupport;
-  // NIC fusion
-  int mergeLevel;
-  int mergePolicy;
-  const char* forceMerge;
-  // dev count tracking functions (not part of ncclNet)
-  ncclResult_t (*getDevCount)(int, int*, int*);
-  ncclResult_t (*setVirtDevCount)(int, int);
-  // ncclNet API functions
-  const char* name;
-  ncclResult_t (*getProperties)(int, ncclNetProperties_t*);
-  ncclResult_t (*makeVDevice)(int*, ncclNetVDeviceProps_t*);
-  ncclResult_t (*devices)(int*);
-
-  // system-wide list of unique rail keys
-  struct ncclTopoNetRailKeyList* railKeyList;
-};
-
-ncclResult_t ncclTopoProcessNet(ncclXml* xml, const char* dumpXmlFile, struct ncclTopoNetInfo* net);
-ncclResult_t ncclTopoForceMerge(struct ncclXml* xml, struct ncclTopoNetInfo* netInfo, int* placedDevs,
-                                ncclNetProperties_t* propsList, struct ncclXmlNode** physNetNodes, int nPhysDevs);
-ncclResult_t ncclTopoGetXmlCpuArch(ncclXml* xml, int* cpuArch);
-ncclResult_t ncclTopoGetFusionEnv(int* mergeLevel, const char** forceMerge, int cudaCompCap, int cpuArch);
 
 // Owned subset of network properties that remains valid after the topology lock is released.
 struct ncclTopoNetPropertiesSnapshot {
@@ -402,8 +361,6 @@ static ncclResult_t ncclTopoDevToRank(struct ncclTopoSystem* system, int systemI
   if (warn) WARN("ncclTopoDevToRank could not find rank for nvml dev %d in systemId %d", dev, systemId);
   return ncclInternalError;
 }
-
-extern struct kvDict nicPathKvList[];
 
 static ncclResult_t ncclTopoIdToNetDev(struct ncclTopoSystem* system, int64_t id, int* netDev) {
   *netDev = -1;

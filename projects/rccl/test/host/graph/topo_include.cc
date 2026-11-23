@@ -8,12 +8,16 @@
 // code under test. It is #included rather than linked because
 // TopoSetNetDevsPolicy can only be defined inside topo.cc's TU, where the
 // NETDEVS policy statics live. topo-test.cc #includes this file for the same
-// reason, so the definition exists exactly once.
+// reason, so the definition exists exactly once. The NIC import and XML
+// fusion units of src/graph/discovery/ come along so topo-test.cc can reach
+// their statics; device discovery (topo_discovery_dev.cc) is linked.
 
 #include "fakes/graph_fakes.h"
 #include "fakes/param_redirect.h"
 
 #include TOPO_CC_PATH
+#include TOPO_DISCOVERY_NET_CC_PATH
+#include TOPO_DISCOVERY_CC_PATH
 
 #include "TopoScene.h"
 

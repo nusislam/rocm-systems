@@ -4,8 +4,8 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
-// Host-only microtests for the topology GPU id and GPU-to-GPU paths: src/graph/xml.cc, topo.cc, paths.cc, search.cc
-// and rome_models.cc.
+// Host-only microtests for the topology GPU id and GPU-to-GPU paths: src/graph/discovery/topo_discovery_dev.cc,
+// xml.cc, topo.cc, paths.cc, search.cc and rome_models.cc.
 
 #include <gtest/gtest.h>
 
@@ -26,6 +26,7 @@
 
 #include "comm.h"
 #include "graph.h"
+#include "graph/discovery/topo_discovery.h"
 #include "graph/rome_models.h"
 #include "graph/topo.h"
 #include "graph/xml.h"

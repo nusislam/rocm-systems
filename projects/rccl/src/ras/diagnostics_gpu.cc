@@ -46,8 +46,9 @@ void rasDiagnosticsGpuInit() {
 
 #if RAS_DIAG_AMD_SMI
 // HIP can place the logical GPUs of a partitioned device (CPX, DPX) at functions .1-.7 of its bus ID, which AMD SMI
-// may not know (ncclTopoFillGpu in src/graph/xml.cc handles the same aliases). A query that fails there is retried
-// on function 0, the physical GPU, whose model, ECC counters and XGMI links the partition shares.
+// may not know (ncclTopoFillGpu in src/graph/discovery/topo_discovery_dev.cc handles the same aliases). A query that
+// fails there is retried on function 0, the physical GPU, whose model, ECC counters and XGMI links the partition
+// shares.
 template <typename Query>
 static ncclResult_t rasDiagnosticsAmdSmiQuery(int64_t busId, Query query) {
   if (query(busId) == ncclSuccess) return ncclSuccess;
