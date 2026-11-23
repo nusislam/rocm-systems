@@ -9,24 +9,23 @@
  * ranks with its partition index on every device; its siblings are the other
  * ranks of its own device. Each rank pushes its own chunk directly to every
  * other rank on its rail (one hop, not a ring) and to its siblings. A chunk
- * that arrives on the rail is read by the siblings straight out of the
- * receiver's scratch, so it crosses into each device once.
+ * that arrives on the rail is remote-written by the receiver to its siblings'
+ * scratch (scale-in), so it crosses into each device once.
  *
  * As in agHierPush, the blocks are dealt out as units. A group-0 unit copies
  * the own chunk to recvbuff and the siblings with the whole block. A group-g
  * unit splits its block in halves: the pusher warps push the own chunk to the
  * rail peer g devices ahead, while the forwarder warps wait for the chunk of
- * the rail peer g devices behind, tell the siblings it is there and copy it to
- * recvbuff.
+ * the rail peer g devices behind, copy it to recvbuff and remote-write it to the
+ * siblings' scratch, then tell the siblings it is there.
  *
  * User buffers are not registered, so no peer touches recvbuff: every remote
  * write lands in the receiver's scratch at the slot of the chunk's owner, and
  * the receiver copies it from there into recvbuff. Own chunks pushed by a
- * sibling are drained from this rank's scratch, rail chunks received by a
- * sibling from that sibling's scratch. That drain runs while the next chunk is
- * in flight: a group-0 block drains between issuing a chunk's stores and
- * waiting for them, and the forwarders drain before waiting for the next rail
- * chunk.
+ * sibling, and rail chunks a sibling received and forwarded, are both drained
+ * from this rank's scratch. That drain runs while the next chunk is in flight:
+ * a group-0 block drains between issuing a chunk's stores and waiting for
+ * them, and the forwarders drain before waiting for the next rail chunk.
  *
  * A receive larger than the scratch goes through it in rounds, each a window of
  * every rank's slot, alternating between the two halves of the scratch. A rank
@@ -114,9 +113,9 @@ __device__ __forceinline__ void ddaAgHierScatter(const uint4* src, size_t lo, si
 
 // count is the per-rank chunk in elements, a multiple of 16 B. A rank's chunk goes in rounds of windowLines 16 B
 // lines (the last may be shorter). Round r uses scratch bank r % 2, nRanks slots of windowLines lines each written by
-// one rank: a rank pushes its own slot to every rail peer and every sibling. A rail slot it receives is read by its
-// siblings in place. The rank's own slot is never written. With a single round only bank 0 is used, so the host may
-// pass windowLines = count lines whenever nRanks slots of it fit the scratch, and half the scratch per slot set
+// one rank: a rank pushes its own slot to every rail peer and every sibling. A rail slot it receives is remote-written
+// on to its siblings, into their slot of the same owner. The rank's own slot is never written. With a single round
+// only bank 0 is used, so the host may pass windowLines = count lines whenever nRanks slots of it fit the scratch, and half the scratch per slot set
 // otherwise.
 //
 // Units and chunks depend only on windowLines, the grid and maxChunkLines, so block b of every rank runs the same
@@ -129,12 +128,13 @@ __device__ __forceinline__ void ddaAgHierScatter(const uint4* src, size_t lo, si
 // the block's units and rounds (seq), so the posts one block makes to one rank only grow:
 //   group 0:  the block copies its chunk i to recvbuff and the siblings and posts seq + i to each sibling;
 //   group g:  the pushers write chunk i to rail peer g ahead and post seq + i to it; the forwarders wait for seq + i
-//             from rail peer g behind, post seq + i to each sibling, and copy the chunk to recvbuff.
+//             from rail peer g behind, copy the chunk to recvbuff and to each sibling's scratch, and post seq + i to
+//             each sibling.
 // The group-0 block drains the siblings' pushed chunk i - 1 from this rank's scratch after issuing chunk i's stores
-// and before posting chunk i; the forwarders pull the siblings' rail chunk i - 1, from the siblings' scratch, before
-// waiting for rail chunk i. A flag slot has one writer: pushers post only to rail peers, the rest only to siblings.
+// and before posting chunk i; the forwarders drain the siblings' forwarded rail chunk i - 1, from this rank's scratch,
+// before waiting for rail chunk i. A flag slot has one writer: pushers post only to rail peers, the rest only to siblings.
 // A post of chunk i waits only on a sibling post of chunk i - 1 (group 0) or on the rail pusher's post of chunk i
-// (forwarders), a forwarder's pull of chunk i - 1 waits on the sibling's post of that same chunk, and a release wait
+// (forwarders), a forwarder's drain of chunk i - 1 waits on the sibling's post of that same chunk, and a release wait
 // of round r only on rounds up to r - 2. Each of those is an earlier post, so the waits cannot form a cycle.
 template <typename T>
 __launch_bounds__(512)
@@ -333,10 +333,16 @@ __launch_bounds__(512)
       } else if (forwarder) {
         const int fromCard = cardAt(-group);
         const int from = fromCard * scaleIn + local;
-        uint4* const fromDst = recvLines + recvSlot(from);
         const uint4* const fromSrc = selfScratch + scratchSlot(from);
-        // The siblings' chunk i - 1 is pulled while the rail peer is still storing chunk i, and the wait for chunk i
-        // starts when that pull is done.
+        const size_t fromScratch = scratchSlot(from);
+        const size_t fromRecv = recvSlot(from);
+        // The forwarders write only into the siblings, so they wait for those to enter the launch.
+        if (round == 0) {
+          if (ht == 0 && n > 0) agHierWaitPackage(barrier.abortFlag(), barrier, scaleIn, local, card, epoch);
+          half.sync();
+        }
+        // The siblings' chunk i - 1 is drained from this rank's scratch while the rail peer is still storing chunk i,
+        // and the wait for chunk i starts when that drain is done.
         for (unsigned i = 0; i <= n; ++i) {
           if (i > 0) {
             auto [lo, hi] = range(i - 1);
@@ -349,7 +355,7 @@ __launch_bounds__(512)
               if (d < scaleIn) {
                 const int sib = sibling(d);
                 const int owner = fromCard * scaleIn + (sib - card * scaleIn);
-                const uint4* const src = scratchOf(sib) + scratchSlot(owner);
+                const uint4* const src = selfScratch + scratchSlot(owner);
                 uint4* const dst = recvLines + recvSlot(owner);
                 ddaAgHierScatter<true>(src, lo + ht, hi, htn, [&](size_t line, uint4 v) { dst[line] = v; });
               }
@@ -361,7 +367,13 @@ __launch_bounds__(512)
               agHierWait(barrier.abortFlag(), const_cast<FlagType*>(barrier.epochFlagFrom(from)), epoch + 2 + (seq + i));
             }
             half.sync();
-            // The chunk is in this rank's scratch, where the siblings read it.
+            // The chunk is in this rank's scratch. Remote-write it to the siblings' scratch, at the slot of its owner,
+            // and copy it to recvbuff.
+            ddaAgHierScatter<true>(fromSrc, lo + ht, hi, htn, [&](size_t line, uint4 v) {
+              storeRecvAndSiblings(fromRecv, fromScratch, line, v);
+            });
+            // Orders every forwarder warp's stores before the leader's system-scope release fence and flag posts.
+            half.sync();
             if (ht == 0) {
               cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
 #pragma unroll
@@ -369,7 +381,6 @@ __launch_bounds__(512)
                 if (d < scaleIn) barrier.epochStorePieceRelaxed(sibling(d), epoch, seq + i);
               }
             }
-            ddaAgHierScatter<true>(fromSrc, lo + ht, hi, htn, [&](size_t line, uint4 v) { fromDst[line] = v; });
           }
         }
       }
